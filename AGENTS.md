@@ -10,7 +10,7 @@
 - Initialize tracing before entering the Tokio runtime; tracing setup must happen outside the runtime.
 - Prefer iterators and functional style over manual loops where possible.
 - Rule: minimal visibility by default — if not needed even within the crate, keep it non-`pub`; use `pub(crate)` only if needed inside the crate; use `pub` only for external API.
-- At each stage, run `cargo fmt`, `cargo clippy --all-targets --all-features`, and `cargo nextest run --all-features --all-targets --locked`; fix all findings.
+- When changing Rust code or Cargo dependencies, run `cargo fmt`, `cargo clippy --all-targets --all-features`, and `cargo nextest run --all-features --all-targets --locked`; fix all findings. For documentation- or pipeline-only changes, validate the changed files without running Rust code checks.
 - Prefer specific types (NewType idiom) where justified.
 - Do not use `lib.rs` (binary only).
 - `main.rs` should stay thin, build the runtime, initialize tracing via the dedicated module before runtime entry, and delegate application behavior to a single function.
