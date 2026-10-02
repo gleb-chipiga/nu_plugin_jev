@@ -39,7 +39,7 @@ lru = "0.18"
 httpdate = "1"
 tracing = "0.1"
 tracing-appender = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
 mimalloc = { version = "0.1", optional = true }
 
 [dev-dependencies]
