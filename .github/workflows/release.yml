@@ -95,7 +95,7 @@ jobs:
         if: endsWith(matrix.target, '-musl')
         run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends musl-tools
       - name: Install cargo-dist
-        run: cargo install cargo-dist --version 0.33.0 --locked
+        run: cargo install cargo-dist --version 0.32.0 --locked
       - name: Build release archive
         shell: bash
         env:
