@@ -1,0 +1,43 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        description: Format Rust code
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        description: Lint Rust code
+        entry: cargo clippy --all-targets --all-features --locked -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-nextest
+        name: cargo nextest
+        description: Test Rust code with nextest
+        entry: cargo nextest run --all-features --all-targets --locked
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-deny
+        name: cargo deny
+        description: Check dependency advisories and licenses
+        entry: cargo +stable deny check advisories licenses
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: openspec-validate
+        name: openspec validate
+        description: Validate OpenSpec artifacts
+        entry: openspec validate --all --strict --no-interactive
+        language: node
+        language_version: 24.21.0
+        additional_dependencies: ["@fission-ai/openspec@1.14.0"]
+        pass_filenames: false
