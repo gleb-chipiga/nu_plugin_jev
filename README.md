@@ -1,5 +1,7 @@
 # nu_plugin_jev
 
+[![crates.io](https://img.shields.io/crates/v/nu_plugin_jev.svg)](https://crates.io/crates/nu_plugin_jev)
+
 `nu_plugin_jev` brings TypeSafe Jev / System One decisions into Nushell. Nu
 builds the state and processes the answers; the plugin sends the request.
 
