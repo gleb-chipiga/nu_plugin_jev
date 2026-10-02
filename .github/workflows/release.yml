@@ -1,0 +1,222 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crates-io-publish
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    uses: ./.github/workflows/verify.yml
+
+  validate-version:
+    name: Validate release version
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check tag and package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          test "$RELEASE_TAG" = "v$package_version"
+      - name: Check changelog section
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          heading="## [${version}]"
+          awk -v heading="$heading" '
+            $0 == heading || index($0, heading " ") == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          grep -q '[^[:space:]]' "$RUNNER_TEMP/release-notes.md"
+
+  build-binaries:
+    name: Build binary (${{ matrix.target }})
+    needs: validate-version
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            archive: nu_plugin_jev-x86_64-unknown-linux-gnu.tar.xz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            archive: nu_plugin_jev-aarch64-unknown-linux-gnu.tar.xz
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+            archive: nu_plugin_jev-x86_64-unknown-linux-musl.tar.xz
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-22.04-arm
+            archive: nu_plugin_jev-aarch64-unknown-linux-musl.tar.xz
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            archive: nu_plugin_jev-x86_64-apple-darwin.tar.xz
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive: nu_plugin_jev-aarch64-apple-darwin.tar.xz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            archive: nu_plugin_jev-x86_64-pc-windows-msvc.zip
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install musl C toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends musl-tools
+      - name: Install cargo-dist
+        run: cargo install cargo-dist --version 0.32.0 --locked
+      - name: Build release archive
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          cargo metadata --locked --format-version 1 > /dev/null
+          dist build --tag "$RELEASE_TAG" --artifacts=local --target "$TARGET"
+      - name: Attest release archive
+        uses: actions/attest@36051bcae73b7c2a8a6945a48cbf80953c6baa35 # v4
+        with:
+          subject-path: target/distrib/${{ matrix.archive }}
+      - name: Upload release archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            target/distrib/${{ matrix.archive }}
+            target/distrib/${{ matrix.archive }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish to crates.io
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.97.1
+      - name: Check crates.io publication status
+        id: crates_io_status
+        shell: bash
+        run: |
+          package_name="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')"
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          response_file="$(mktemp)"
+          user_agent="$package_name-release/$package_version (+https://github.com/$GITHUB_REPOSITORY)"
+          if ! status_code="$(curl --silent --show-error --retry 3 --retry-delay 2 --output "$response_file" --user-agent "$user_agent" --write-out '%{http_code}' "https://crates.io/api/v1/crates/$package_name/$package_version")"; then
+            echo "Unable to determine crates.io publication status." >&2
+            exit 1
+          fi
+          case "$status_code" in
+            200)
+              jq -e --arg version "$package_version" '.version.num == $version' "$response_file" >/dev/null
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unable to determine crates.io publication status (HTTP $status_code)." >&2
+              exit 1
+              ;;
+          esac
+      - name: Authenticate with crates.io
+        id: crates_io_auth
+        if: steps.crates_io_status.outputs.published != 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: Publish crate
+        if: steps.crates_io_status.outputs.published != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
+        run: cargo publish --locked
+
+  release:
+    name: Create GitHub release
+    needs: [build-binaries, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Extract release notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          heading="## [${version}]"
+          awk -v heading="$heading" '
+            $0 == heading || index($0, heading " ") == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          grep -q '[^[:space:]]' RELEASE_NOTES.md
+      - name: Download release archives
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create combined checksum
+        shell: bash
+        working-directory: release-assets
+        run: sha256sum -- *.tar.xz *.zip > sha256.sum
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "$RELEASE_TAG" \
+              --notes-file RELEASE_NOTES.md
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" \
+              --notes-file RELEASE_NOTES.md release-assets/*
+          fi

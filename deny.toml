@@ -1,0 +1,21 @@
+[advisories]
+unmaintained = "workspace"
+unsound = "workspace"
+yanked = "warn"
+unused-ignored-advisory = "deny"
+
+[licenses]
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CC-PDDC",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8

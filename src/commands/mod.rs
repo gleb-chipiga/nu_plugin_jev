@@ -1,0 +1,13 @@
+/// Streams independent table-row evaluations and typed annotations.
+pub(crate) mod annotate;
+/// Evaluates one finite state against named questions.
+pub(crate) mod ask;
+/// Shares request construction and live evaluation for `jev ask`.
+pub(crate) mod evaluate;
+/// Builds API question records without contacting the service.
+pub(crate) mod question;
+/// Provides offline guidance from the `jev` root command.
+pub(crate) mod root;
+#[cfg(test)]
+/// Supplies an isolated local HTTP fixture for command-level tests.
+pub(crate) mod tests;

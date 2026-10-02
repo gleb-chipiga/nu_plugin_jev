@@ -1,0 +1,74 @@
+name: Verify
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: Rust, Nu, and OpenSpec
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.97.1
+          components: clippy, rustfmt
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: nextest@0.9.146
+      - name: Install matching Nushell
+        shell: bash
+        env:
+          NU_VERSION: 0.116.0
+          NU_SHA256: 9f73a6913f9515a621bd916dc91d7f3e0494e488161c2d686f6b98ffa0555945
+        run: |
+          archive="$RUNNER_TEMP/nu-${NU_VERSION}.tar.gz"
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://github.com/nushell/nushell/releases/download/${NU_VERSION}/nu-${NU_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          printf '%s  %s\n' "$NU_SHA256" "$archive" | sha256sum --check -
+          mkdir -p "$RUNNER_TEMP/nu-release" "$RUNNER_TEMP/nu-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/nu-release"
+          nu_binary="$(find "$RUNNER_TEMP/nu-release" -type f -name nu -print -quit)"
+          test -n "$nu_binary"
+          install -m 755 "$nu_binary" "$RUNNER_TEMP/nu-bin/nu"
+          echo "$RUNNER_TEMP/nu-bin" >> "$GITHUB_PATH"
+      - name: Verify Nushell version
+        run: test "$(nu --version)" = "0.116.0"
+      - name: Run repository hooks
+        uses: j178/prek-action@5337cb91e0fa35a7ff31b9ca345126d8bbbcdf16 # v2.0.6
+        with:
+          extra-args: --all-files
+          prek-version: 0.2.25
+      - name: Test without mimalloc
+        run: cargo nextest run --all-targets --no-default-features --locked
+      - name: Check publishable crate
+        shell: bash
+        run: cargo package --offline --locked --no-verify
+
+  security:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check advisories and licenses
+        uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1 # v2.0.18
+        with:
+          command: check advisories licenses
+          rust-version: 1.97.1
