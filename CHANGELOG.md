@@ -4,9 +4,17 @@ Notable changes to `nu_plugin_jev` are documented here.
 
 ## [Unreleased]
 
+## [0.1.1]
+
 ### Changed
 
 - Run Rust and real-Nushell integration tests with cargo-nextest locally and in CI.
+- Update Rust dependencies and pinned CI actions.
+- Trim unused `tracing-subscriber` features.
+
+### Added
+
+- Show the published crates.io version in the README.
 
 ## [0.1.0]
 
