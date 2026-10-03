@@ -102,15 +102,20 @@ key nor a network response.
 ## Annotate a table
 
 `jev annotate` evaluates each record row independently. It preserves the
-source fields, adds named answers under `jev` (or `--into`), and always adds
+source fields, adds named answers under `answers` by default, and always adds
 `jev_meta: {base_url, model, usage}` on successful rows.
 
 ```nu
 open messages.nuon
-| jev annotate $questions --fields [message sender] --into ai
-| where ai.spam.noul >= 0.98
-| sort-by ai.urgency.score --reverse
+| jev annotate $questions --fields [message sender]
+| where answers.spam.noul >= 0.98
+| sort-by answers.urgency.score --reverse
 ```
+
+Use `--into ai` for another answer field (`ai.spam.noul`), or `--into jev`
+to retain the former `jev.spam.noul` path. If a source row already has the
+selected answer field, annotation stops rather than overwriting it, including
+with `--on-error keep` or `record`.
 
 `--fields` sends only the named top-level columns. Use `--state document.text`
 instead to send one cell path; these selectors cannot be combined. The

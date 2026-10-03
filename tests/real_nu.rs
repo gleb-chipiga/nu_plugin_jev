@@ -124,9 +124,9 @@ fn run_pipeline(selective: bool) -> Option<(Vec<serde_json::Value>, usize)> {
     }
     let (base_url, stop, calls, server) = serve_until_stopped(selective);
     let source = if selective {
-        "let q = {match: (jev question noul 'Is this a match?')}; 1..1000 | each { |id| {id: $id, message: ($id mod 5)} } | jev annotate $q --fields [message] --jobs 4 | where jev.match.noul > 0.5 | first 10 | to json --raw"
+        "let q = {match: (jev question noul 'Is this a match?')}; 1..1000 | each { |id| {id: $id, message: ($id mod 5)} } | jev annotate $q --fields [message] --jobs 4 | where answers.match.noul > 0.5 | first 10 | to json --raw"
     } else {
-        "let q = {match: (jev question noul 'Is this a match?')}; 1..1000 | each { |id| {id: $id, message: $id} } | jev annotate $q --fields [message] -j 4 | where jev.match.noul > 0.5 | first 10 | to json --raw"
+        "let q = {match: (jev question noul 'Is this a match?')}; 1..1000 | each { |id| {id: $id, message: $id} } | jev annotate $q --fields [message] -j 4 | where answers.match.noul > 0.5 | first 10 | to json --raw"
     };
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut child = Command::new("nu")
@@ -549,10 +549,11 @@ let q = {
     kind: {type: choice, criteria: {normal: null, spam: null}}
     urgency: {type: score, criteria: ['later' 'today' 'now']}
 }
+
 let rows = ([{id: 1, message: 'urgent', sender: 'a', secret: 'local-1'} {id: 2, message: 'normal', sender: 'b', secret: 'local-2'} {id: 3, message: 'later', sender: 'c', secret: 'local-3'}]
-    | jev annotate $q --fields [message sender] --context {policy: 'rules'} --into ai --metrics --jobs 2
-    | select id message sender secret ai jev_meta jev_metrics)
-{all: $rows, filtered: ($rows | where ai.spam.noul > 0.9 | sort-by ai.urgency.score --reverse | reject jev_meta jev_metrics)} | to json --raw
+    | jev annotate $q --fields [message sender] --context {policy: 'rules'} --metrics --jobs 2
+    | select id message sender secret answers jev_meta jev_metrics)
+{all: $rows, filtered: ($rows | where answers.spam.noul > 0.9 | sort-by answers.urgency.score --reverse | reject jev_meta jev_metrics)} | to json --raw
 "#;
     let output = Command::new("nu")
         .args([
@@ -601,7 +602,7 @@ let rows = ([{id: 1, message: 'urgent', sender: 'a', secret: 'local-1'} {id: 2, 
     assert_eq!(wire["filtered"].as_array().unwrap().len(), 2);
     assert_eq!(wire["filtered"][0]["id"], 1);
     assert_eq!(wire["filtered"][1]["id"], 3);
-    assert_eq!(wire["filtered"][0]["ai"]["kind"]["choice"], "spam");
+    assert_eq!(wire["filtered"][0]["answers"]["kind"]["choice"], "spam");
     assert!(wire["filtered"][0].get("jev_meta").is_none());
     let captured = server.join().expect("join table mock");
     assert_eq!(captured.len(), 3);
@@ -616,6 +617,115 @@ let rows = ([{id: 1, message: 'urgent', sender: 'a', secret: 'local-1'} {id: 2, 
         assert!(request["state"]["input"].get("message").is_some());
         assert!(request["state"]["input"].get("sender").is_some());
     }
+}
+
+/// Keeps the default answer path aligned with ask while preserving legacy and metadata fields.
+#[test]
+fn annotate_default_answers_and_explicit_legacy_path_in_real_nu() {
+    if Command::new("nu").arg("--version").output().is_err() {
+        return;
+    }
+    let (base_url, stop, calls, server) = serve_until_stopped(false);
+    let source = r#"
+let q = {match: {type: noul}}
+let default = ([{id: 1, message: 7}] | jev annotate $q --fields [message] --metrics | first)
+let legacy = ([{id: 2, message: 7}] | jev annotate $q --fields [message] --into jev --metrics | first)
+let shared = ([{id: 3, message: 7} {id: 4, message: 7}] | jev annotate $q --fields [message] --metrics --jobs 1)
+let kept = ([{id: 5}] | jev annotate $q --fields [message] --on-error keep | first)
+let recorded = ([{id: 6}] | jev annotate $q --fields [message] --on-error record | first)
+let empty = ([] | jev annotate $q --fields [message] | length)
+let ordered = ([{id: 7, message: 1} {id: 8, message: 2}] | jev annotate $q --fields [message] --jobs 2 | get id)
+let unordered = ([{id: 9, message: 3} {id: 10, message: 4}] | jev annotate $q --fields [message] --jobs 2 --unordered | get id)
+{default: $default, legacy: $legacy, shared: $shared, kept: $kept, recorded: $recorded, empty: $empty, ordered: $ordered, unordered: $unordered} | to json --raw
+"#;
+    let output = Command::new("nu")
+        .args([
+            "--no-config-file",
+            "--plugins",
+            env!("CARGO_BIN_EXE_nu_plugin_jev"),
+            "--commands",
+            source,
+        ])
+        .env("TYPESAFE_API_KEY", "local-key")
+        .env("NU_PLUGIN_JEV_BASE_URL", &base_url)
+        .output()
+        .expect("run isolated Nu");
+    stop.store(true, Ordering::SeqCst);
+    server.join().expect("join local mock");
+    assert!(
+        output.status.success(),
+        "Nu failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("Nu result");
+    assert_eq!(result["default"]["answers"]["match"]["noul"], 0.9);
+    assert!(result["default"].get("jev").is_none());
+    assert_eq!(result["default"]["jev_meta"]["model"], "jev-fixed");
+    assert_eq!(result["default"]["jev_metrics"]["attempts"], 1);
+    assert_eq!(result["legacy"]["jev"]["match"]["noul"], 0.9);
+    assert!(result["legacy"].get("answers").is_none());
+    assert_eq!(result["legacy"]["jev_meta"], result["default"]["jev_meta"]);
+    assert!(result["legacy"]["jev_metrics"]["request_id"].is_string());
+    let shared = result["shared"].as_array().expect("shared rows");
+    assert_eq!(shared.len(), 2);
+    assert!(
+        shared
+            .iter()
+            .all(|row| row["answers"]["match"]["noul"] == 0.9)
+    );
+    assert_eq!(shared[0]["jev_meta"], shared[1]["jev_meta"]);
+    assert_eq!(shared[0]["jev_metrics"], shared[1]["jev_metrics"]);
+    assert_eq!(result["kept"], serde_json::json!({"id": 5}));
+    assert_eq!(result["recorded"]["jev_error"]["kind"], "state");
+    assert!(result["recorded"].get("answers").is_none());
+    assert!(result["recorded"].get("jev_meta").is_none());
+    assert_eq!(result["empty"], 0);
+    assert_eq!(result["ordered"], serde_json::json!([7, 8]));
+    let mut unordered = result["unordered"]
+        .as_array()
+        .expect("unordered rows")
+        .iter()
+        .map(|value| value.as_i64().expect("row ID"))
+        .collect::<Vec<_>>();
+    unordered.sort_unstable();
+    assert_eq!(unordered, [9, 10]);
+    assert_eq!(calls.load(Ordering::SeqCst), 7);
+}
+
+/// Rejects new-default source collisions and removed destination flags before HTTP dispatch.
+#[test]
+fn annotate_default_destination_collisions_are_terminal_in_real_nu() {
+    if Command::new("nu").arg("--version").output().is_err() {
+        return;
+    }
+    let (base_url, stop, calls, server) = serve_until_stopped(false);
+    for source in [
+        "[{id: 1, message: 7, answers: 'existing'}] | jev annotate {match: {type: noul}} --fields [message] --on-error keep | to json --raw",
+        "[{id: 1, message: 7, answers: 'existing'}] | jev annotate {match: {type: noul}} --fields [message] --on-error record | to json --raw",
+        "[] | jev annotate {match: {type: noul}} --meta-into ai | to json --raw",
+        "[] | jev annotate {match: {type: noul}} --metrics-into ai | to json --raw",
+    ] {
+        let output = Command::new("nu")
+            .args([
+                "--no-config-file",
+                "--plugins",
+                env!("CARGO_BIN_EXE_nu_plugin_jev"),
+                "--commands",
+                source,
+            ])
+            .env("TYPESAFE_API_KEY", "local-key")
+            .env("NU_PLUGIN_JEV_BASE_URL", &base_url)
+            .output()
+            .expect("run isolated Nu");
+        assert!(
+            !output.status.success(),
+            "conflicting annotation unexpectedly succeeded: {source}"
+        );
+        assert!(output.stdout.is_empty(), "conflicting row reached output");
+    }
+    stop.store(true, Ordering::SeqCst);
+    server.join().expect("join local mock");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 /// Confirms NUON cache-hit records correlate with row metadata in real Nu.

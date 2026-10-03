@@ -39,7 +39,7 @@ let questions = {
 {message: "Hello"} | jev ask $questions --dry-run
 [{message: "Hello"}, {message: "Buy now"}]
 | jev annotate $questions --fields [message]
-| where jev.spam.noul >= 0.98
+| where answers.spam.noul >= 0.98
 ```
 
 To inspect available names before choosing a model:
@@ -59,9 +59,12 @@ jev models | get models | sort-by name | select name release_date
   but no evaluation model or table options. If a sandbox
   blocks access, report the call as unverified, not as an API failure.
 - `jev ask` returns `{answers, meta: {base_url, model, usage}}`;
-  `jev annotate` adds answers under `jev` or `--into` and always adds
+  `jev annotate` adds answers under `answers` by default and always adds
   `jev_meta: {base_url, model, usage}` on success. Read `noul`, `choice`, or
-  `score` from each named answer; Nu code chooses its own thresholds.
+  `score` from each named answer; Nu code chooses its own thresholds. Use
+  `--into ai` for a custom answer field or `--into jev` for the old path.
+  A source field matching the answer destination terminates annotation,
+  including with `--on-error keep` or `record`.
   `--metrics` adds HTTP measurements: `metrics` on `ask`/`models`,
   `jev_metrics` on `annotate`. Reused rows share `jev_metrics.request_id`;
   count usage and body bytes once per distinct ID.

@@ -122,7 +122,7 @@ impl PluginCommand for JevAnnotate {
             .named(
                 "into",
                 SyntaxShape::String,
-                "Answer field (default: jev)",
+                "Answer field (default: answers)",
                 Some('i'),
             )
             .switch("metrics", "Add jev_metrics to successful rows", None)
@@ -147,7 +147,7 @@ impl PluginCommand for JevAnnotate {
 
     /// Clarifies that each row is one state and native Nu handles filtering.
     fn extra_description(&self) -> &str {
-        "Each row is an independent System One state; matching requests may share one evaluation. Successful rows always add jev_meta with base_url, model, and usage; --metrics adds jev_metrics with one shared request_id and HTTP measurements. --fields selects literal top-level names, while --state follows a Nu cell path. Use native where and sort-by on answers. Settings are snapshotted per call from flags, Nu config, caller environment, local TOML (--config or NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.toml), user TOML, then defaults."
+        "Each row is an independent System One state; matching requests may share one evaluation. Answers go under answers by default; --into jev preserves the former answer path. Successful rows always add jev_meta with base_url, model, and usage; --metrics adds jev_metrics with one shared request_id and HTTP measurements. --fields selects literal top-level names, while --state follows a Nu cell path. Use native where and sort-by on answers. Settings are snapshotted per call from flags, Nu config, caller environment, local TOML (--config or NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.toml), user TOML, then defaults."
     }
 
     /// Shows a credential-free structured preview.
@@ -290,7 +290,7 @@ impl TableOptions {
             StateSelector::Whole
         };
         let into: Option<String> = call.get_flag("into").map_err(LabeledError::from)?;
-        let into = into.unwrap_or_else(|| "jev".into());
+        let into = into.unwrap_or_else(|| "answers".into());
         if into.trim().is_empty() {
             return Err(option_error("--into must be nonempty"));
         }
@@ -656,6 +656,38 @@ mod tests {
         Ok(())
     }
 
+    /// Defaults to answers while an explicit legacy destination changes only answer placement.
+    #[test]
+    fn default_answers_and_explicit_jev_keep_fixed_metadata() -> Result<(), Box<ShellError>> {
+        let response = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.875}}, "usage": {"input_tokens": 10, "output_tokens": 1}});
+        let (base_url, server) = serve(vec![response.clone(), response]);
+        let mut test = plugin_test()?;
+        let setup = format!(
+            "$env.TYPESAFE_API_KEY = 'local-key'; $env.NU_PLUGIN_JEV_BASE_URL = '{base_url}';"
+        );
+        let source =
+            "[{id: 7, message: 'hello'}] | jev annotate {q: {type: noul}} --fields [message]";
+        let default = test
+            .eval(&format!("{setup} {source}"))?
+            .into_value(Span::test_data())?;
+        let default = to_json(&default).unwrap();
+        assert_eq!(default[0]["answers"]["q"]["noul"], 0.875);
+        assert_eq!(default[0]["jev_meta"]["model"], "jev-fixed");
+        assert!(default[0].get("jev").is_none());
+        assert!(default[0].get("jev_metrics").is_none());
+
+        let legacy = test
+            .eval(&format!("{setup} {source} --into jev --metrics"))?
+            .into_value(Span::test_data())?;
+        let legacy = to_json(&legacy).unwrap();
+        assert_eq!(legacy[0]["jev"]["q"]["noul"], 0.875);
+        assert!(legacy[0].get("answers").is_none());
+        assert_eq!(legacy[0]["jev_meta"], default[0]["jev_meta"]);
+        assert!(legacy[0]["jev_metrics"]["request_id"].is_string());
+        assert_eq!(server.join().unwrap().len(), 2);
+        Ok(())
+    }
+
     /// Reports malformed selectors before input or credential access.
     #[test]
     fn rejects_conflicting_and_duplicate_selectors() -> Result<(), Box<ShellError>> {
@@ -823,7 +855,7 @@ mod tests {
             );
             let result = test.eval(&source)?.into_value(Span::test_data())?;
             let wire = to_json(&result).unwrap();
-            assert_eq!(wire[0]["jev"]["q"]["noul"], 0.875);
+            assert_eq!(wire[0]["answers"]["q"]["noul"], 0.875);
             assert_eq!(wire[0]["jev_meta"]["base_url"], format!("{url}/"));
             assert!(wire[0].get("jev_metrics").is_none());
         }
@@ -913,7 +945,7 @@ mod tests {
             let result = test.eval(&source)?.into_value(Span::test_data())?;
             let wire = to_json(&result).unwrap();
             assert_eq!(wire[0]["id"], 1);
-            assert!(wire[0].get("jev").is_none());
+            assert!(wire[0].get("answers").is_none());
             assert!(wire[0].get("jev_meta").is_none());
             assert!(wire[0].get("jev_metrics").is_none());
             if policy == "record" {
@@ -964,8 +996,16 @@ mod tests {
         let missing = test.eval("[{id: 1}] | jev annotate {q: {type: noul}} --state payload.text --on-error record --dry-run")?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&missing).unwrap()[0]["jev_error"]["kind"], "state");
-        let collision = test.eval("[{id: 1, message: 'hello', jev: 'existing'}] | jev annotate {q: {type: noul}} --fields [message] --on-error record --dry-run")?;
-        assert!(collision.into_value(Span::test_data()).is_err());
+        for policy in ["keep", "record"] {
+            let collision = test.eval(&format!("[{{id: 1, message: 'hello', answers: 'existing'}}] | jev annotate {{q: {{type: noul}}}} --fields [message] --on-error {policy} --dry-run"))?;
+            assert!(collision.into_value(Span::test_data()).is_err());
+        }
+        let legacy = test.eval("[{id: 1, message: 'hello', jev: 'existing'}] | jev annotate {q: {type: noul}} --fields [message] --dry-run")?
+            .into_value(Span::test_data())?;
+        assert_eq!(
+            to_json(&legacy).unwrap()[0]["request"]["state"],
+            json!({"message": "hello"})
+        );
         let meta_collision = test.eval("[{id: 1, message: 'hello', jev_meta: 'existing'}] | jev annotate {q: {type: noul}} --fields [message] --on-error keep --dry-run")?;
         assert!(meta_collision.into_value(Span::test_data()).is_err());
         let missing_field = test.eval("[{id: 1}] | jev annotate {q: {type: noul}} --fields [message] --on-error record --dry-run")?

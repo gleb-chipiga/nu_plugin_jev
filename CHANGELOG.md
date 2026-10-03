@@ -15,6 +15,8 @@ Notable changes to `nu_plugin_jev` are documented here.
 
 ### Changed
 
+- Default `jev annotate` answers to the `answers` field, aligning row paths
+  with `jev ask`; use `--into jev` to retain the former default path.
 - Wrap successful dry-run bodies as `{request, request_bytes}`; access former
   top-level request fields through `request`.
 - Return always-present `meta` on live `jev ask` and `jev models`, and
