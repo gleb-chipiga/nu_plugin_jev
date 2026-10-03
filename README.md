@@ -43,11 +43,12 @@ Question constructors and `--dry-run` work without a key or network access.
 ## List current models
 
 ```nu
-jev models | sort-by name | select name description release_date
+jev models | get models | sort-by name | select name description release_date
 ```
 
-`jev models` makes an authenticated, bodyless `GET /v1/models` and returns a
-table of string fields in service order. It accepts no pipeline input. The
+`jev models` makes an authenticated, bodyless `GET /v1/models` and returns
+`{models: <table>, meta: {base_url}}`. With `--metrics`, its request body size
+is `0`. It accepts no pipeline input. The
 list is fetched on every call: names and aliases can change, and `jev ask`
 and `jev annotate` do not consult it before evaluating. Use native Nu table
 commands to inspect it. The command accepts `--base-url`, `--timeout`, and
@@ -75,7 +76,7 @@ $result | get answers.kind.choice
 $result | get answers.urgency.score
 ```
 
-`jev ask` returns `{model, answers, usage}`. Each answer retains its type and
+`jev ask` returns `{answers, meta: {base_url, model, usage}}`. Each answer retains its type and
 service-provided details, including confidence and probability distributions.
 The caller chooses thresholds; the plugin does not decide what counts as true.
 
@@ -86,18 +87,23 @@ JSON object, and a list becomes a JSON array. A finite stream passed to
 Add separate context with `--context <value>`. The outgoing state becomes
 `{input: <pipeline value>, context: <value>}`; fields are not merged.
 
-Inspect the exact request body before sending data:
+Inspect the exact request body and its compact UTF-8 JSON size before sending data:
 
 ```nu
-{message: "Hello"} | jev ask $questions --dry-run
+let preview = ({message: "Hello"} | jev ask $questions --dry-run)
+$preview.request.state
+$preview.request_bytes
 ```
 
-The preview contains neither the API key nor a network response.
+The preview is `{request, request_bytes}`. The byte count covers only the JSON
+body, not HTTP headers or other network overhead. It contains neither the API
+key nor a network response.
 
 ## Annotate a table
 
 `jev annotate` evaluates each record row independently. It preserves the
-source fields and adds the named answers under `jev`, or under `--into`.
+source fields, adds named answers under `jev` (or `--into`), and always adds
+`jev_meta: {base_url, model, usage}` on successful rows.
 
 ```nu
 open messages.nuon
@@ -115,17 +121,21 @@ Useful options:
 
 | Option | Effect |
 | --- | --- |
-| `--meta jev_meta` | Add model, token usage, and a local `request_id` separately. |
+| `--metrics` | Add HTTP measurements (`metrics` for `ask`/`models`, `jev_metrics` for `annotate`). |
 | `--jobs 32` | Limit concurrent distinct evaluations; default is 16. |
 | `--unordered` | Emit ready rows without waiting for earlier slow rows. |
 | `--on-error keep` | Pass a failed row through without an annotation. |
 | `--on-error record` | Add a `jev_error` record to a failed row. |
-| `--dry-run` | Stream request bodies without a key or network call. |
+| `--dry-run` | Stream `{request, request_bytes}` previews without a key or network call. |
 
 The default error mode is `fail`. Successful duplicates can share an
 in-progress request or a bounded, per-invocation cache. Eviction permits a
 later request for the same state. Output and input are bounded, and stopping
-downstream consumption cancels outstanding local work. The service has no
+downstream consumption cancels outstanding local work. With `--metrics`, shared
+annotation rows reuse one `jev_metrics.request_id`; count their usage and body
+bytes once per distinct ID. Metrics contain `request_bytes`, `response_bytes`,
+`elapsed`, `attempt_elapsed`, `attempts`, and `http_version`; both times are Nu
+durations. The service has no
 independent-row batch endpoint: an array sent through `jev ask` is still one
 shared state.
 
@@ -192,7 +202,12 @@ restart with `plugin stop jev`. NUON support is included in the default Cargo
 features via `nuon-tracing-format`; a `--no-default-features` build omits it and
 rejects this setting. Each selected diagnostic event becomes one stderr line
 with `timestamp`, `level`, `target`, `message`, typed `fields`, and root-to-leaf
-`spans`. A successful evaluation's `fields` include input and output tokens.
+`spans`. Successful completion events include the selected `base_url`, body
+byte counts, attempt count, HTTP version, both durations in nanoseconds, and
+evaluation input/output tokens. They occur once per HTTP operation, not per
+cached row. `elapsed` includes retries and waits; `attempt_elapsed` covers
+only the final successful attempt through response validation. Byte counts
+exclude headers and earlier retry responses.
 Parse captured diagnostic-only output in Nu with `use std/formats *` and
 `open --raw jev.log | from ndnuon`; one line also works with `from nuon`.
 The plugin does not write log files. A whole Nu stderr capture may include
@@ -204,8 +219,8 @@ silent; `RUST_LOG` and `JEV_LOG` are not used. Plugin-owned events omit
 credentials, state, questions, and request bodies. Treat captured third-party
 stderr as sensitive. Selecting a target does not enable instrumentation a
 library does not emit.
-Use `--meta` when downstream Nu code needs model, usage, or the local request
-ID as data.
+Use the always-present `meta` or `jev_meta` for model and usage data. Add
+`--metrics` for HTTP measurements and annotation request identity.
 
 One logical evaluation has a total timeout, including retry waits. HTTP
 `429`, `502`, `503`, `504`, and `529` may be retried; `Retry-After` guidance

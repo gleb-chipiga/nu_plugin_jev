@@ -23,8 +23,9 @@ questions. Prefer native Nu commands over inventing extra Jev operations.
 - Use native Nu commands for filtering, sorting, and projecting answers. There
   are no scalar `jev noul|choice|score` or `jev where` commands.
 - Use `jev models` to fetch the current model catalog. It accepts no pipeline
-  input and returns `name`, `description`, and `release_date` strings. Filter
-  or sort with Nu; the list is not cached and does not preflight evaluations.
+  input and returns `{models, meta: {base_url}}`; each model has `name`,
+  `description`, and `release_date` strings. The list is not cached and does
+  not preflight evaluations. Filter or sort after `get models`.
 
 For example, build related questions once, preview one outgoing state, then
 apply the same questions independently to table rows:
@@ -44,22 +45,26 @@ let questions = {
 To inspect available names before choosing a model:
 
 ```nu
-jev models | sort-by name | select name release_date
+jev models | get models | sort-by name | select name release_date
 ```
 
 ## Inspect and consume results
 
 - Use `--dry-run` to inspect the exact outbound request before sending data.
-  It needs no key or network. Never include credentials in examples or output.
+  It returns `{request, request_bytes}`; use `get request.state` for the state.
+  The size is compact UTF-8 JSON body bytes, not total wire traffic. It needs
+  no key or network. Never include credentials in examples or output.
 - Live calls, including `jev models`, need a TypeSafe API key and permitted
   network access. The listing accepts `--base-url`, `--timeout`, and `--config`
   but no evaluation model or table options. If a sandbox
   blocks access, report the call as unverified, not as an API failure.
-- `jev ask` returns `{model, answers, usage}`; `jev annotate` adds `answers`
-  under `jev` or `--into`. Read `noul`, `choice`, or `score` from each named
-  answer; Nu code chooses its own thresholds. `--meta` adds model, usage, and a
-  local request ID. Reused results share that ID, so count reported usage once
-  per distinct ID.
+- `jev ask` returns `{answers, meta: {base_url, model, usage}}`;
+  `jev annotate` adds answers under `jev` or `--into` and always adds
+  `jev_meta: {base_url, model, usage}` on success. Read `noul`, `choice`, or
+  `score` from each named answer; Nu code chooses its own thresholds.
+  `--metrics` adds HTTP measurements: `metrics` on `ask`/`models`,
+  `jev_metrics` on `annotate`. Reused rows share `jev_metrics.request_id`;
+  count usage and body bytes once per distinct ID.
 - With `--on-error keep` or `record`, some rows lack answers. Check for an
   annotation before accessing nested answer fields.
 - `NU_PLUGIN_JEV_LOG=info|debug` enables plugin-only text diagnostics.
@@ -67,6 +72,10 @@ jev models | sort-by name | select name release_date
   To enable them, select targets explicitly, for example
   `NU_PLUGIN_JEV_LOG=nu_plugin_jev=info,reqwest=debug`, then restart with
   `plugin stop jev`. Unlisted dependencies remain off.
+- Successful `evaluation completed` and `model listing completed` events at
+  `info` include the selected `base_url`, body bytes, attempt count, HTTP
+  version, and total/final-attempt nanoseconds even without `--metrics`.
+  They occur once per HTTP operation, not once per cached row.
 - Set `NU_PLUGIN_JEV_LOG_FORMAT=nuon` before startup for one structured record
   per plugin stderr line. Records contain `timestamp`, `level`, `target`,
   `message`, `fields`, and `spans`. Parse captured diagnostic-only lines with

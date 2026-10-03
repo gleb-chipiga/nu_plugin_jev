@@ -1,11 +1,13 @@
 //! Evaluates one finite Nushell state against multiple named questions.
 
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
-use nu_protocol::{Example, LabeledError, PipelineData, Signature, SyntaxShape, Value};
+use nu_protocol::{Example, LabeledError, PipelineData, Record, Signature, SyntaxShape, Value};
 
 use crate::{api::validate::parse_questions, plugin::JevPlugin};
 
-use super::evaluate::{Evaluation, evaluate, to_nu};
+use super::evaluate::{
+    Evaluation, evaluate, evaluation_meta, measurement_value, preview_value, to_nu,
+};
 
 /// Sends one structured state and a nonempty question record to System One.
 pub(crate) struct JevAsk;
@@ -58,9 +60,10 @@ impl PluginCommand for JevAsk {
             )
             .switch(
                 "dry-run",
-                "Return the exact request body without HTTP",
+                "Return {request, request_bytes} without HTTP",
                 None,
             )
+            .switch("metrics", "Include successful HTTP measurements", None)
     }
 
     /// Summarizes the single-state, multi-question primitive.
@@ -70,7 +73,7 @@ impl PluginCommand for JevAsk {
 
     /// Explains that a stream is intentionally collected as one array state.
     fn extra_description(&self) -> &str {
-        "A finite input stream becomes one JSON array state and one API request. --context wraps the state as {input, context}; --dry-run needs no API key. Defaults are resolved per call from flags, Nu config, caller environment, selected local TOML (--config or NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.toml), user TOML, then built-ins."
+        "A finite input stream becomes one JSON array state and one API request. Live success returns {answers, meta: {base_url, model, usage}}; --metrics adds HTTP-only metrics. --context wraps the state as {input, context}; --dry-run returns {request, request_bytes} without an API key. The byte count covers only the compact JSON body. Defaults are resolved per call from flags, Nu config, caller environment, selected local TOML (--config or NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.toml), user TOML, then built-ins."
     }
 
     /// Shows the ordinary one-state usage.
@@ -92,6 +95,11 @@ impl PluginCommand for JevAsk {
     ) -> Result<PipelineData, LabeledError> {
         let questions: Value = call.req(0).map_err(LabeledError::from)?;
         let questions = parse_questions(&questions)?;
+        let metrics = call.has_flag("metrics").map_err(LabeledError::from)?;
+        if metrics && call.has_flag("dry-run").map_err(LabeledError::from)? {
+            return Err(LabeledError::new("--metrics requires a live Jev request")
+                .with_label("remove --metrics or --dry-run", call.head));
+        }
         let state = match input {
             PipelineData::Empty => {
                 return Err(LabeledError::new("jev ask requires an input state")
@@ -107,8 +115,22 @@ impl PluginCommand for JevAsk {
             }
         };
         let result = match evaluate(plugin, engine, call, &state, questions)? {
-            Evaluation::Preview(request) => to_nu(request, call.head)?,
-            Evaluation::Response(response) => to_nu(response, call.head)?,
+            Evaluation::Preview(request) => preview_value(request, call.head)?,
+            Evaluation::Response(success) => {
+                let mut result = Record::with_capacity(if metrics { 3 } else { 2 });
+                result.push("answers", to_nu(&success.response.answers, call.head)?);
+                result.push(
+                    "meta",
+                    evaluation_meta(&success.base_url, &success.response, call.head)?,
+                );
+                if metrics {
+                    result.push(
+                        "metrics",
+                        measurement_value(&success.measurement, None, call.head)?,
+                    );
+                }
+                Value::record(result, call.head)
+            }
         };
         Ok(PipelineData::value(result, None))
     }
@@ -138,7 +160,7 @@ mod tests {
         let mut test = plugin_test()?;
         for example in super::JevAsk.examples() {
             let result = test.eval(example.example)?.into_value(Span::test_data())?;
-            assert_eq!(to_json(&result).unwrap()["model"], "jev-latest");
+            assert_eq!(to_json(&result).unwrap()["request"]["model"], "jev-latest");
         }
         Ok(())
     }
@@ -150,14 +172,19 @@ mod tests {
         let result = test
             .eval("{message: 'hello'} | jev ask {spam: {type: noul, instructions: {task: 'spam'}, criteria: {'true': null}}, kind: {type: choice, criteria: {normal: null, spam: 'bulk'}}, urgency: {type: score, criteria: ['later' 'now']}} --context null --dry-run")?
             .into_value(Span::test_data())?;
+        let preview = to_json(&result).unwrap();
         assert_eq!(
-            to_json(&result).unwrap(),
+            preview["request"],
             json!({"model": "jev-latest", "state": {"input": {"message": "hello"}, "context": null},
             "questions": {
                 "spam": {"type": "noul", "instructions": {"task": "spam"}, "criteria": {"true": null}},
                 "kind": {"type": "choice", "criteria": {"normal": null, "spam": "bulk"}},
                 "urgency": {"type": "score", "criteria": ["later", "now"]}
             }})
+        );
+        assert_eq!(
+            preview["request_bytes"],
+            json!(serde_json::to_vec(&preview["request"]).unwrap().len())
         );
         Ok(())
     }
@@ -184,7 +211,7 @@ mod tests {
             ))?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&short).unwrap(), to_json(&long).unwrap());
-        assert_eq!(to_json(&short).unwrap()["model"], "flag-model");
+        assert_eq!(to_json(&short).unwrap()["request"]["model"], "flag-model");
 
         let live = test
             .eval(&format!(
@@ -192,7 +219,10 @@ mod tests {
             ))?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&live).unwrap()["answers"]["q"]["noul"], 0.75);
-        assert_eq!(server.join().unwrap()[0].body, to_json(&long).unwrap());
+        assert_eq!(
+            server.join().unwrap()[0].body,
+            to_json(&long).unwrap()["request"]
+        );
         Ok(())
     }
 
@@ -212,7 +242,10 @@ mod tests {
         let result = test
             .eval_with("jev ask {match: {type: noul}} --dry-run", input)?
             .into_value(Span::test_data())?;
-        assert_eq!(to_json(&result).unwrap()["state"], json!(["a", "b"]));
+        assert_eq!(
+            to_json(&result).unwrap()["request"]["state"],
+            json!(["a", "b"])
+        );
         assert!(
             test.eval("jev ask {match: {type: noul}} --dry-run")
                 .is_err()
@@ -247,7 +280,17 @@ let result = ({message: $message, sender: $sender} | jev ask $questions)
 $result
 "#;
         let result = test.eval(&source)?.into_value(Span::test_data())?;
-        assert_eq!(to_json(&result).unwrap(), answer);
+        assert_eq!(
+            to_json(&result).unwrap(),
+            json!({
+                "answers": answer["answers"],
+                "meta": {
+                    "base_url": format!("{base_url}/"),
+                    "model": answer["model"],
+                    "usage": answer["usage"]
+                }
+            })
+        );
         let captured = server.join().expect("mock server thread");
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].method, "POST");
@@ -261,6 +304,56 @@ $result
             json!({"message": "Hello", "sender": "Ada"})
         );
         assert_eq!(captured[0].body["questions"].as_object().unwrap().len(), 3);
+        Ok(())
+    }
+
+    /// Keeps provenance always visible and reports HTTP-only metrics on request.
+    #[test]
+    fn live_metrics_match_preview_bytes_and_use_nu_durations() -> Result<(), Box<ShellError>> {
+        let response = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 4, "output_tokens": 1}});
+        let response_bytes = response.to_string().len();
+        let (base_url, server) = serve(vec![response]);
+        let mut test = plugin_test()?;
+        let question = "{q: {type: noul}}";
+        let preview = test
+            .eval(&format!("'hello' | jev ask {question} --dry-run"))?
+            .into_value(Span::test_data())?;
+        let live = test.eval(&format!("$env.TYPESAFE_API_KEY = 'local-key'; 'hello' | jev ask {question} --metrics --base-url '{base_url}'"))?
+            .into_value(Span::test_data())?;
+        let Value::Record { val, .. } = &live else {
+            panic!("ask result is a record");
+        };
+        let Some(Value::Record { val: metrics, .. }) = val.get("metrics") else {
+            panic!("ask metrics is a record");
+        };
+        assert!(matches!(
+            metrics.get("elapsed"),
+            Some(Value::Duration { .. })
+        ));
+        assert!(matches!(
+            metrics.get("attempt_elapsed"),
+            Some(Value::Duration { .. })
+        ));
+        let preview = to_json(&preview).unwrap();
+        let live = to_json(&live).unwrap();
+        assert_eq!(live["answers"]["q"]["noul"], 0.75);
+        assert_eq!(live["meta"]["base_url"], format!("{base_url}/"));
+        assert_eq!(live["meta"]["usage"]["input_tokens"], 4);
+        assert_eq!(live["metrics"]["request_bytes"], preview["request_bytes"]);
+        assert_eq!(live["metrics"]["response_bytes"], response_bytes);
+        assert_eq!(live["metrics"]["attempts"], 1);
+        assert_eq!(live["metrics"]["http_version"], "HTTP/1.1");
+        assert_eq!(
+            live["metrics"]["elapsed"],
+            live["metrics"]["attempt_elapsed"]
+        );
+        assert!(live["metrics"].get("base_url").is_none());
+        assert!(live["metrics"]["elapsed"].as_str().unwrap().ends_with("ns"));
+        assert!(
+            test.eval(&format!("'hello' | jev ask {question} --metrics --dry-run"))
+                .is_err()
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
         Ok(())
     }
 
@@ -287,7 +380,12 @@ $result
         );
         let captured = server.join().expect("mock server thread");
         assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].body, to_json(&preview).unwrap());
+        let preview = to_json(&preview).unwrap();
+        assert_eq!(captured[0].body, preview["request"]);
+        assert_eq!(
+            preview["request_bytes"],
+            json!(serde_json::to_vec(&captured[0].body).unwrap().len())
+        );
         Ok(())
     }
 

@@ -1,6 +1,7 @@
 //! Implements authenticated, bounded-deadline HTTP calls with status-only retries.
 
 use std::{
+    io::{self, Write},
     num::NonZeroUsize,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -10,7 +11,7 @@ use bytes::Bytes;
 use futures::future::{Either, select};
 use lru::LruCache;
 use reqwest::{
-    Client, StatusCode, Url,
+    Client, StatusCode, Url, Version,
     header::{CONTENT_TYPE, HeaderMap, RETRY_AFTER},
 };
 use serde::de::DeserializeOwned;
@@ -70,9 +71,80 @@ impl JevClientPool {
 /// Couples a typed request with JSON bytes prepared outside Tokio workers.
 pub(crate) struct PreparedRequest {
     /// The validated request retained for response-contract checks.
-    pub(crate) wire: SystemOneRequest,
+    pub(crate) wire: Arc<SystemOneRequest>,
     /// The exact reusable HTTP body and canonical cache-key body.
     pub(crate) body: Bytes,
+}
+
+/// Describes one validated logical HTTP operation without transport overhead.
+#[derive(Clone, Debug)]
+pub(crate) struct HttpMeasurement {
+    /// Compact JSON body bytes sent per attempt, or zero for model lookup.
+    pub(crate) request_bytes: usize,
+    /// Bytes consumed from the final successful response body.
+    pub(crate) response_bytes: usize,
+    /// Time from the first send through response decoding and validation.
+    pub(crate) elapsed: Duration,
+    /// Time from the final send through the same successful completion.
+    pub(crate) attempt_elapsed: Duration,
+    /// Explicit HTTP attempts, including failed attempts before success.
+    pub(crate) attempts: usize,
+    /// Final successful response's HTTP protocol version.
+    pub(crate) http_version: Version,
+}
+
+impl HttpMeasurement {
+    /// Names the final response protocol without inferring connection reuse.
+    pub(crate) fn http_version_name(&self) -> &'static str {
+        match self.http_version {
+            Version::HTTP_09 => "HTTP/0.9",
+            Version::HTTP_10 => "HTTP/1.0",
+            Version::HTTP_11 => "HTTP/1.1",
+            Version::HTTP_2 => "HTTP/2",
+            Version::HTTP_3 => "HTTP/3",
+            _ => "HTTP/unknown",
+        }
+    }
+}
+
+/// Keeps selected service provenance and measurements beside one validated result.
+pub(crate) struct MeasuredSuccess<T> {
+    /// Typed service response after all applicable contract checks.
+    pub(crate) response: T,
+    /// Validated service root selected for this invocation.
+    pub(crate) base_url: String,
+    /// Measurement of the successful logical HTTP operation.
+    pub(crate) measurement: HttpMeasurement,
+}
+
+/// Retains attempt timestamps until typed response validation has completed.
+struct PendingSuccess<T> {
+    response: T,
+    request_bytes: usize,
+    response_bytes: usize,
+    first_started: Instant,
+    attempt_started: Instant,
+    attempts: usize,
+    http_version: Version,
+}
+
+impl<T> PendingSuccess<T> {
+    /// Finishes both intervals at the same instant after response validation.
+    fn complete(self, base_url: &Url) -> MeasuredSuccess<T> {
+        let finished = Instant::now();
+        MeasuredSuccess {
+            response: self.response,
+            base_url: base_url.as_str().to_owned(),
+            measurement: HttpMeasurement {
+                request_bytes: self.request_bytes,
+                response_bytes: self.response_bytes,
+                elapsed: finished.duration_since(self.first_started),
+                attempt_elapsed: finished.duration_since(self.attempt_started),
+                attempts: self.attempts,
+                http_version: self.http_version,
+            },
+        }
+    }
 }
 
 /// Distinguishes a bodyless catalog lookup from a JSON evaluation request.
@@ -87,8 +159,46 @@ impl PreparedRequest {
     /// Serializes one request once before scheduling its HTTP evaluation.
     pub(crate) fn new(wire: SystemOneRequest) -> Result<Self, JevError> {
         let body = encode_request(&wire)?;
-        Ok(Self { wire, body })
+        Ok(Self {
+            wire: Arc::new(wire),
+            body,
+        })
     }
+}
+
+/// Counts compact JSON bytes without materializing a second request body.
+struct CountingWriter {
+    bytes: u64,
+}
+
+impl Write for CountingWriter {
+    /// Counts each serialized byte and rejects an unrepresentable size.
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(u64::try_from(buffer.len()).map_err(io::Error::other)?)
+            .ok_or_else(|| io::Error::other("Jev request size overflow"))?;
+        Ok(buffer.len())
+    }
+
+    /// Counts the entire buffer in one checked operation.
+    fn write_all(&mut self, buffer: &[u8]) -> io::Result<()> {
+        self.write(buffer).map(|_| ())
+    }
+
+    /// Does not buffer JSON bytes.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Measures the exact compact JSON body using the live encoder's settings.
+pub(crate) fn request_body_bytes(request: &SystemOneRequest) -> Result<i64, JevError> {
+    let mut writer = CountingWriter { bytes: 0 };
+    serde_json::to_writer(&mut writer, request)
+        .map_err(|_| JevError::new(ErrorKind::Validation, "cannot measure Jev request"))?;
+    i64::try_from(writer.bytes)
+        .map_err(|_| JevError::new(ErrorKind::Validation, "Jev request is too large"))
 }
 
 /// Encodes a validated request without exposing its contents in errors.
@@ -135,8 +245,21 @@ impl JevClient {
         key: &ApiKey,
         cancel: CancelSignal,
     ) -> Result<SystemOneResponse, JevError> {
+        self.system_one_measured(request, config, key, cancel)
+            .await
+            .map(|success| success.response)
+    }
+
+    /// Evaluates one request and retains measured HTTP and root provenance.
+    pub(crate) async fn system_one_measured(
+        &self,
+        request: &SystemOneRequest,
+        config: &InvocationConfig,
+        key: &ApiKey,
+        cancel: CancelSignal,
+    ) -> Result<MeasuredSuccess<SystemOneResponse>, JevError> {
         let body = encode_request(request)?;
-        self.system_one_encoded(request, &body, config, key, cancel)
+        self.system_one_encoded(Arc::new(request.clone()), &body, config, key, cancel)
             .await
     }
 
@@ -148,27 +271,58 @@ impl JevClient {
         key: &ApiKey,
         cancel: CancelSignal,
     ) -> Result<SystemOneResponse, JevError> {
-        self.system_one_encoded(&prepared.wire, &prepared.body, config, key, cancel)
+        self.system_one_prepared_measured(prepared, config, key, cancel)
             .await
+            .map(|success| success.response)
+    }
+
+    /// Reuses a prepared body while retaining measured success provenance.
+    pub(crate) async fn system_one_prepared_measured(
+        &self,
+        prepared: &PreparedRequest,
+        config: &InvocationConfig,
+        key: &ApiKey,
+        cancel: CancelSignal,
+    ) -> Result<MeasuredSuccess<SystemOneResponse>, JevError> {
+        self.system_one_encoded(
+            Arc::clone(&prepared.wire),
+            &prepared.body,
+            config,
+            key,
+            cancel,
+        )
+        .await
     }
 
     /// Sends encoded JSON and validates its response against the typed questions.
     async fn system_one_encoded(
         &self,
-        request: &SystemOneRequest,
+        request: Arc<SystemOneRequest>,
         body: &Bytes,
         config: &InvocationConfig,
         key: &ApiKey,
         cancel: CancelSignal,
-    ) -> Result<SystemOneResponse, JevError> {
-        let response: SystemOneResponse = self.send_system_one(body, config, key, cancel).await?;
-        validate_response(&response, &request.questions).map_err(|_| {
+    ) -> Result<MeasuredSuccess<SystemOneResponse>, JevError> {
+        let pending: PendingSuccess<SystemOneResponse> =
+            self.send_system_one(body, config, key, cancel).await?;
+        let invalid = || {
             JevError::new(
                 ErrorKind::Response,
                 "Jev answer does not match the submitted questions",
             )
-        })?;
-        Ok(response)
+        };
+        let pending = if pending.response_bytes > 64 * 1024 || request.questions.len() > 64 {
+            tokio::task::spawn_blocking(move || {
+                validate_response(&pending.response, &request.questions).map_err(|_| invalid())?;
+                Ok::<_, JevError>(pending)
+            })
+            .await
+            .map_err(|_| JevError::new(ErrorKind::Response, "cannot validate Jev response"))??
+        } else {
+            validate_response(&pending.response, &request.questions).map_err(|_| invalid())?;
+            pending
+        };
+        Ok(pending.complete(&config.base_url))
     }
 
     /// Fetches one uncached model catalog with the evaluation transport policy.
@@ -178,7 +332,22 @@ impl JevClient {
         key: &ApiKey,
         cancel: CancelSignal,
     ) -> Result<ModelMetadataList, JevError> {
-        self.send(HttpOperation::Models, config, key, cancel).await
+        self.models_measured(config, key, cancel)
+            .await
+            .map(|success| success.response)
+    }
+
+    /// Fetches a catalog and retains its bodyless request measurement.
+    pub(crate) async fn models_measured(
+        &self,
+        config: &TransportConfig,
+        key: &ApiKey,
+        cancel: CancelSignal,
+    ) -> Result<MeasuredSuccess<ModelMetadataList>, JevError> {
+        let pending = self
+            .send(HttpOperation::Models, config, key, cancel)
+            .await?;
+        Ok(pending.complete(&config.base_url))
     }
 
     /// Sends one authenticated System One operation with retryable status handling.
@@ -188,19 +357,19 @@ impl JevClient {
         config: &InvocationConfig,
         key: &ApiKey,
         cancel: CancelSignal,
-    ) -> Result<SystemOneResponse, JevError> {
+    ) -> Result<PendingSuccess<SystemOneResponse>, JevError> {
         self.send(HttpOperation::SystemOne(body), config, key, cancel)
             .await
     }
 
     /// Applies the same status retries, deadline, and cancellation to both endpoints.
-    async fn send<T: DeserializeOwned>(
+    async fn send<T: DeserializeOwned + Send + 'static>(
         &self,
         operation: HttpOperation<'_>,
         config: &impl TransportSettings,
         key: &ApiKey,
         mut cancel: CancelSignal,
-    ) -> Result<T, JevError> {
+    ) -> Result<PendingSuccess<T>, JevError> {
         if cancel.is_cancelled() {
             return Err(JevError::new(
                 ErrorKind::Cancelled,
@@ -213,7 +382,12 @@ impl JevClient {
             HttpOperation::SystemOne(_) => system_one_url(root)?,
         };
         let deadline = Instant::now() + timeout;
+        let request_bytes = match operation {
+            HttpOperation::Models => 0,
+            HttpOperation::SystemOne(body) => body.len(),
+        };
         let task = async {
+            let mut first_started = None;
             for attempt in 0..=retries {
                 let attempt_number = attempt + 1;
                 tracing::debug!(attempt = attempt_number, "Jev HTTP attempt started");
@@ -226,6 +400,8 @@ impl JevClient {
                         .header(CONTENT_TYPE, "application/json")
                         .body(body.clone()),
                 };
+                let attempt_started = Instant::now();
+                first_started.get_or_insert(attempt_started);
                 let response = request.send().await.map_err(|_| {
                     tracing::debug!(attempt = attempt_number, "Jev HTTP transport failed");
                     JevError::new(ErrorKind::Transport, "Jev HTTP transport failed")
@@ -248,11 +424,34 @@ impl JevClient {
                     );
                 }
                 if status.is_success() {
-                    return response.json::<T>().await.map_err(|_| {
+                    let http_version = response.version();
+                    let body = response.bytes().await.map_err(|_| {
+                        JevError::new(ErrorKind::Response, "Jev returned an unreadable response")
+                    })?;
+                    let response_bytes = body.len();
+                    let decoded = if response_bytes > 64 * 1024 {
+                        tokio::task::spawn_blocking(move || serde_json::from_slice::<T>(&body))
+                            .await
+                            .map_err(|_| {
+                                JevError::new(ErrorKind::Response, "cannot decode Jev response")
+                            })?
+                    } else {
+                        serde_json::from_slice::<T>(&body)
+                    }
+                    .map_err(|_| {
                         JevError::new(
                             ErrorKind::Response,
                             "Jev returned malformed JSON or missing fields",
                         )
+                    })?;
+                    return Ok(PendingSuccess {
+                        response: decoded,
+                        request_bytes,
+                        response_bytes,
+                        first_started: first_started.expect("send attempt has a start"),
+                        attempt_started,
+                        attempts: attempt_number,
+                        http_version,
                     });
                 }
                 if attempt < retries && retryable(status) {
@@ -417,8 +616,8 @@ mod tests {
 
     use super::{
         Bytes, JevClient, JevClientPool, jittered_backoff, jittered_backoff_with_entropy,
-        models_url, retry_after, retry_after_ms, retry_delay, retryable, server_request_id,
-        system_one_url,
+        models_url, request_body_bytes, retry_after, retry_after_ms, retry_delay, retryable,
+        server_request_id, system_one_url,
     };
 
     /// Captures only fields needed to verify outgoing mock requests.
@@ -593,6 +792,161 @@ mod tests {
     fn answer() -> serde_json::Value {
         json!({"model": "jev-2026-09", "answers": {"spam": {"type": "noul", "noul": 0.9}},
             "usage": {"input_tokens": 10, "output_tokens": 2}})
+    }
+
+    /// Matches the live compact encoder for nested Unicode and mixed questions.
+    #[test]
+    fn counts_exact_compact_request_body_bytes() {
+        let mut request = request();
+        request.state = json!({"thread": ["Привет", "quote: \"hello\"", {"nested": true}]});
+        request.questions.insert(
+            "kind".into(),
+            Question::Choice {
+                instructions: Some(json!({"task": "classify"})),
+                criteria: BTreeMap::from([
+                    ("normal".into(), json!(null)),
+                    ("spam".into(), json!({"hint": "реклама"})),
+                ]),
+            },
+        );
+        request.questions.insert(
+            "urgency".into(),
+            Question::Score {
+                instructions: Some(json!(["priority", "review"])),
+                criteria: vec![json!("later"), json!("сейчас")],
+            },
+        );
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(request_body_bytes(&request).unwrap(), encoded.len() as i64);
+        assert!(encoded.len() > serde_json::to_string(&request).unwrap().chars().count());
+    }
+
+    /// Matches bytes actually captured by the local HTTP service.
+    #[test]
+    fn counted_request_size_matches_submitted_body() {
+        let (url, server) = serve(vec![MockResponse::json(200, answer())]);
+        let mut request = request();
+        request.state = json!({"message": "Привет \"Jev\"", "nested": [1, {"ok": true}]});
+        let measured = request_body_bytes(&request).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let client = JevClient::new().unwrap();
+            let (_handle, signal) = CancelHandle::new();
+            client
+                .system_one(&request, &config(url), &ApiKey::for_test("test"), signal)
+                .await
+                .unwrap();
+        });
+        assert_eq!(server.join().unwrap()[0].body.len() as i64, measured);
+    }
+
+    /// Measures one validated POST from its actual submitted and consumed bodies.
+    #[test]
+    fn measured_system_one_success_keeps_root_and_body_sizes() {
+        let answer = answer();
+        let response_bytes = answer.to_string().len();
+        let (url, server) = serve(vec![MockResponse::json(200, answer)]);
+        let request = request();
+        let expected_request_bytes = serde_json::to_vec(&request).unwrap().len();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let success = runtime.block_on(async {
+            let client = JevClient::new().unwrap();
+            let (_handle, signal) = CancelHandle::new();
+            client
+                .system_one_measured(
+                    &request,
+                    &config(url.clone()),
+                    &ApiKey::for_test("test"),
+                    signal,
+                )
+                .await
+                .unwrap()
+        });
+        assert_eq!(success.base_url, url.as_str());
+        assert_eq!(success.response.model, "jev-2026-09");
+        assert_eq!(success.measurement.request_bytes, expected_request_bytes);
+        assert_eq!(success.measurement.response_bytes, response_bytes);
+        assert_eq!(success.measurement.attempts, 1);
+        assert_eq!(success.measurement.http_version, reqwest::Version::HTTP_11);
+        assert_eq!(
+            success.measurement.elapsed,
+            success.measurement.attempt_elapsed
+        );
+        assert_eq!(server.join().unwrap()[0].body.len(), expected_request_bytes);
+    }
+
+    /// Includes retry delay only in total time and excludes retry bodies from sizes.
+    #[test]
+    fn measured_retry_keeps_final_body_and_attempt_duration() {
+        let answer = answer();
+        let response_bytes = answer.to_string().len();
+        let (url, server) = serve(vec![
+            MockResponse::json(503, json!({})).header("Retry-After-Ms", "50"),
+            MockResponse::json(200, answer),
+        ]);
+        let mut settings = config(url.clone());
+        settings.retries = 1;
+        let request = request();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let success = runtime.block_on(async {
+            let client = JevClient::new().unwrap();
+            let (_handle, signal) = CancelHandle::new();
+            client
+                .system_one_measured(&request, &settings, &ApiKey::for_test("test"), signal)
+                .await
+                .unwrap()
+        });
+        assert_eq!(success.base_url, url.as_str());
+        assert_eq!(success.measurement.attempts, 2);
+        assert_eq!(success.measurement.response_bytes, response_bytes);
+        assert!(
+            success.measurement.elapsed - success.measurement.attempt_elapsed
+                >= Duration::from_millis(50)
+        );
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    /// Reports a bodyless GET with the final response's exact body size.
+    #[test]
+    fn measured_models_success_has_zero_request_bytes() {
+        let body = model_list();
+        let response_bytes = body.to_string().len();
+        let (url, server) = serve(vec![MockResponse::json(200, body)]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let success = runtime.block_on(async {
+            let client = JevClient::new().unwrap();
+            let (_handle, signal) = CancelHandle::new();
+            client
+                .models_measured(
+                    &models_config(url.clone()),
+                    &ApiKey::for_test("test"),
+                    signal,
+                )
+                .await
+                .unwrap()
+        });
+        assert_eq!(success.base_url, url.as_str());
+        assert_eq!(success.response.models.len(), 2);
+        assert_eq!(success.measurement.request_bytes, 0);
+        assert_eq!(success.measurement.response_bytes, response_bytes);
+        assert_eq!(success.measurement.attempts, 1);
+        assert_eq!(
+            success.measurement.elapsed,
+            success.measurement.attempt_elapsed
+        );
+        assert!(server.join().unwrap()[0].body.is_empty());
     }
 
     /// Joins the System One path independently of the root's trailing slash.
@@ -1278,7 +1632,7 @@ mod tests {
                     trace_evaluation(
                         "ask",
                         "jev-trace-test",
-                        client.system_one(
+                        client.system_one_measured(
                             &request(),
                             &config,
                             &ApiKey::for_test("local-test-key"),
@@ -1290,12 +1644,14 @@ mod tests {
                 );
                 let failure =
                     trace_evaluation("ask", "jev-failed", async { Err(JevError::http(401)) }).await;
-                assert_eq!(failure.unwrap_err().status, Some(401));
+                assert_eq!(failure.err().expect("failed evaluation").status, Some(401));
             });
         });
         drop(guard);
         assert_eq!(server.join().unwrap().len(), 3);
         let diagnostics = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(diagnostics.matches("evaluation completed").count(), 1);
+        assert_eq!(diagnostics.matches("evaluation failed").count(), 1);
         for (attempt, expected_id) in [(1, "req_retry_1"), (3, "req_success_3")] {
             let line = diagnostics
                 .lines()
@@ -1624,9 +1980,10 @@ mod tests {
     /// Negotiates h2 on capable HTTPS routes and HTTP/1.1 otherwise.
     #[test]
     fn tls_alpn_negotiates_h2_and_http1_fallback() {
-        for (h2_enabled, expected_alpn) in
-            [(true, b"h2".as_slice()), (false, b"http/1.1".as_slice())]
-        {
+        for (h2_enabled, expected_alpn, expected_version) in [
+            (true, b"h2".as_slice(), reqwest::Version::HTTP_2),
+            (false, b"http/1.1".as_slice(), reqwest::Version::HTTP_11),
+        ] {
             let TlsFixture {
                 url,
                 certificate,
@@ -1649,9 +2006,15 @@ mod tests {
             runtime.block_on(async {
                 let (_handle, signal) = CancelHandle::new();
                 let result = client
-                    .system_one(&request(), &config(url), &ApiKey::for_test("test"), signal)
-                    .await;
-                assert!(result.is_ok(), "{result:?}");
+                    .system_one_measured(
+                        &request(),
+                        &config(url),
+                        &ApiKey::for_test("test"),
+                        signal,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result.measurement.http_version, expected_version);
             });
             let (alpn, count) = server.join().unwrap();
             assert_eq!(alpn, expected_alpn);

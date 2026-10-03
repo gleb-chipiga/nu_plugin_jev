@@ -1,10 +1,6 @@
-# jev-model-discovery Specification
+# Spec Delta
 
-## Purpose
-
-Let Nushell users discover the model names exposed to their TypeSafe account as ordinary tabular data without changing how evaluations select models.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: List model metadata as Nu rows
 
@@ -53,31 +49,3 @@ Let Nushell users discover the model names exposed to their TypeSafe account as 
 
 - **WHEN** pipeline input is supplied or the lookup fails before a validated model-list response exists
 - **THEN** the command returns the existing error without a `models`/`meta`/`metrics` success envelope
-
-### Requirement: Model discovery selects TOML per invocation
-
-`jev models` SHALL select and read its local and user TOML configuration for each invocation using the existing live-command precedence. `--config <path>` SHALL select the local TOML file for that invocation, overriding `NU_PLUGIN_JEV_CONFIG` and the implicit local filename. A reused plugin process SHALL NOT retain parsed TOML settings between invocations.
-
-#### Scenario: File changes between listings
-
-- **WHEN** a TOML setting changes between two `jev models` invocations in the same plugin process
-- **THEN** the second invocation uses the updated setting without restarting the plugin
-
-#### Scenario: Explicit file selection
-
-- **WHEN** the caller passes `--config <path>` to `jev models` while `NU_PLUGIN_JEV_CONFIG` names another file
-- **THEN** the flag-selected file supplies the local TOML layer for that invocation
-
-### Requirement: Model discovery is informational and fresh
-
-Each `jev models` invocation SHALL make its own logical listing request and SHALL NOT return a process-cached model list. The result SHALL NOT update the configured model, automatically select a model, or cause `jev ask` or `jev annotate` to preflight their model names against the list. Existing evaluation calls SHALL make no additional models request.
-
-#### Scenario: Listing changes in a reused plugin process
-
-- **WHEN** the service returns different model entries on two `jev models` invocations using one plugin process
-- **THEN** each invocation returns its own service response without a plugin restart
-
-#### Scenario: Evaluation remains independent
-
-- **WHEN** the caller invokes `jev ask` or `jev annotate` without first listing models
-- **THEN** the evaluation follows its existing model-selection behavior without a `GET /v1/models` preflight

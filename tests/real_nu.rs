@@ -250,7 +250,7 @@ fn ask_native_get_keeps_mixed_answer_details() {
         return;
     }
     let (base_url, server) = serve_mixed_once();
-    let source = "let q = {spam: {type: noul}, kind: {type: choice, criteria: {normal: null, spam: null}}, urgency: {type: score, criteria: ['later' 'today' 'now']}}; let result = ('hello' | jev ask $q); {probability: ($result | get answers.spam.noul), passes: (($result | get answers.spam.noul) > 0.98), kind: ($result | get answers.kind.choice), confidence: ($result | get answers.kind.confidence), distribution: ($result | get answers.kind.probabilities), score: ($result | get answers.urgency.score), legend: ($result | get answers.urgency.legend), model: ($result | get model)} | to json --raw";
+    let source = "let q = {spam: {type: noul}, kind: {type: choice, criteria: {normal: null, spam: null}}, urgency: {type: score, criteria: ['later' 'today' 'now']}}; let result = ('hello' | jev ask $q); {probability: ($result | get answers.spam.noul), passes: (($result | get answers.spam.noul) > 0.98), kind: ($result | get answers.kind.choice), confidence: ($result | get answers.kind.confidence), distribution: ($result | get answers.kind.probabilities), score: ($result | get answers.urgency.score), legend: ($result | get answers.urgency.legend), model: ($result | get meta.model)} | to json --raw";
     let output = Command::new("nu")
         .args([
             "--no-config-file",
@@ -274,6 +274,17 @@ fn ask_native_get_keeps_mixed_answer_details() {
     assert!(diagnostics.contains("evaluation started"));
     assert!(diagnostics.contains("evaluation completed"));
     assert!(diagnostics.contains("command=\"ask\""));
+    assert!(diagnostics.contains(&format!("base_url={base_url}/")));
+    for field in [
+        "request_bytes=",
+        "response_bytes=",
+        "elapsed_ns=",
+        "attempt_elapsed_ns=",
+        "attempts=1",
+        "http_version=\"HTTP/1.1\"",
+    ] {
+        assert!(diagnostics.contains(field), "missing {field}");
+    }
     for secret in ["local-key", "hello", "Authorization"] {
         assert!(!diagnostics.contains(secret));
     }
@@ -345,7 +356,7 @@ fn ask_nuon_correlates_retry_attempts() {
             "--plugins",
             env!("CARGO_BIN_EXE_nu_plugin_jev"),
             "--commands",
-            "'hello' | jev ask {match: {type: noul}} --timeout 5sec | get answers.match.noul | to json --raw",
+            "let result = ('hello' | jev ask {match: {type: noul}} --timeout 5sec --metrics); {answer: $result.answers.match.noul, meta: $result.meta, metrics: $result.metrics, elapsed_ns: ($result.metrics.elapsed | into int), attempt_elapsed_ns: ($result.metrics.attempt_elapsed | into int)} | to json --raw",
         ])
         .env("TYPESAFE_API_KEY", "local-key")
         .env("NU_PLUGIN_JEV_BASE_URL", &base_url)
@@ -360,7 +371,10 @@ fn ask_nuon_correlates_retry_attempts() {
         "Nu failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.stdout.trim_ascii(), b"0.9");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("Nu JSON result");
+    assert_eq!(result["answer"], 0.9);
+    assert_eq!(result["meta"]["base_url"], format!("{base_url}/"));
+    assert_eq!(result["metrics"]["attempts"], 3);
     let records = parse_nuon_diagnostics_in_nu(&output.stderr);
     let attempts = records
         .iter()
@@ -421,10 +435,58 @@ fn ask_nuon_correlates_retry_attempts() {
         .expect("completed evaluation");
     assert_eq!(completed["fields"]["input_tokens"], 2);
     assert_eq!(completed["fields"]["output_tokens"], 1);
+    assert_eq!(completed["fields"]["base_url"], result["meta"]["base_url"]);
+    for name in [
+        "request_bytes",
+        "response_bytes",
+        "attempts",
+        "http_version",
+    ] {
+        assert_eq!(completed["fields"][name], result["metrics"][name]);
+    }
+    assert_eq!(completed["fields"]["elapsed_ns"], result["elapsed_ns"]);
+    assert_eq!(
+        completed["fields"]["attempt_elapsed_ns"],
+        result["attempt_elapsed_ns"]
+    );
+    assert!(completed["fields"]["duration_ms"].as_u64().is_some());
     let diagnostics = String::from_utf8_lossy(&output.stderr);
     for secret in ["local-key", "hello", "Authorization", "req_local-key"] {
         assert!(!diagnostics.contains(secret));
     }
+}
+
+/// Keeps offline previews free of fabricated successful HTTP diagnostics.
+#[test]
+fn dry_run_has_no_success_measurement_event() {
+    if Command::new("nu").arg("--version").output().is_err() {
+        return;
+    }
+    let source = "let ask = ('hello' | jev ask {q: {type: noul}} --dry-run); let annotate = ([{message: 'hello'}] | jev annotate {q: {type: noul}} --dry-run); {ask: $ask, annotate: $annotate} | to json --raw";
+    let output = Command::new("nu")
+        .args([
+            "--no-config-file",
+            "--plugins",
+            env!("CARGO_BIN_EXE_nu_plugin_jev"),
+            "--commands",
+            source,
+        ])
+        .env("NU_PLUGIN_JEV_LOG", "info")
+        .output()
+        .expect("run isolated Nu dry-run");
+    assert!(
+        output.status.success(),
+        "Nu failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("Nu JSON result");
+    assert!(result["ask"]["request_bytes"].as_u64().is_some());
+    assert!(result["ask"].get("meta").is_none());
+    assert!(result["ask"].get("metrics").is_none());
+    assert!(result["annotate"][0]["request_bytes"].as_u64().is_some());
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(!diagnostics.contains("evaluation completed"));
+    assert!(!diagnostics.contains("model listing completed"));
 }
 
 /// Responds to three distinct projected states with typed, state-dependent decisions.
@@ -488,9 +550,9 @@ let q = {
     urgency: {type: score, criteria: ['later' 'today' 'now']}
 }
 let rows = ([{id: 1, message: 'urgent', sender: 'a', secret: 'local-1'} {id: 2, message: 'normal', sender: 'b', secret: 'local-2'} {id: 3, message: 'later', sender: 'c', secret: 'local-3'}]
-    | jev annotate $q --fields [message sender] --context {policy: 'rules'} --into ai --meta ai_meta --jobs 2
-    | select id message sender secret ai ai_meta)
-{all: $rows, filtered: ($rows | where ai.spam.noul > 0.9 | sort-by ai.urgency.score --reverse | reject ai_meta)} | to json --raw
+    | jev annotate $q --fields [message sender] --context {policy: 'rules'} --into ai --metrics --jobs 2
+    | select id message sender secret ai jev_meta jev_metrics)
+{all: $rows, filtered: ($rows | where ai.spam.noul > 0.9 | sort-by ai.urgency.score --reverse | reject jev_meta jev_metrics)} | to json --raw
 "#;
     let output = Command::new("nu")
         .args([
@@ -522,19 +584,25 @@ let rows = ([{id: 1, message: 'urgent', sender: 'a', secret: 'local-1'} {id: 2, 
             "missing diagnostic: {expected}"
         );
     }
-    assert!(diagnostics.contains(wire["all"][0]["ai_meta"]["request_id"].as_str().unwrap()));
+    assert!(
+        diagnostics.contains(
+            wire["all"][0]["jev_metrics"]["request_id"]
+                .as_str()
+                .unwrap()
+        )
+    );
     for secret in ["local-key", "local-1", "urgent"] {
         assert!(!diagnostics.contains(secret));
     }
     assert_eq!(wire["all"].as_array().unwrap().len(), 3);
     assert_eq!(wire["all"][0]["secret"], "local-1");
-    assert_eq!(wire["all"][0]["ai_meta"]["model"], "jev-fixed");
-    assert_eq!(wire["all"][0]["ai_meta"]["usage"]["input_tokens"], 10);
+    assert_eq!(wire["all"][0]["jev_meta"]["model"], "jev-fixed");
+    assert_eq!(wire["all"][0]["jev_meta"]["usage"]["input_tokens"], 10);
     assert_eq!(wire["filtered"].as_array().unwrap().len(), 2);
     assert_eq!(wire["filtered"][0]["id"], 1);
     assert_eq!(wire["filtered"][1]["id"], 3);
     assert_eq!(wire["filtered"][0]["ai"]["kind"]["choice"], "spam");
-    assert!(wire["filtered"][0].get("ai_meta").is_none());
+    assert!(wire["filtered"][0].get("jev_meta").is_none());
     let captured = server.join().expect("join table mock");
     assert_eq!(captured.len(), 3);
     for request in captured {
@@ -558,7 +626,7 @@ fn annotate_nuon_correlates_cached_rows() {
         return;
     }
     let (base_url, stop, calls, server) = serve_until_stopped(false);
-    let source = "[{id: 1, message: 7} {id: 2, message: 7} {id: 3, message: 7}] | jev annotate {match: {type: noul}} --fields [message] --jobs 1 --meta ai_meta | select id ai_meta | to json --raw";
+    let source = "let rows = ([{id: 1, message: 7} {id: 2, message: 7} {id: 3, message: 7}] | jev annotate {match: {type: noul}} --fields [message] --jobs 1 --metrics | select id jev_meta jev_metrics); {rows: $rows, elapsed_ns: ($rows | get 0.jev_metrics.elapsed | into int), attempt_elapsed_ns: ($rows | get 0.jev_metrics.attempt_elapsed | into int)} | to json --raw";
     let output = Command::new("nu")
         .args([
             "--no-config-file",
@@ -580,16 +648,16 @@ fn annotate_nuon_correlates_cached_rows() {
         "Nu failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).expect("Nu JSON table");
-    let rows = rows.as_array().expect("annotated rows");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("Nu JSON table");
+    let rows = result["rows"].as_array().expect("annotated rows");
     assert_eq!(rows.len(), 3);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    let request_id = rows[0]["ai_meta"]["request_id"]
+    let request_id = rows[0]["jev_metrics"]["request_id"]
         .as_str()
         .expect("request identity");
     assert!(
         rows.iter()
-            .all(|row| row["ai_meta"]["request_id"] == request_id)
+            .all(|row| row["jev_metrics"]["request_id"] == request_id)
     );
     let records = parse_nuon_diagnostics_in_nu(&output.stderr);
     let hits = records
@@ -601,6 +669,33 @@ fn annotate_nuon_correlates_cached_rows() {
         hits.iter()
             .all(|record| record["fields"]["request_id"] == request_id)
     );
+    let completed = records
+        .iter()
+        .filter(|record| record["message"] == "evaluation completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(
+        completed[0]["fields"]["base_url"],
+        rows[0]["jev_meta"]["base_url"]
+    );
+    assert_eq!(
+        completed[0]["fields"]["input_tokens"],
+        rows[0]["jev_meta"]["usage"]["input_tokens"]
+    );
+    for name in [
+        "request_bytes",
+        "response_bytes",
+        "attempts",
+        "http_version",
+    ] {
+        assert_eq!(completed[0]["fields"][name], rows[0]["jev_metrics"][name]);
+    }
+    assert_eq!(completed[0]["fields"]["elapsed_ns"], result["elapsed_ns"]);
+    assert_eq!(
+        completed[0]["fields"]["attempt_elapsed_ns"],
+        result["attempt_elapsed_ns"]
+    );
+    assert_eq!(diagnostic_request_id(completed[0]), Some(request_id));
     let diagnostics = String::from_utf8_lossy(&output.stderr);
     assert!(!diagnostics.contains("local-key"));
 }
@@ -779,7 +874,7 @@ fn real_nu_models_are_fresh_native_records() {
         return;
     }
     let (url, server) = serve_model_catalogs(&["first", "second"]);
-    let source = "{first: (jev models | sort-by name | select name description release_date), second: (jev models | where name == 'second' | select name release_date)} | to json --raw";
+    let source = "{first: (jev models | get models | sort-by name | select name description release_date), second: (jev models | get models | where name == 'second' | select name release_date)} | to json --raw";
     let output = Command::new("nu")
         .args([
             "--no-config-file",
@@ -814,6 +909,75 @@ fn real_nu_models_are_fresh_native_records() {
     );
 }
 
+/// Correlates unflagged and measured catalog lookups with NUON completion events.
+#[test]
+#[cfg(feature = "nuon-tracing-format")]
+fn models_nuon_completion_matches_optional_metrics() {
+    if Command::new("nu").arg("--version").output().is_err() {
+        return;
+    }
+    let (base_url, server) = serve_model_catalogs(&["first", "second"]);
+    let source = "let first = (jev models); let second = (jev models --metrics); {first: $first, second: $second, elapsed_ns: ($second.metrics.elapsed | into int), attempt_elapsed_ns: ($second.metrics.attempt_elapsed | into int)} | to json --raw";
+    let output = Command::new("nu")
+        .args([
+            "--no-config-file",
+            "--plugins",
+            env!("CARGO_BIN_EXE_nu_plugin_jev"),
+            "--commands",
+            source,
+        ])
+        .env("TYPESAFE_API_KEY", "local-model-key")
+        .env("NU_PLUGIN_JEV_BASE_URL", &base_url)
+        .env("NU_PLUGIN_JEV_LOG", "info")
+        .env("NU_PLUGIN_JEV_LOG_FORMAT", "nuon")
+        .output()
+        .expect("run isolated Nu model lookup");
+    assert!(
+        output.status.success(),
+        "Nu failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("Nu JSON result");
+    assert_eq!(result["first"]["models"][0]["name"], "first");
+    assert!(result["first"].get("metrics").is_none());
+    assert_eq!(result["second"]["models"][0]["name"], "second");
+    assert_eq!(result["second"]["metrics"]["request_bytes"], 0);
+    let records = parse_nuon_diagnostics_in_nu(&output.stderr);
+    let completed = records
+        .iter()
+        .filter(|record| record["message"] == "model listing completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 2);
+    assert_eq!(
+        completed[0]["fields"]["base_url"],
+        result["first"]["meta"]["base_url"]
+    );
+    assert_eq!(completed[0]["fields"]["request_bytes"], 0);
+    assert_eq!(completed[0]["fields"]["count"], 1);
+    assert!(completed[0]["fields"].get("input_tokens").is_none());
+    assert_eq!(
+        completed[1]["fields"]["base_url"],
+        result["second"]["meta"]["base_url"]
+    );
+    for name in [
+        "request_bytes",
+        "response_bytes",
+        "attempts",
+        "http_version",
+    ] {
+        assert_eq!(
+            completed[1]["fields"][name],
+            result["second"]["metrics"][name]
+        );
+    }
+    assert_eq!(completed[1]["fields"]["elapsed_ns"], result["elapsed_ns"]);
+    assert_eq!(
+        completed[1]["fields"]["attempt_elapsed_ns"],
+        result["attempt_elapsed_ns"]
+    );
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
 /// Reads changed user TOML again for a second models call in the same Nu session.
 #[test]
 fn real_nu_models_reload_toml_between_calls() {
@@ -827,7 +991,7 @@ fn real_nu_models_reload_toml_between_calls() {
     std::fs::write(&config, "timeout_ms = 5000\n").expect("initial user TOML");
     let (url, server) = serve_model_catalogs(&["first"]);
     let source = r#"
-let first = (jev models --base-url '{URL}' | get 0.name)
+let first = (jev models --base-url '{URL}' | get models.0.name)
 'timeout_ms = 0' | save --force '{CONFIG}'
 let second_error = (try { jev models --base-url '{URL}' } catch {|err| $err.msg })
 {first: $first, second_error: $second_error} | to json --raw
@@ -1059,27 +1223,27 @@ fn toml_defaults_follow_caller_directory_and_reload_between_calls() {
     let source = r#"
 let q = {match: (jev question noul 'Match?')};
 cd '{FIRST}';
-let a = ('hello' | jev ask $q --dry-run | get model);
+let a = ('hello' | jev ask $q --dry-run | get request.model);
 let pending = ([{message: 1}] | jev annotate $q --dry-run);
 "model = 'updated-model'" | save --force .nu_plugin_jev.toml;
-let frozen = ($pending | get 0.model);
-let b = ('hello' | jev ask $q --dry-run | get model);
+let frozen = ($pending | get 0.request.model);
+let b = ('hello' | jev ask $q --dry-run | get request.model);
 cd '{SECOND}';
-let c = ('hello' | jev ask $q --dry-run | get model);
+let c = ('hello' | jev ask $q --dry-run | get request.model);
 "model = 'changed-user'" | save --force '{USER}/nu_plugin_jev/config.toml';
-let changed_user = ('hello' | jev ask $q --dry-run | get model);
+let changed_user = ('hello' | jev ask $q --dry-run | get request.model);
 $env.NU_PLUGIN_JEV_MODEL = 'env-model';
-let changed_env = ('hello' | jev ask $q --dry-run | get model);
+let changed_env = ('hello' | jev ask $q --dry-run | get request.model);
 hide-env NU_PLUGIN_JEV_MODEL;
 $env.NU_PLUGIN_JEV_CONFIG = '{FIRST}/.nu_plugin_jev.toml';
-let d = ('hello' | jev ask $q --dry-run | get model);
-let e = ('hello' | jev ask $q --config '{EXPLICIT}' --dry-run | get model);
+let d = ('hello' | jev ask $q --dry-run | get request.model);
+let e = ('hello' | jev ask $q --config '{EXPLICIT}' --dry-run | get request.model);
 hide-env NU_PLUGIN_JEV_CONFIG;
-let parallel = (['{FIRST}' '{SECOND}'] | par-each { |dir| cd $dir; 'hello' | jev ask $q --dry-run | get model } | sort);
+let parallel = (['{FIRST}' '{SECOND}'] | par-each { |dir| cd $dir; 'hello' | jev ask $q --dry-run | get request.model } | sort);
 cd '{SECOND}';
 $env.XDG_CONFIG_HOME = '{LEGACY_USER}';
-let ignored_legacy_files = ('hello' | jev ask $q --dry-run | get model);
-let explicit_legacy = ('hello' | jev ask $q --config .jev.toml --dry-run | get model);
+let ignored_legacy_files = ('hello' | jev ask $q --dry-run | get request.model);
+let explicit_legacy = ('hello' | jev ask $q --config .jev.toml --dry-run | get request.model);
 cd '{BROKEN}';
 let offline = ((jev question noul 'Still offline?') | get type);
 let guidance = (jev | str contains 'jev ask');
@@ -1137,7 +1301,7 @@ fn replaced_environment_names_are_not_selected() {
     }
     let root = std::env::temp_dir().join(format!("jev-old-env-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("isolated config directory");
-    let source = "let q = {match: {type: noul}}; let a = ('hello' | jev ask $q --dry-run | get model); let b = ([{message: 'hello'}] | jev annotate $q --dry-run | get 0.model); [$a $b] | to json --raw";
+    let source = "let q = {match: {type: noul}}; let a = ('hello' | jev ask $q --dry-run | get request.model); let b = ([{message: 'hello'}] | jev annotate $q --dry-run | get 0.request.model); [$a $b] | to json --raw";
     let output = Command::new("nu")
         .args([
             "--no-config-file",

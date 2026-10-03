@@ -23,7 +23,7 @@ use crate::{
     plugin::JevPlugin,
 };
 
-use super::evaluate::to_nu;
+use super::evaluate::{evaluation_meta, measurement_value, preview_value, to_nu};
 
 /// Annotates each record row with answers from one named multi-question request.
 pub(crate) struct JevAnnotate;
@@ -49,7 +49,7 @@ struct TableOptions {
     selector: StateSelector,
     context: Option<Value>,
     into: String,
-    meta: Option<String>,
+    metrics: bool,
     on_error: ErrorPolicy,
     unordered: bool,
     dry_run: bool,
@@ -125,12 +125,7 @@ impl PluginCommand for JevAnnotate {
                 "Answer field (default: jev)",
                 Some('i'),
             )
-            .named(
-                "meta",
-                SyntaxShape::String,
-                "Optional model, usage, and request identity field",
-                None,
-            )
+            .switch("metrics", "Add jev_metrics to successful rows", None)
             .named(
                 "on-error",
                 SyntaxShape::String,
@@ -138,7 +133,11 @@ impl PluginCommand for JevAnnotate {
                 None,
             )
             .switch("unordered", "Emit rows as their evaluations complete", None)
-            .switch("dry-run", "Stream exact request bodies without HTTP", None)
+            .switch(
+                "dry-run",
+                "Stream {request, request_bytes} without HTTP",
+                None,
+            )
     }
 
     /// Summarizes independent per-row decisions.
@@ -148,7 +147,7 @@ impl PluginCommand for JevAnnotate {
 
     /// Clarifies that each row is one state and native Nu handles filtering.
     fn extra_description(&self) -> &str {
-        "Each row is an independent System One state; matching requests may share one evaluation. --fields selects literal top-level names, while --state follows a Nu cell path. Use native where and sort-by on answers. Settings are snapshotted per call from flags, Nu config, caller environment, local TOML (--config or NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.toml), user TOML, then defaults."
+        "Each row is an independent System One state; matching requests may share one evaluation. Successful rows always add jev_meta with base_url, model, and usage; --metrics adds jev_metrics with one shared request_id and HTTP measurements. --fields selects literal top-level names, while --state follows a Nu cell path. Use native where and sort-by on answers. Settings are snapshotted per call from flags, Nu config, caller environment, local TOML (--config or NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.toml), user TOML, then defaults."
     }
 
     /// Shows a credential-free structured preview.
@@ -190,26 +189,7 @@ impl PluginCommand for JevAnnotate {
         let signals = engine.signals();
         let build = request_builder(&options, config.model.clone(), questions);
         if options.dry_run {
-            let mut stopped = false;
-            let mut rows = rows;
-            let iterator = std::iter::from_fn(move || {
-                if stopped {
-                    return None;
-                }
-                let row = rows.next()?;
-                Some(match build(&row) {
-                    Ok(request) => to_nu(request, span)
-                        .unwrap_or_else(|error| Value::error(ShellError::from(error), span)),
-                    Err(error) => match options.on_error {
-                        ErrorPolicy::Fail => {
-                            stopped = true;
-                            error_value(&error, span)
-                        }
-                        ErrorPolicy::Keep => row,
-                        ErrorPolicy::Record => add_error(row, &error, span),
-                    },
-                })
-            });
+            let iterator = preview_rows(rows, build, options.on_error, span);
             return Ok(PipelineData::list_stream(
                 ListStream::new(iterator, span, signals.clone()),
                 None,
@@ -253,6 +233,38 @@ impl PluginCommand for JevAnnotate {
     }
 }
 
+/// Previews rows lazily and stops after any terminal validation failure.
+fn preview_rows(
+    mut rows: Box<dyn Iterator<Item = Value> + Send>,
+    build: RowBuilder,
+    on_error: ErrorPolicy,
+    span: Span,
+) -> impl Iterator<Item = Value> {
+    let mut stopped = false;
+    std::iter::from_fn(move || {
+        if stopped {
+            return None;
+        }
+        let row = rows.next()?;
+        Some(match build(&row) {
+            Ok(request) => preview_value(request, span)
+                .unwrap_or_else(|error| Value::error(ShellError::from(error), span)),
+            Err(error) if error.kind == ErrorKind::FieldCollision => {
+                stopped = true;
+                error_value(&error, span)
+            }
+            Err(error) => match on_error {
+                ErrorPolicy::Fail => {
+                    stopped = true;
+                    error_value(&error, span)
+                }
+                ErrorPolicy::Keep => row,
+                ErrorPolicy::Record => add_error(row, &error, span),
+            },
+        })
+    })
+}
+
 impl TableOptions {
     /// Parses and validates selectors, destinations, and policies before input consumption.
     fn parse(call: &EvaluatedCall) -> Result<Self, LabeledError> {
@@ -282,14 +294,13 @@ impl TableOptions {
         if into.trim().is_empty() {
             return Err(option_error("--into must be nonempty"));
         }
-        let meta: Option<String> = call.get_flag("meta").map_err(LabeledError::from)?;
-        if meta
-            .as_ref()
-            .is_some_and(|name| name.trim().is_empty() || name == &into)
-        {
-            return Err(option_error(
-                "--meta must be nonempty and distinct from --into",
-            ));
+        let metrics = call.has_flag("metrics").map_err(LabeledError::from)?;
+        let dry_run = call.has_flag("dry-run").map_err(LabeledError::from)?;
+        if metrics && dry_run {
+            return Err(option_error("--metrics requires a live Jev request"));
+        }
+        if into == "jev_meta" || (metrics && into == "jev_metrics") {
+            return Err(option_error("--into conflicts with a Jev output field"));
         }
         let on_error: Option<String> = call.get_flag("on-error").map_err(LabeledError::from)?;
         let on_error = match on_error.as_deref().unwrap_or("fail") {
@@ -298,21 +309,17 @@ impl TableOptions {
             "record" => ErrorPolicy::Record,
             _ => return Err(option_error("--on-error must be fail, keep, or record")),
         };
-        if on_error == ErrorPolicy::Record
-            && (into == "jev_error" || meta.as_deref() == Some("jev_error"))
-        {
-            return Err(option_error(
-                "answer and metadata fields must differ from jev_error",
-            ));
+        if on_error == ErrorPolicy::Record && into == "jev_error" {
+            return Err(option_error("answer field must differ from jev_error"));
         }
         Ok(Self {
             selector,
             context: call.get_flag_value("context"),
             into,
-            meta,
+            metrics,
             on_error,
             unordered: call.has_flag("unordered").map_err(LabeledError::from)?,
-            dry_run: call.has_flag("dry-run").map_err(LabeledError::from)?,
+            dry_run,
         })
     }
 }
@@ -364,7 +371,7 @@ fn request_builder(
     let selector = options.selector.clone();
     let context = options.context.clone();
     let into = options.into.clone();
-    let meta = options.meta.clone();
+    let metrics = options.metrics;
     let on_error = options.on_error;
     Box::new(move |source| {
         if matches!(source, Value::Error { .. }) {
@@ -380,7 +387,8 @@ fn request_builder(
             ));
         };
         if val.contains(&into)
-            || meta.as_ref().is_some_and(|name| val.contains(name))
+            || val.contains("jev_meta")
+            || (metrics && val.contains("jev_metrics"))
             || (on_error == ErrorPolicy::Record && val.contains("jev_error"))
         {
             return Err(JevError::new(
@@ -420,7 +428,7 @@ fn request_builder(
     })
 }
 
-/// Appends answers and optional provenance to a successful original row.
+/// Appends answers, provenance, and optional measurements to a successful row.
 fn annotate_outcome(outcome: RowOutcome, options: &TableOptions, span: Span) -> Value {
     match outcome.result {
         Ok(shared) => {
@@ -436,18 +444,22 @@ fn annotate_outcome(outcome: RowOutcome, options: &TableOptions, span: Span) -> 
                 Err(error) => return Value::error(ShellError::from(error), span),
             };
             record.push(options.into.clone(), answers);
-            if let Some(name) = &options.meta {
-                let mut metadata = Record::with_capacity(3);
-                metadata.push("model", Value::string(shared.response.model.clone(), span));
-                metadata.push(
-                    "usage",
-                    to_nu(&shared.response.usage, span).expect("validated usage converts to Nu"),
-                );
-                metadata.push("request_id", Value::string(shared.request_id.clone(), span));
-                record.push(name.clone(), Value::record(metadata, span));
+            let meta = match evaluation_meta(&shared.base_url, &shared.response, span) {
+                Ok(value) => value,
+                Err(error) => return Value::error(ShellError::from(error), span),
+            };
+            record.push("jev_meta", meta);
+            if options.metrics {
+                let metrics =
+                    match measurement_value(&shared.measurement, Some(&shared.request_id), span) {
+                        Ok(value) => value,
+                        Err(error) => return Value::error(ShellError::from(error), span),
+                    };
+                record.push("jev_metrics", metrics);
             }
             Value::record(record, internal_span)
         }
+        Err(error) if error.kind == ErrorKind::FieldCollision => error_value(&error, span),
         Err(error) => match options.on_error {
             ErrorPolicy::Fail => error_value(&error, span),
             ErrorPolicy::Keep => outcome.source,
@@ -499,12 +511,23 @@ fn option_error(message: impl Into<String>) -> LabeledError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
     use nu_plugin::PluginCommand;
     use nu_plugin_test_support::PluginTest;
     use nu_protocol::{Record, ShellError, Span, Value};
     use serde_json::json;
 
-    use crate::{commands::tests::serve, nu::value::to_json, plugin::JevPlugin};
+    use crate::{
+        api::types::Question, commands::tests::serve, error::ErrorKind, nu::value::to_json,
+        plugin::JevPlugin,
+    };
 
     /// Creates an isolated plugin engine with an explicitly built runtime.
     fn plugin_test() -> Result<PluginTest, Box<ShellError>> {
@@ -524,10 +547,19 @@ mod tests {
         let wire = to_json(&result).unwrap();
         assert_eq!(wire.as_array().unwrap().len(), 2);
         assert_eq!(
-            wire[0]["state"],
+            wire[0]["request"]["state"],
             json!({"input": {"message": "hello"}, "context": {"policy": "greetings"}})
         );
-        assert_eq!(wire[1]["state"]["input"], json!({"message": "bye"}));
+        assert_eq!(
+            wire[1]["request"]["state"]["input"],
+            json!({"message": "bye"})
+        );
+        for row in wire.as_array().unwrap() {
+            assert_eq!(
+                row["request_bytes"],
+                json!(serde_json::to_vec(&row["request"]).unwrap().len())
+            );
+        }
         Ok(())
     }
 
@@ -555,7 +587,10 @@ mod tests {
             ))?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&short).unwrap(), to_json(&long).unwrap());
-        assert_eq!(to_json(&short).unwrap()[0]["model"], "flag-model");
+        assert_eq!(
+            to_json(&short).unwrap()[0]["request"]["model"],
+            "flag-model"
+        );
 
         let live = test
             .eval(&format!(
@@ -566,7 +601,10 @@ mod tests {
         assert_eq!(live[0]["id"], 1);
         assert_eq!(live[0]["ai"]["q"]["noul"], 0.875);
         assert!(live[0].get("jev").is_none());
-        assert_eq!(server.join().unwrap()[0].body, to_json(&long).unwrap()[0]);
+        assert_eq!(
+            server.join().unwrap()[0].body,
+            to_json(&long).unwrap()[0]["request"]
+        );
         Ok(())
     }
 
@@ -582,7 +620,7 @@ mod tests {
             .eval(&format!("{common} -s payload.text --dry-run"))?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&short).unwrap(), to_json(&long).unwrap());
-        assert_eq!(to_json(&short).unwrap()[0]["state"], "hello");
+        assert_eq!(to_json(&short).unwrap()[0]["request"]["state"], "hello");
         Ok(())
     }
 
@@ -592,17 +630,18 @@ mod tests {
         let response = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.875}}, "usage": {"input_tokens": 10, "output_tokens": 1}});
         let (base_url, server) = serve(vec![response]);
         let mut test = plugin_test()?;
-        let result = test.eval(&format!("$env.TYPESAFE_API_KEY = 'local-key'; [{{id: 7, payload: {{text: 'hello'}}, secret: 'local'}}] | jev annotate {{q: {{type: noul}}}} --state payload.text --into ai --meta ai_meta --base-url '{base_url}'"))?
+        let result = test.eval(&format!("$env.TYPESAFE_API_KEY = 'local-key'; [{{id: 7, payload: {{text: 'hello'}}, secret: 'local'}}] | jev annotate {{q: {{type: noul}}}} --state payload.text --into ai --metrics --base-url '{base_url}'"))?
             .into_value(Span::test_data())?;
         let wire = to_json(&result).unwrap();
         assert_eq!(wire[0]["id"], 7);
         assert_eq!(wire[0]["secret"], "local");
         assert_eq!(wire[0]["ai"]["q"]["noul"], 0.875);
-        assert_eq!(wire[0]["ai_meta"]["model"], "jev-fixed");
-        assert_eq!(wire[0]["ai_meta"]["usage"]["input_tokens"], 10);
-        assert_eq!(wire[0]["ai_meta"].as_object().unwrap().len(), 3);
+        assert_eq!(wire[0]["jev_meta"]["base_url"], format!("{base_url}/"));
+        assert_eq!(wire[0]["jev_meta"]["model"], "jev-fixed");
+        assert_eq!(wire[0]["jev_meta"]["usage"]["input_tokens"], 10);
+        assert_eq!(wire[0]["jev_meta"].as_object().unwrap().len(), 3);
         assert!(
-            wire[0]["ai_meta"]["request_id"]
+            wire[0]["jev_metrics"]["request_id"]
                 .as_str()
                 .unwrap()
                 .starts_with("jev-")
@@ -655,7 +694,48 @@ mod tests {
             test.eval("[] | jev annotate {q: {type: noul}} --into ai --meta ai --dry-run")
                 .is_err()
         );
+        assert!(
+            test.eval("[] | jev annotate {q: {type: noul}} --into jev_meta --dry-run")
+                .is_err()
+        );
+        assert!(
+            test.eval("[] | jev annotate {q: {type: noul}} --into jev_metrics --metrics")
+                .is_err()
+        );
+        assert!(
+            test.eval("[] | jev annotate {q: {type: noul}} --metrics --dry-run")
+                .is_err()
+        );
+        assert!(
+            test.eval("[] | jev annotate {q: {type: noul}} --into jev_metrics --dry-run")
+                .is_ok()
+        );
         Ok(())
+    }
+
+    /// Checks enabled output fields before projecting the outbound state.
+    #[test]
+    fn metrics_collision_is_terminal_even_when_field_is_not_sent() {
+        let span = Span::test_data();
+        let mut source = Record::new();
+        source.push("message", Value::test_string("hello"));
+        source.push("jev_metrics", Value::test_string("existing"));
+        let options = super::TableOptions {
+            selector: super::StateSelector::Fields(vec!["message".into()]),
+            context: None,
+            into: "jev".into(),
+            metrics: true,
+            on_error: super::ErrorPolicy::Keep,
+            unordered: false,
+            dry_run: false,
+        };
+        let raw = crate::nu::value::from_json(json!({"q": {"type": "noul"}}), span).unwrap();
+        let questions = crate::api::validate::parse_questions(&raw).unwrap();
+        let error = super::request_builder(&options, "jev-latest".into(), questions)(
+            &Value::record(source, span),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::FieldCollision);
     }
 
     /// Preserves failed source rows or adds a classified record without sending HTTP.
@@ -682,12 +762,12 @@ mod tests {
         let literal = test.eval("[{'a.b': 'value', id: 1}] | jev annotate {q: {type: noul}} --fields ['a.b'] --dry-run")?
             .into_value(Span::test_data())?;
         assert_eq!(
-            to_json(&literal).unwrap()[0]["state"],
+            to_json(&literal).unwrap()[0]["request"]["state"],
             json!({"a.b": "value"})
         );
         let indexed = test.eval("[{payload: [{text: 'first'} {text: 'second'}]}] | jev annotate {q: {type: noul}} --state payload.1.text --dry-run")?
             .into_value(Span::test_data())?;
-        assert_eq!(to_json(&indexed).unwrap()[0]["state"], "second");
+        assert_eq!(to_json(&indexed).unwrap()[0]["request"]["state"], "second");
         Ok(())
     }
 
@@ -698,23 +778,29 @@ mod tests {
         let (base_url, server) = serve(vec![response]);
         let mut test = plugin_test()?;
         let source = format!(
-            "$env.TYPESAFE_API_KEY = 'local-key'; [{{id: 1, message: 'same'}} {{id: 2, message: 'same'}}] | jev annotate {{q: {{type: noul}}}} --fields [message] --meta jev_meta --base-url '{base_url}'"
+            "$env.TYPESAFE_API_KEY = 'local-key'; [{{id: 1, message: 'same'}} {{id: 2, message: 'same'}}] | jev annotate {{q: {{type: noul}}}} --fields [message] --metrics --base-url '{base_url}'"
         );
         let result = test.eval(&source)?.into_value(Span::test_data())?;
         let wire = to_json(&result).unwrap();
         assert_eq!(wire[0]["id"], 1);
         assert_eq!(wire[1]["id"], 2);
         assert_eq!(
-            wire[0]["jev_meta"]["request_id"],
-            wire[1]["jev_meta"]["request_id"]
+            wire[0]["jev_metrics"]["request_id"],
+            wire[1]["jev_metrics"]["request_id"]
         );
+        assert_eq!(wire[0]["jev_meta"], wire[1]["jev_meta"]);
+        assert_eq!(wire[0]["jev_metrics"], wire[1]["jev_metrics"]);
+        assert_eq!(wire[0]["jev_meta"]["base_url"], format!("{base_url}/"));
+        assert_eq!(wire[0]["jev_metrics"]["attempts"], 1);
+        assert!(wire[0]["jev_metrics"]["request_bytes"].as_u64().unwrap() > 0);
+        assert!(wire[0]["jev_metrics"]["response_bytes"].as_u64().unwrap() > 0);
         let unique_usage = wire
             .as_array()
             .unwrap()
             .iter()
             .map(|row| {
                 (
-                    row["jev_meta"]["request_id"].as_str().unwrap(),
+                    row["jev_metrics"]["request_id"].as_str().unwrap(),
                     row["jev_meta"]["usage"]["input_tokens"].as_u64().unwrap(),
                 )
             })
@@ -736,7 +822,10 @@ mod tests {
                 "$env.TYPESAFE_API_KEY = '{key}'; $env.NU_PLUGIN_JEV_BASE_URL = '{url}'; [{{message: 'same'}}] | jev annotate {{q: {{type: noul}}}} --fields [message]"
             );
             let result = test.eval(&source)?.into_value(Span::test_data())?;
-            assert_eq!(to_json(&result).unwrap()[0]["jev"]["q"]["noul"], 0.875);
+            let wire = to_json(&result).unwrap();
+            assert_eq!(wire[0]["jev"]["q"]["noul"], 0.875);
+            assert_eq!(wire[0]["jev_meta"]["base_url"], format!("{url}/"));
+            assert!(wire[0].get("jev_metrics").is_none());
         }
         assert_eq!(
             first_server.join().unwrap()[0].authorization.as_deref(),
@@ -770,7 +859,7 @@ mod tests {
             selector: super::StateSelector::Fields(vec!["message".into(), "elapsed".into()]),
             context: None,
             into: "jev".into(),
-            meta: None,
+            metrics: false,
             on_error: super::ErrorPolicy::Fail,
             unordered: false,
             dry_run: true,
@@ -807,7 +896,7 @@ mod tests {
         assert_eq!(to_json(&live).unwrap()[0]["id"], 7);
         assert_eq!(
             server.join().unwrap()[0].body,
-            to_json(&preview).unwrap()[0]
+            to_json(&preview).unwrap()[0]["request"]
         );
         Ok(())
     }
@@ -819,12 +908,14 @@ mod tests {
             let (base_url, server) = serve(vec![json!({"malformed": true})]);
             let mut test = plugin_test()?;
             let source = format!(
-                "$env.TYPESAFE_API_KEY = 'local-key'; [{{id: 1, message: 'hello'}}] | jev annotate {{q: {{type: noul}}}} --on-error {policy} --base-url '{base_url}'"
+                "$env.TYPESAFE_API_KEY = 'local-key'; [{{id: 1, message: 'hello'}}] | jev annotate {{q: {{type: noul}}}} --on-error {policy} --metrics --base-url '{base_url}'"
             );
             let result = test.eval(&source)?.into_value(Span::test_data())?;
             let wire = to_json(&result).unwrap();
             assert_eq!(wire[0]["id"], 1);
             assert!(wire[0].get("jev").is_none());
+            assert!(wire[0].get("jev_meta").is_none());
+            assert!(wire[0].get("jev_metrics").is_none());
             if policy == "record" {
                 assert_eq!(wire[0]["jev_error"]["kind"], "response");
             } else {
@@ -843,7 +934,7 @@ mod tests {
             .eval("{message: 'hello'} | jev annotate {q: {type: noul}} --dry-run")?
             .into_value(Span::test_data())?;
         assert_eq!(
-            to_json(&single).unwrap()[0]["state"],
+            to_json(&single).unwrap()[0]["request"]["state"],
             json!({"message": "hello"})
         );
         let empty = test
@@ -862,30 +953,63 @@ mod tests {
         let wire = to_json(&result).unwrap();
         assert_eq!(wire.as_array().unwrap().len(), 2);
         assert_eq!(wire[0], wire[1]);
-        assert_eq!(wire[0]["state"], json!({"message": "same"}));
+        assert_eq!(wire[0]["request"]["state"], json!({"message": "same"}));
         Ok(())
     }
 
-    /// Converts selector misses and destination collisions to classified row errors.
+    /// Records selector misses but terminates on a destination collision.
     #[test]
     fn selector_misses_and_collisions_do_not_issue_requests() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
         let missing = test.eval("[{id: 1}] | jev annotate {q: {type: noul}} --state payload.text --on-error record --dry-run")?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&missing).unwrap()[0]["jev_error"]["kind"], "state");
-        let collision = test.eval("[{id: 1, message: 'hello', jev: 'existing'}] | jev annotate {q: {type: noul}} --fields [message] --on-error record --dry-run")?
-            .into_value(Span::test_data())?;
-        assert_eq!(to_json(&collision).unwrap()[0]["jev"], "existing");
-        assert_eq!(
-            to_json(&collision).unwrap()[0]["jev_error"]["kind"],
-            "field_collision"
-        );
+        let collision = test.eval("[{id: 1, message: 'hello', jev: 'existing'}] | jev annotate {q: {type: noul}} --fields [message] --on-error record --dry-run")?;
+        assert!(collision.into_value(Span::test_data()).is_err());
+        let meta_collision = test.eval("[{id: 1, message: 'hello', jev_meta: 'existing'}] | jev annotate {q: {type: noul}} --fields [message] --on-error keep --dry-run")?;
+        assert!(meta_collision.into_value(Span::test_data()).is_err());
         let missing_field = test.eval("[{id: 1}] | jev annotate {q: {type: noul}} --fields [message] --on-error record --dry-run")?
             .into_value(Span::test_data())?;
         assert_eq!(
             to_json(&missing_field).unwrap()[0]["jev_error"]["kind"],
             "state"
         );
+        Ok(())
+    }
+
+    /// Stops a long offline preview when downstream takes only a bounded prefix.
+    #[test]
+    fn dry_run_downstream_truncation() -> Result<(), Box<ShellError>> {
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&consumed);
+        let input = Box::new((0..100_000).map(move |id| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            let mut record = Record::with_capacity(1);
+            record.push("message", Value::test_int(id));
+            Value::test_record(record)
+        }));
+        let options = super::TableOptions {
+            selector: super::StateSelector::Fields(vec!["message".into()]),
+            context: None,
+            into: "jev".into(),
+            metrics: false,
+            on_error: super::ErrorPolicy::Fail,
+            unordered: false,
+            dry_run: true,
+        };
+        let questions = BTreeMap::from([(
+            "q".into(),
+            Question::Noul {
+                instructions: None,
+                criteria: None,
+            },
+        )]);
+        let build = super::request_builder(&options, "jev-latest".into(), questions);
+        let rows = super::preview_rows(input, build, options.on_error, Span::test_data())
+            .take(10)
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 10);
+        assert_eq!(consumed.load(Ordering::Relaxed), 10);
         Ok(())
     }
 
@@ -917,7 +1041,7 @@ mod tests {
             selector: super::StateSelector::Whole,
             context: None,
             into: "jev".into(),
-            meta: None,
+            metrics: false,
             on_error: super::ErrorPolicy::Fail,
             unordered: false,
             dry_run: false,

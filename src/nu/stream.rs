@@ -25,7 +25,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use crate::{
     api::{
         cancel::{CancelHandle, CancelSignal},
-        client::{JevClient, PreparedRequest},
+        client::{JevClient, MeasuredSuccess, PreparedRequest},
         types::{SystemOneRequest, SystemOneResponse},
     },
     config::{ApiKey, InvocationConfig},
@@ -116,7 +116,11 @@ struct PendingGroup {
 }
 
 /// Identifies one completed logical HTTP evaluation and its shared local identity.
-type Completion = (RequestKey, String, Result<SystemOneResponse, JevError>);
+type Completion = (
+    RequestKey,
+    String,
+    Result<MeasuredSuccess<SystemOneResponse>, JevError>,
+);
 
 /// Starts a bounded row stream without reading its first input value on the caller thread.
 pub(crate) fn start(
@@ -264,7 +268,12 @@ async fn supervise(
                     let result = crate::tracing::trace_evaluation(
                         "annotate",
                         &trace_id,
-                        client.system_one_prepared(&request, &config, &key, request_signal),
+                        client.system_one_prepared_measured(
+                            &request,
+                            &config,
+                            &key,
+                            request_signal,
+                        ),
                     )
                     .await;
                     (request_key, request_id, result)
@@ -437,8 +446,12 @@ async fn emit(
     fail_fast: bool,
     signal: &mut CancelSignal,
 ) -> bool {
-    if unordered || (fail_fast && row.result.is_err()) {
-        let terminal = fail_fast && row.result.is_err();
+    let terminal = row
+        .result
+        .as_ref()
+        .err()
+        .is_some_and(|error| fail_fast || error.kind == ErrorKind::FieldCollision);
+    if unordered || terminal {
         return send_or_cancel(output, row, signal).await && !terminal;
     }
     ordered.insert(row.sequence, row);
@@ -635,6 +648,10 @@ mod tests {
         let first = rows[0].result.as_ref().unwrap();
         let second = rows[1].result.as_ref().unwrap();
         assert_eq!(first.request_id, second.request_id);
+        assert_eq!(first.base_url, format!("{base_url}/"));
+        assert_eq!(first.measurement.attempts, 1);
+        assert!(first.measurement.request_bytes > 0);
+        assert!(first.measurement.response_bytes > 0);
         assert!(Arc::ptr_eq(first, second));
         assert_eq!(server.join().unwrap().len(), 1);
     }
@@ -1066,6 +1083,41 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// A destination collision bypasses ordering even when ordinary errors are kept.
+    #[test]
+    fn field_collision_bypasses_stalled_row_under_keep_policy() {
+        let (base_url, server) = serve_delayed_one();
+        let build = Box::new(|value: &Value| {
+            if value.as_int().unwrap() == 1 {
+                Err(crate::error::JevError::new(
+                    crate::error::ErrorKind::FieldCollision,
+                    "Jev destination field already exists",
+                ))
+            } else {
+                build(value)
+            }
+        });
+        let mut settings = setup(&base_url, 2);
+        settings.fail_fast = false;
+        let mut output = start(
+            runtime(),
+            settings,
+            Box::new(vec![Value::test_int(0), Value::test_int(1)].into_iter()),
+            build,
+            None,
+            CancelHandle::new(),
+        )
+        .unwrap();
+        let first = output.next().unwrap();
+        assert_eq!(first.sequence, 1);
+        assert_eq!(
+            first.result.unwrap_err().kind,
+            crate::error::ErrorKind::FieldCollision
+        );
+        assert!(output.next().is_none());
+        server.join().unwrap();
+    }
+
     /// Nonterminal failed rows still advance the ordered sequence for keep/record policies.
     #[test]
     fn nonterminal_error_advances_ordered_output() {
@@ -1119,11 +1171,14 @@ mod tests {
         )
         .unwrap();
         let first = output.next().unwrap();
-        let first_id = first.result.as_ref().unwrap().request_id.clone();
+        let first_result = Arc::clone(first.result.as_ref().unwrap());
         drop(first);
         gate.store(true, Ordering::SeqCst);
         let second = output.next().unwrap();
-        assert_eq!(second.result.as_ref().unwrap().request_id, first_id);
+        let second_result = second.result.as_ref().unwrap();
+        assert_eq!(second_result.request_id, first_result.request_id);
+        assert_eq!(second_result.base_url, first_result.base_url);
+        assert!(Arc::ptr_eq(second_result, &first_result));
         drop(second);
         assert!(output.next().is_none());
         assert_eq!(server.join().unwrap().len(), 1);

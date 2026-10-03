@@ -7,7 +7,19 @@ Notable changes to `nu_plugin_jev` are documented here.
 ### Added
 
 - Add `jev models` for uncached, authenticated model discovery with ordinary
-  Nushell table output and shared transport settings.
+  model records and shared transport settings.
+- Report exact compact JSON body bytes in offline `jev ask --dry-run` and
+  `jev annotate --dry-run` previews.
+- Add opt-in HTTP measurements to `jev ask`, `jev annotate`, and `jev models`.
+- Add selected service-root and HTTP measurements to successful completion diagnostics.
+
+### Changed
+
+- Wrap successful dry-run bodies as `{request, request_bytes}`; access former
+  top-level request fields through `request`.
+- Return always-present `meta` on live `jev ask` and `jev models`, and
+  `jev_meta` on successful annotation rows. Use `get models` for model-table
+  pipelines; annotation's former `--meta` flag is removed.
 
 ## [0.1.1]
 

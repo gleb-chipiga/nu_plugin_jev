@@ -13,6 +13,8 @@ use crate::{
     tracing::trace_models,
 };
 
+use super::evaluate::measurement_value;
+
 /// Fetches the current catalog without accepting pipeline state or questions.
 pub(crate) struct JevModels;
 
@@ -45,6 +47,7 @@ impl PluginCommand for JevModels {
                 "Explicit local TOML file",
                 None,
             )
+            .switch("metrics", "Include successful HTTP measurements", None)
     }
 
     /// Summarizes the uncached model lookup.
@@ -54,13 +57,13 @@ impl PluginCommand for JevModels {
 
     /// Explains authentication, output, and the absence of implicit evaluation.
     fn extra_description(&self) -> &str {
-        "Requires TYPESAFE_API_KEY or a private configured API key. Sends one authenticated GET /v1/models (plus configured retries), returning ordered records with name, description, and release_date strings. Results are not cached and do not validate models used by jev ask or jev annotate."
+        "Requires TYPESAFE_API_KEY or a private configured API key. Sends one authenticated GET /v1/models (plus configured retries), returning {models, meta: {base_url}}; --metrics adds HTTP measurements with request_bytes = 0. Model records preserve name, description, and release_date strings. Results are not cached and do not validate models used by jev ask or jev annotate."
     }
 
     /// Shows native Nushell filtering of model metadata.
     fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
-            example: "jev models | where name =~ '^jev' | select name release_date",
+            example: "jev models | get models | where name =~ '^jev' | select name release_date",
             description: "Inspect current Jev model names and release dates",
             result: None,
         }]
@@ -80,6 +83,7 @@ impl PluginCommand for JevModels {
                     .with_label("invoke jev models without an input state", call.head),
             );
         }
+        let metrics = call.has_flag("metrics").map_err(LabeledError::from)?;
         let sources = capture_sources(engine, call, ConfigScope::Models)?;
         let config = resolve_models(&sources)?;
         let key = require_api_key(&sources)?;
@@ -105,10 +109,11 @@ impl PluginCommand for JevModels {
             .runtime
             .block_on(trace_models(
                 &request_id,
-                client.models(&config, &key, signal),
+                client.models_measured(&config, &key, signal),
             ))
             .map_err(|error| error.into_labeled())?;
         let rows = list
+            .response
             .models
             .into_iter()
             .map(|model| {
@@ -119,7 +124,18 @@ impl PluginCommand for JevModels {
                 Value::record(record, call.head)
             })
             .collect();
-        Ok(PipelineData::value(Value::list(rows, call.head), None))
+        let mut metadata = Record::with_capacity(1);
+        metadata.push("base_url", Value::string(list.base_url, call.head));
+        let mut result = Record::with_capacity(if metrics { 3 } else { 2 });
+        result.push("models", Value::list(rows, call.head));
+        result.push("meta", Value::record(metadata, call.head));
+        if metrics {
+            result.push(
+                "metrics",
+                measurement_value(&list.measurement, None, call.head)?,
+            );
+        }
+        Ok(PipelineData::value(Value::record(result, call.head), None))
     }
 }
 
@@ -155,19 +171,68 @@ mod tests {
         let first = test.eval(&command)?.into_value(Span::test_data())?;
         assert_eq!(
             to_json(&first).unwrap(),
-            json!([
-                {"name": "jev-latest", "description": "General", "release_date": "unknown"},
-                {"name": "jev-fixed", "description": "Pinned", "release_date": "2026-09-15"}
-            ])
+            json!({
+                "models": [
+                    {"name": "jev-latest", "description": "General", "release_date": "unknown"},
+                    {"name": "jev-fixed", "description": "Pinned", "release_date": "2026-09-15"}
+                ],
+                "meta": {"base_url": format!("{url}/")}
+            })
         );
         let second = test.eval(&command)?.into_value(Span::test_data())?;
-        assert_eq!(to_json(&second).unwrap(), json!([]));
+        assert_eq!(
+            to_json(&second).unwrap(),
+            json!({"models": [], "meta": {"base_url": format!("{url}/")}})
+        );
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 2);
         assert!(requests.iter().all(|request| request.method == "GET"
             && request.path == "/v1/models"
             && request.authorization.as_deref() == Some("Bearer test-key")
             && request.body.is_null()));
+        Ok(())
+    }
+
+    /// Keeps catalog provenance separate from optional bodyless GET metrics.
+    #[test]
+    fn metrics_wrap_empty_catalog_without_fabricated_usage() -> Result<(), Box<ShellError>> {
+        let response = json!({"models": []});
+        let response_bytes = response.to_string().len();
+        let (url, server) = serve(vec![response]);
+        let mut test = plugin_test()?;
+        let value = test
+            .eval(&format!(
+                "$env.TYPESAFE_API_KEY = 'local-key'; jev models --base-url '{url}' --metrics"
+            ))?
+            .into_value(Span::test_data())?;
+        let Value::Record { val, .. } = &value else {
+            panic!("model listing is a record");
+        };
+        let Some(Value::Record { val: metrics, .. }) = val.get("metrics") else {
+            panic!("model metrics is a record");
+        };
+        assert!(matches!(
+            metrics.get("elapsed"),
+            Some(Value::Duration { .. })
+        ));
+        assert!(matches!(
+            metrics.get("attempt_elapsed"),
+            Some(Value::Duration { .. })
+        ));
+        let wire = to_json(&value).unwrap();
+        assert_eq!(wire["models"], json!([]));
+        assert_eq!(wire["meta"], json!({"base_url": format!("{url}/")}));
+        assert_eq!(wire["metrics"]["request_bytes"], 0);
+        assert_eq!(wire["metrics"]["response_bytes"], response_bytes);
+        assert_eq!(wire["metrics"]["attempts"], 1);
+        assert_eq!(wire["metrics"]["http_version"], "HTTP/1.1");
+        assert_eq!(
+            wire["metrics"]["elapsed"],
+            wire["metrics"]["attempt_elapsed"]
+        );
+        assert!(wire["metrics"].get("model").is_none());
+        assert!(wire["metrics"].get("usage").is_none());
+        assert_eq!(server.join().unwrap().len(), 1);
         Ok(())
     }
 
@@ -182,7 +247,7 @@ mod tests {
         );
         assert_eq!(
             to_json(&test.eval(&command)?.into_value(Span::test_data())?).unwrap(),
-            json!([])
+            json!({"models": [], "meta": {"base_url": format!("{url}/")}})
         );
         assert_eq!(server.join().unwrap().len(), 1);
         Ok(())

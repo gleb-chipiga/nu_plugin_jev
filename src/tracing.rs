@@ -20,7 +20,10 @@ use tracing_subscriber::{
 };
 
 use crate::{
-    api::types::{ModelMetadataList, SystemOneResponse},
+    api::{
+        client::MeasuredSuccess,
+        types::{ModelMetadataList, SystemOneResponse},
+    },
     error::{ErrorKind, JevError},
 };
 
@@ -193,9 +196,9 @@ pub(crate) fn init() -> Result<WorkerGuard, Box<dyn std::error::Error + Send + S
 pub(crate) async fn trace_models<F>(
     request_id: &str,
     operation: F,
-) -> Result<ModelMetadataList, JevError>
+) -> Result<MeasuredSuccess<ModelMetadataList>, JevError>
 where
-    F: Future<Output = Result<ModelMetadataList, JevError>>,
+    F: Future<Output = Result<MeasuredSuccess<ModelMetadataList>, JevError>>,
 {
     let span = ::tracing::warn_span!("jev_models", request_id);
     async move {
@@ -204,9 +207,16 @@ where
         let result = operation.await;
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match &result {
-            Ok(list) => ::tracing::info!(
+            Ok(success) => ::tracing::info!(
                 duration_ms,
-                count = list.models.len(),
+                count = success.response.models.len(),
+                base_url = %success.base_url,
+                request_bytes = u64::try_from(success.measurement.request_bytes).unwrap_or(u64::MAX),
+                response_bytes = u64::try_from(success.measurement.response_bytes).unwrap_or(u64::MAX),
+                elapsed_ns = u64::try_from(success.measurement.elapsed.as_nanos()).unwrap_or(u64::MAX),
+                attempt_elapsed_ns = u64::try_from(success.measurement.attempt_elapsed.as_nanos()).unwrap_or(u64::MAX),
+                attempts = u64::try_from(success.measurement.attempts).unwrap_or(u64::MAX),
+                http_version = success.measurement.http_version_name(),
                 "model listing completed"
             ),
             Err(error) if error.kind == ErrorKind::Cancelled => {
@@ -230,9 +240,9 @@ pub(crate) async fn trace_evaluation<F>(
     command: &'static str,
     request_id: &str,
     operation: F,
-) -> Result<SystemOneResponse, JevError>
+) -> Result<MeasuredSuccess<SystemOneResponse>, JevError>
 where
-    F: Future<Output = Result<SystemOneResponse, JevError>>,
+    F: Future<Output = Result<MeasuredSuccess<SystemOneResponse>, JevError>>,
 {
     let span = ::tracing::warn_span!("jev_evaluation", command, request_id);
     async move {
@@ -241,11 +251,18 @@ where
         let result = operation.await;
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match &result {
-            Ok(response) => ::tracing::info!(
+            Ok(success) => ::tracing::info!(
                 duration_ms,
-                model = %response.model,
-                input_tokens = response.usage.input_tokens,
-                output_tokens = response.usage.output_tokens,
+                model = %success.response.model,
+                input_tokens = success.response.usage.input_tokens,
+                output_tokens = success.response.usage.output_tokens,
+                base_url = %success.base_url,
+                request_bytes = u64::try_from(success.measurement.request_bytes).unwrap_or(u64::MAX),
+                response_bytes = u64::try_from(success.measurement.response_bytes).unwrap_or(u64::MAX),
+                elapsed_ns = u64::try_from(success.measurement.elapsed.as_nanos()).unwrap_or(u64::MAX),
+                attempt_elapsed_ns = u64::try_from(success.measurement.attempt_elapsed.as_nanos()).unwrap_or(u64::MAX),
+                attempts = u64::try_from(success.measurement.attempts).unwrap_or(u64::MAX),
+                http_version = success.measurement.http_version_name(),
                 "evaluation completed"
             ),
             Err(error) if error.kind == ErrorKind::Cancelled => {

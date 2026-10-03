@@ -12,7 +12,13 @@ use reqwest::Url;
 
 #[cfg(test)]
 use crate::api::types::SystemOneRequest;
-use crate::{api::types::SystemOneResponse, config::CacheLimits};
+use crate::{
+    api::{
+        client::{HttpMeasurement, MeasuredSuccess},
+        types::SystemOneResponse,
+    },
+    config::CacheLimits,
+};
 
 /// Includes the service root and a canonical complete request body, never credentials.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -54,24 +60,31 @@ impl RequestKey {
 pub(crate) struct SharedResponse {
     /// Complete validated response returned by the service.
     pub(crate) response: SystemOneResponse,
+    /// Selected service root for this shared evaluation.
+    pub(crate) base_url: String,
+    /// HTTP measurements shared by waiters and completed-cache hits.
+    pub(crate) measurement: HttpMeasurement,
     /// Stable local identity shared by retries, waiters, and cache hits.
     pub(crate) request_id: String,
 }
 
 impl SharedResponse {
     /// Attaches a process-unique identity to a newly completed logical evaluation.
-    pub(crate) fn new(response: SystemOneResponse, request_id: String) -> Self {
+    pub(crate) fn new(success: MeasuredSuccess<SystemOneResponse>, request_id: String) -> Self {
         Self {
-            response,
+            response: success.response,
+            base_url: success.base_url,
+            measurement: success.measurement,
             request_id,
         }
     }
 
     /// Estimates cache-retained bytes beyond the canonical key.
     fn byte_len(&self) -> usize {
-        serde_json::to_vec(&self.response)
-            .expect("validated Jev responses serialize as JSON")
-            .len()
+        self.measurement
+            .response_bytes
+            .saturating_add(self.base_url.len())
+            .saturating_add(std::mem::size_of::<HttpMeasurement>())
             .saturating_add(self.request_id.len())
     }
 }
@@ -149,7 +162,7 @@ impl CompletedCache {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
+    use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
 
     use reqwest::Url;
     use serde_json::json;
@@ -160,7 +173,7 @@ mod tests {
     };
 
     use super::{CompletedCache, RequestKey, SharedResponse};
-    use crate::api::client::PreparedRequest;
+    use crate::api::client::{HttpMeasurement, MeasuredSuccess, PreparedRequest};
 
     /// Builds a valid request while varying only the state under test.
     fn request(state: serde_json::Value) -> SystemOneRequest {
@@ -184,7 +197,22 @@ mod tests {
             "usage": {"input_tokens": 1, "output_tokens": 1}
         }))
         .unwrap();
-        Arc::new(SharedResponse::new(response, "jev-test".into()))
+        let response_bytes = serde_json::to_vec(&response).unwrap().len();
+        Arc::new(SharedResponse::new(
+            MeasuredSuccess {
+                response,
+                base_url: "https://example.test/".into(),
+                measurement: HttpMeasurement {
+                    request_bytes: 0,
+                    response_bytes,
+                    elapsed: Duration::ZERO,
+                    attempt_elapsed: Duration::ZERO,
+                    attempts: 1,
+                    http_version: reqwest::Version::HTTP_11,
+                },
+            },
+            "jev-test".into(),
+        ))
     }
 
     /// Creates independently bounded cache limits for small fixtures.
