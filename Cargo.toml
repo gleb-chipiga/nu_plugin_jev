@@ -21,7 +21,8 @@ targets = [
 ]
 
 [features]
-default = ["mimalloc"]
+default = ["mimalloc", "nuon-tracing-format"]
+nuon-tracing-format = ["dep:time"]
 
 [dependencies]
 nu-plugin = "=0.116"
@@ -38,8 +39,11 @@ futures = "0.3"
 lru = "0.18"
 httpdate = "1"
 tracing = "0.1"
+tracing-log = { version = "0.2", default-features = false, features = ["log-tracer", "std"] }
+log = "0.4"
+time = { version = "0.3", default-features = false, features = ["formatting", "std"], optional = true }
 tracing-appender = "0.2"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 mimalloc = { version = "0.1", optional = true }
 
 [dev-dependencies]

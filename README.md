@@ -33,8 +33,9 @@ plugin use jev
 help jev
 ```
 
-The default build uses mimalloc. Pass `--no-default-features` to `cargo install`
-to use the system allocator.
+The default build uses mimalloc and supports NUON diagnostics. Pass
+`--no-default-features` to `cargo install` to use the system allocator and omit
+NUON diagnostics; add `--features nuon-tracing-format` to keep NUON support.
 
 Live requests need an API key from `TYPESAFE_API_KEY` or a private TOML file.
 Question constructors and `--dry-run` work without a key or network access.
@@ -177,10 +178,34 @@ connection.
 ## Diagnostics and failures
 
 Set `NU_PLUGIN_JEV_LOG=info` or `debug` before the plugin starts to write
-diagnostics to stderr. In an existing Nu session, run `plugin stop jev` after
-changing the variable. Logs omit credentials, state, questions, and request
-bodies. Use `--meta` when downstream Nu code needs model, usage, or the local
-request ID as data.
+plugin diagnostics to stderr. The default is `warn`; bare levels affect only
+`nu_plugin_jev`. Dependency logs may contain sensitive URLs, headers, or
+payloads; the plugin cannot redact them. To opt into a dependency target:
+
+```nu
+$env.NU_PLUGIN_JEV_LOG = "nu_plugin_jev=info,reqwest=debug"
+plugin stop jev
+```
+
+For structured diagnostics, set `$env.NU_PLUGIN_JEV_LOG_FORMAT = "nuon"` and
+restart with `plugin stop jev`. NUON support is included in the default Cargo
+features via `nuon-tracing-format`; a `--no-default-features` build omits it and
+rejects this setting. Each selected diagnostic event becomes one stderr line
+with `timestamp`, `level`, `target`, `message`, typed `fields`, and root-to-leaf
+`spans`. A successful evaluation's `fields` include input and output tokens.
+Parse captured diagnostic-only output in Nu with `use std/formats *` and
+`open --raw jev.log | from ndnuon`; one line also works with `from nuon`.
+The plugin does not write log files. A whole Nu stderr capture may include
+other messages that are not NUON records.
+
+Both settings are read when the plugin process starts; changing them requires
+`plugin stop jev`. Text is the default format. Unlisted dependencies stay
+silent; `RUST_LOG` and `JEV_LOG` are not used. Plugin-owned events omit
+credentials, state, questions, and request bodies. Treat captured third-party
+stderr as sensitive. Selecting a target does not enable instrumentation a
+library does not emit.
+Use `--meta` when downstream Nu code needs model, usage, or the local request
+ID as data.
 
 One logical evaluation has a total timeout, including retry waits. HTTP
 `429`, `502`, `503`, `504`, and `529` may be retried; `Retry-After` guidance

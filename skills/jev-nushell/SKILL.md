@@ -62,3 +62,14 @@ jev models | sort-by name | select name release_date
   per distinct ID.
 - With `--on-error keep` or `record`, some rows lack answers. Check for an
   annotation before accessing nested answer fields.
+- `NU_PLUGIN_JEV_LOG=info|debug` enables plugin-only text diagnostics.
+  Third-party logs may contain secrets and are not automatically redacted.
+  To enable them, select targets explicitly, for example
+  `NU_PLUGIN_JEV_LOG=nu_plugin_jev=info,reqwest=debug`, then restart with
+  `plugin stop jev`. Unlisted dependencies remain off.
+- Set `NU_PLUGIN_JEV_LOG_FORMAT=nuon` before startup for one structured record
+  per plugin stderr line. Records contain `timestamp`, `level`, `target`,
+  `message`, `fields`, and `spans`. Parse captured diagnostic-only lines with
+  Nu's `from nuon`; for multiple lines use
+  `use std/formats *; open --raw jev.log | from ndnuon`. Whole Nu stderr may
+  contain non-NUON messages; the plugin has no managed log file.

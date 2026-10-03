@@ -12,6 +12,41 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Parses plugin diagnostics with Nu's single-record and newline-delimited NUON readers.
+#[cfg(feature = "nuon-tracing-format")]
+fn parse_nuon_diagnostics_in_nu(stderr: &[u8]) -> Vec<serde_json::Value> {
+    let diagnostics = String::from_utf8(stderr.to_vec()).expect("UTF-8 diagnostics");
+    let output = Command::new("nu")
+        .args([
+            "--no-config-file",
+            "--commands",
+            "use std/formats *; {single: ($env.JEV_TEST_DIAGNOSTICS | lines | first | from nuon), batch: ($env.JEV_TEST_DIAGNOSTICS | from ndnuon)} | to json --raw",
+        ])
+        .env("JEV_TEST_DIAGNOSTICS", &diagnostics)
+        .output()
+        .expect("parse diagnostics in Nu");
+    assert!(
+        output.status.success(),
+        "Nu could not parse diagnostics: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parsed Nu diagnostics");
+    let batch = parsed["batch"].as_array().expect("NDNUON records");
+    assert_eq!(batch.len(), diagnostics.lines().count());
+    assert_eq!(parsed["single"], batch[0]);
+    batch.clone()
+}
+
+/// Returns the local evaluation identity recorded on a diagnostic span.
+#[cfg(feature = "nuon-tracing-format")]
+fn diagnostic_request_id(record: &serde_json::Value) -> Option<&str> {
+    record["spans"]
+        .as_array()?
+        .iter()
+        .find_map(|span| span["fields"]["request_id"].as_str())
+}
+
 /// Responds to local System One requests until the subprocess completes.
 fn serve_until_stopped(
     selective: bool,
@@ -258,9 +293,10 @@ fn ask_native_get_keeps_mixed_answer_details() {
     assert_eq!(captured["questions"].as_object().unwrap().len(), 3);
 }
 
-/// Keeps retry attempts under one traced evaluation without logging request content.
+/// Keeps retry attempts under one NUON evaluation span without logging secrets.
 #[test]
-fn ask_tracing_correlates_retry_attempts() {
+#[cfg(feature = "nuon-tracing-format")]
+fn ask_nuon_correlates_retry_attempts() {
     if Command::new("nu").arg("--version").output().is_err() {
         return;
     }
@@ -315,6 +351,7 @@ fn ask_tracing_correlates_retry_attempts() {
         .env("NU_PLUGIN_JEV_BASE_URL", &base_url)
         .env("NU_PLUGIN_JEV_RETRIES", "2")
         .env("NU_PLUGIN_JEV_LOG", "debug")
+        .env("NU_PLUGIN_JEV_LOG_FORMAT", "nuon")
         .output()
         .expect("run isolated Nu");
     server.join().expect("join retry mock");
@@ -324,43 +361,67 @@ fn ask_tracing_correlates_retry_attempts() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout.trim_ascii(), b"0.9");
-    let diagnostics = String::from_utf8_lossy(&output.stderr);
-    for expected in [
-        "attempt=1",
-        "attempt=2",
-        "status=503",
-        "status=200",
-        "retrying Jev request",
-    ] {
-        assert!(
-            diagnostics.contains(expected),
-            "missing diagnostic: {expected}"
-        );
-    }
-    let ids: Vec<_> = diagnostics
-        .lines()
-        .filter(|line| line.contains("Jev HTTP") || line.contains("retrying Jev request"))
-        .filter_map(|line| line.split("request_id=\"").nth(1))
-        .filter_map(|suffix| suffix.split('"').next())
-        .collect();
+    let records = parse_nuon_diagnostics_in_nu(&output.stderr);
+    let attempts = records
+        .iter()
+        .filter(|record| record["message"] == "Jev HTTP attempt started")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|record| record["fields"]["attempt"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    let responses = records
+        .iter()
+        .filter(|record| record["message"] == "Jev HTTP response received")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        responses
+            .iter()
+            .map(|record| record["fields"]["status"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        [503, 503, 200]
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["message"] == "retrying Jev request")
+            .count(),
+        2
+    );
+    let ids = records
+        .iter()
+        .filter(|record| {
+            record["message"] == "Jev HTTP attempt started"
+                || record["message"] == "Jev HTTP response received"
+                || record["message"] == "retrying Jev request"
+        })
+        .filter_map(|record| diagnostic_request_id(record))
+        .collect::<Vec<_>>();
     assert!(ids.len() >= 4);
     assert!(ids.iter().all(|id| *id == ids[0]));
     for (attempt, server_id) in [(1, "req_retry_1"), (3, "req_success_3")] {
-        let line = diagnostics
-            .lines()
-            .find(|line| {
-                line.contains("Jev HTTP response received")
-                    && line.contains(&format!("attempt={attempt}"))
-            })
+        let record = responses
+            .iter()
+            .find(|record| record["fields"]["attempt"] == attempt)
             .expect("response diagnostic");
-        assert!(line.contains(&format!("server_request_id=\"{server_id}\"")));
-        assert!(line.contains(&format!("request_id=\"{}\"", ids[0])));
+        assert_eq!(record["fields"]["server_request_id"], server_id);
+        assert_eq!(diagnostic_request_id(record), Some(ids[0]));
     }
-    let invalid_line = diagnostics
-        .lines()
-        .find(|line| line.contains("Jev HTTP response received") && line.contains("attempt=2"))
+    let invalid_record = responses
+        .iter()
+        .find(|record| record["fields"]["attempt"] == 2)
         .expect("invalid-ID response diagnostic");
-    assert!(!invalid_line.contains("server_request_id"));
+    assert!(invalid_record["fields"].get("server_request_id").is_none());
+    let completed = records
+        .iter()
+        .find(|record| record["message"] == "evaluation completed")
+        .expect("completed evaluation");
+    assert_eq!(completed["fields"]["input_tokens"], 2);
+    assert_eq!(completed["fields"]["output_tokens"], 1);
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
     for secret in ["local-key", "hello", "Authorization", "req_local-key"] {
         assert!(!diagnostics.contains(secret));
     }
@@ -489,9 +550,10 @@ let rows = ([{id: 1, message: 'urgent', sender: 'a', secret: 'local-1'} {id: 2, 
     }
 }
 
-/// Confirms cache reuse logs correlate with row metadata in a real Nu process.
+/// Confirms NUON cache-hit records correlate with row metadata in real Nu.
 #[test]
-fn annotate_tracing_correlates_cached_rows() {
+#[cfg(feature = "nuon-tracing-format")]
+fn annotate_nuon_correlates_cached_rows() {
     if Command::new("nu").arg("--version").output().is_err() {
         return;
     }
@@ -508,6 +570,7 @@ fn annotate_tracing_correlates_cached_rows() {
         .env("TYPESAFE_API_KEY", "local-key")
         .env("NU_PLUGIN_JEV_BASE_URL", &base_url)
         .env("NU_PLUGIN_JEV_LOG", "debug")
+        .env("NU_PLUGIN_JEV_LOG_FORMAT", "nuon")
         .output()
         .expect("run isolated Nu");
     stop.store(true, Ordering::SeqCst);
@@ -528,9 +591,17 @@ fn annotate_tracing_correlates_cached_rows() {
         rows.iter()
             .all(|row| row["ai_meta"]["request_id"] == request_id)
     );
+    let records = parse_nuon_diagnostics_in_nu(&output.stderr);
+    let hits = records
+        .iter()
+        .filter(|record| record["message"] == "completed Jev result cache hit")
+        .collect::<Vec<_>>();
+    assert!(!hits.is_empty(), "expected a completed-result cache hit");
+    assert!(
+        hits.iter()
+            .all(|record| record["fields"]["request_id"] == request_id)
+    );
     let diagnostics = String::from_utf8_lossy(&output.stderr);
-    assert!(diagnostics.contains("completed Jev result cache hit"));
-    assert!(diagnostics.contains(request_id));
     assert!(!diagnostics.contains("local-key"));
 }
 
