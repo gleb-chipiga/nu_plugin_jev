@@ -21,6 +21,34 @@ pub(crate) enum ConfigScope {
     Single,
     /// A table evaluation additionally needs scheduling and cache limits.
     Table,
+    /// Model discovery needs transport settings but no evaluation model.
+    Models,
+}
+
+/// Holds the settings shared by evaluation and model discovery HTTP calls.
+#[derive(Clone, Debug)]
+pub(crate) struct TransportConfig {
+    /// Authenticated service root, without a query or fragment.
+    pub(crate) base_url: Url,
+    /// Effective proxy policy selected for this invocation.
+    pub(crate) proxy: ProxyPolicy,
+    /// Total deadline for one logical request, including retry waits.
+    pub(crate) timeout: Duration,
+    /// Number of additional HTTP attempts after the first.
+    pub(crate) retries: usize,
+}
+
+/// Exposes the common transport settings without changing evaluation config shape.
+pub(crate) trait TransportSettings {
+    /// Returns the validated transport settings for one invocation.
+    fn transport(&self) -> (&Url, Duration, usize);
+}
+
+impl TransportSettings for TransportConfig {
+    /// Borrows model-discovery transport settings.
+    fn transport(&self) -> (&Url, Duration, usize) {
+        (&self.base_url, self.timeout, self.retries)
+    }
 }
 
 /// Holds the bounded completed-cache limits for one table invocation.
@@ -71,6 +99,13 @@ pub(crate) struct InvocationConfig {
     pub(crate) retries: usize,
     /// Invocation-local completed-cache limits for table commands.
     pub(crate) cache: Option<CacheLimits>,
+}
+
+impl TransportSettings for InvocationConfig {
+    /// Borrows evaluation transport settings.
+    fn transport(&self) -> (&Url, Duration, usize) {
+        (&self.base_url, self.timeout, self.retries)
+    }
 }
 
 /// Holds a caller-scoped bearer credential without exposing it through Debug.
@@ -126,6 +161,7 @@ pub(crate) fn capture_sources(
     let flag_names: &'static [&'static str] = match scope {
         ConfigScope::Single => &["model", "base-url", "timeout", "config"],
         ConfigScope::Table => &["model", "base-url", "timeout", "jobs", "config"],
+        ConfigScope::Models => &["base-url", "timeout", "config"],
     };
     let env_names: &'static [&'static str] = match scope {
         ConfigScope::Single => &[
@@ -140,6 +176,12 @@ pub(crate) fn capture_sources(
             "NU_PLUGIN_JEV_BASE_URL",
             "NU_PLUGIN_JEV_TIMEOUT_MS",
             "NU_PLUGIN_JEV_JOBS",
+            "NU_PLUGIN_JEV_RETRIES",
+            "NU_PLUGIN_JEV_PROXY",
+        ],
+        ConfigScope::Models => &[
+            "NU_PLUGIN_JEV_BASE_URL",
+            "NU_PLUGIN_JEV_TIMEOUT_MS",
             "NU_PLUGIN_JEV_RETRIES",
             "NU_PLUGIN_JEV_PROXY",
         ],
@@ -356,11 +398,7 @@ pub(crate) fn resolve(
     sources: &ConfigSources,
     scope: ConfigScope,
 ) -> Result<InvocationConfig, LabeledError> {
-    let plugin = match sources.plugin.as_ref() {
-        Some(Value::Record { val, .. }) => Some(&**val),
-        None => None,
-        Some(_) => return Err(config_error("plugin config must be a record")),
-    };
+    let plugin = plugin_record(sources)?;
     let model = match selected(
         sources,
         plugin,
@@ -371,6 +409,89 @@ pub(crate) fn resolve(
         Some((source, value)) => parse_nonempty_string(value, "model", source)?,
         None => "jev-latest".to_owned(),
     };
+    let transport = resolve_transport(sources, plugin)?;
+    let TransportConfig {
+        base_url,
+        proxy,
+        timeout,
+        retries,
+    } = transport;
+    let jobs = if scope == ConfigScope::Table {
+        let value = selected(
+            sources,
+            plugin,
+            Some("jobs"),
+            "jobs",
+            Some("NU_PLUGIN_JEV_JOBS"),
+        );
+        let jobs = match value {
+            Some((source, value)) => parse_positive_usize(value, "jobs", source)?,
+            None => NonZeroUsize::new(16).expect("nonzero default jobs"),
+        };
+        if jobs.get() > usize::MAX / 2 {
+            return Err(config_error(
+                "jobs is too large for a bounded admission window",
+            ));
+        }
+        Some(jobs)
+    } else {
+        None
+    };
+    let cache = if scope == ConfigScope::Table {
+        for file in [sources.local.as_ref(), sources.user.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if file
+                .values
+                .get("cache")
+                .is_some_and(|value| !matches!(value, Value::Record { .. }))
+            {
+                return Err(config_error("TOML cache must be a table"));
+            }
+        }
+        let cache_record = match plugin.and_then(|record| record.get("cache")) {
+            Some(Value::Record { val, .. }) => Some(&**val),
+            None => None,
+            Some(_) => return Err(config_error("plugin cache config must be a record")),
+        };
+        Some(CacheLimits {
+            max_entries: cache_limit(sources, cache_record, "max_entries", 1024)?,
+            max_approx_bytes: cache_limit(sources, cache_record, "max_approx_bytes", 16_777_216)?,
+        })
+    } else {
+        None
+    };
+    Ok(InvocationConfig {
+        model,
+        base_url,
+        proxy,
+        timeout,
+        jobs,
+        retries,
+        cache,
+    })
+}
+
+/// Resolves only the transport settings required for a model-list request.
+pub(crate) fn resolve_models(sources: &ConfigSources) -> Result<TransportConfig, LabeledError> {
+    resolve_transport(sources, plugin_record(sources)?)
+}
+
+/// Borrows a caller plugin record while rejecting a wrong top-level shape.
+fn plugin_record(sources: &ConfigSources) -> Result<Option<&Record>, LabeledError> {
+    match sources.plugin.as_ref() {
+        Some(Value::Record { val, .. }) => Ok(Some(val)),
+        None => Ok(None),
+        Some(_) => Err(config_error("plugin config must be a record")),
+    }
+}
+
+/// Shares per-field transport precedence and validation across command families.
+fn resolve_transport(
+    sources: &ConfigSources,
+    plugin: Option<&Record>,
+) -> Result<TransportConfig, LabeledError> {
     let base_url = match selected(
         sources,
         plugin,
@@ -409,27 +530,6 @@ pub(crate) fn resolve(
     if std::time::Instant::now().checked_add(timeout).is_none() {
         return Err(config_error("timeout is too large for a deadline"));
     }
-    let jobs = if scope == ConfigScope::Table {
-        let value = selected(
-            sources,
-            plugin,
-            Some("jobs"),
-            "jobs",
-            Some("NU_PLUGIN_JEV_JOBS"),
-        );
-        let jobs = match value {
-            Some((source, value)) => parse_positive_usize(value, "jobs", source)?,
-            None => NonZeroUsize::new(16).expect("nonzero default jobs"),
-        };
-        if jobs.get() > usize::MAX / 2 {
-            return Err(config_error(
-                "jobs is too large for a bounded admission window",
-            ));
-        }
-        Some(jobs)
-    } else {
-        None
-    };
     let retries = selected(
         sources,
         plugin,
@@ -440,39 +540,11 @@ pub(crate) fn resolve(
     .map(|(source, value)| parse_unsigned(value, "retries", source, true))
     .transpose()?
     .unwrap_or(3);
-    let cache = if scope == ConfigScope::Table {
-        for file in [sources.local.as_ref(), sources.user.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            if file
-                .values
-                .get("cache")
-                .is_some_and(|value| !matches!(value, Value::Record { .. }))
-            {
-                return Err(config_error("TOML cache must be a table"));
-            }
-        }
-        let cache_record = match plugin.and_then(|record| record.get("cache")) {
-            Some(Value::Record { val, .. }) => Some(&**val),
-            None => None,
-            Some(_) => return Err(config_error("plugin cache config must be a record")),
-        };
-        Some(CacheLimits {
-            max_entries: cache_limit(sources, cache_record, "max_entries", 1024)?,
-            max_approx_bytes: cache_limit(sources, cache_record, "max_approx_bytes", 16_777_216)?,
-        })
-    } else {
-        None
-    };
-    Ok(InvocationConfig {
-        model,
+    Ok(TransportConfig {
         base_url,
         proxy,
         timeout,
-        jobs,
         retries,
-        cache,
     })
 }
 
@@ -725,7 +797,8 @@ mod tests {
     use nu_protocol::{Record, Value};
 
     use super::{
-        ConfigScope, ConfigSources, ProxyPolicy, parse_api_key, read_toml, require_api_key, resolve,
+        ConfigScope, ConfigSources, ProxyPolicy, parse_api_key, read_toml, require_api_key,
+        resolve, resolve_models,
     };
 
     /// Owns an isolated test directory and removes it after each fixture.
@@ -1104,5 +1177,59 @@ mod tests {
         }
         sources.plugin = Some(record([("proxy", Value::test_int(1))]));
         assert!(resolve(&sources, ConfigScope::Single).is_err());
+    }
+
+    /// Resolves discovery transport independently of invalid evaluation-only settings.
+    #[test]
+    fn models_scope_uses_transport_precedence_only() {
+        let fixture = Fixture::new();
+        let user_path = fixture.write("models-user.toml", "api_key = 'user-key'\nbase_url = 'https://user.example/'\ntimeout_ms = 5000\nmodel = 7\njobs = -1\n[cache]\nmax_entries = -1");
+        let local_path = fixture.write(
+            "models-local.toml",
+            "api_key = 'local-key'\nretries = 2\nmodel = 9",
+        );
+        let mut sources = ConfigSources {
+            user: read_toml(&user_path, true, false, "user").unwrap(),
+            local: read_toml(&local_path, true, true, "local").unwrap(),
+            plugin: Some(record([
+                ("model", Value::test_int(1)),
+                ("jobs", Value::test_int(0)),
+                ("cache", Value::test_int(1)),
+                ("timeout", Value::test_duration(2_000_000_000)),
+            ])),
+            ..ConfigSources::default()
+        };
+        sources.env.insert(
+            "NU_PLUGIN_JEV_BASE_URL",
+            Value::test_string("https://env.example/"),
+        );
+        sources
+            .env
+            .insert("NU_PLUGIN_JEV_RETRIES", Value::test_string("4"));
+        sources
+            .flags
+            .insert("base-url", Value::test_string("https://flag.example/"));
+        let config = resolve_models(&sources).unwrap();
+        assert_eq!(config.base_url.as_str(), "https://flag.example/");
+        assert_eq!(config.timeout.as_secs(), 2);
+        assert_eq!(config.retries, 4);
+        assert_eq!(require_api_key(&sources).unwrap().as_str(), "local-key");
+        sources.key = Some(Value::test_string("new-key"));
+        assert_eq!(require_api_key(&sources).unwrap().as_str(), "new-key");
+        sources.flags.insert("timeout", Value::test_duration(0));
+        assert!(resolve_models(&sources).is_err());
+    }
+
+    /// Discovery retains implicit-file transport restrictions and key requirements.
+    #[test]
+    fn models_scope_keeps_transport_boundary() {
+        let fixture = Fixture::new();
+        let path = fixture.write("models-unsafe.toml", "proxy = 'http://localhost:1111'");
+        assert!(read_toml(&path, true, true, "local").is_err());
+        assert!(require_api_key(&ConfigSources::default()).is_err());
+        assert_eq!(
+            resolve_models(&ConfigSources::default()).unwrap().retries,
+            3
+        );
     }
 }

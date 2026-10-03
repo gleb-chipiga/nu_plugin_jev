@@ -8,7 +8,7 @@ Expose Jev decisions through a standard Nushell plugin with consistent naming, d
 
 ### Requirement: Consistent plugin identity and discovery
 
-The project SHALL use `nu_plugin_jev` as its repository, Cargo crate, and binary name, and SHALL expose `jev` as its Nushell namespace. Registration SHALL support `plugin add <binary-path>` followed by `plugin use jev`. The complete registered command inventory SHALL be `jev`, `jev ask`, `jev annotate`, `jev question noul`, `jev question choice`, and `jev question score`. Scalar projection and filtering SHALL remain ordinary Nu operations; this change SHALL NOT register `jev noul`, `jev choice`, `jev score`, `jev where`, or `jev models`.
+The project SHALL use `nu_plugin_jev` as its repository, Cargo crate, and binary name, and SHALL expose `jev` as its Nushell namespace. Registration SHALL support `plugin add <binary-path>` followed by `plugin use jev`. The complete registered command inventory SHALL be `jev`, `jev ask`, `jev annotate`, `jev models`, `jev question noul`, `jev question choice`, and `jev question score`. Scalar projection and filtering SHALL remain ordinary Nu operations; this change SHALL NOT register `jev noul`, `jev choice`, `jev score`, or `jev where`.
 
 #### Scenario: Register and inspect the plugin
 
@@ -19,8 +19,8 @@ The project SHALL use `nu_plugin_jev` as its repository, Cargo crate, and binary
 #### Scenario: Minimal command inventory
 
 - **WHEN** the loaded plugin's command names are inspected
-- **THEN** exactly the six declared commands are registered
-- **AND** there are no scalar shortcut, semantic-filter, or model-discovery commands
+- **THEN** exactly the seven declared commands are registered
+- **AND** there are no scalar shortcut or semantic-filter commands
 
 #### Scenario: Root command is offline
 

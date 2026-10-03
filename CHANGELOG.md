@@ -4,6 +4,11 @@ Notable changes to `nu_plugin_jev` are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Add `jev models` for uncached, authenticated model discovery with ordinary
+  Nushell table output and shared transport settings.
+
 ## [0.1.1]
 
 ### Changed

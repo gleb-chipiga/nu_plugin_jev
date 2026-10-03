@@ -21,7 +21,10 @@ questions. Prefer native Nu commands over inventing extra Jev operations.
   `--fields <list>` restrict outbound data without removing source columns;
   they cannot be combined. Shared context is sent with each row.
 - Use native Nu commands for filtering, sorting, and projecting answers. There
-  are no scalar `jev noul|choice|score`, `jev where`, or `jev models` commands.
+  are no scalar `jev noul|choice|score` or `jev where` commands.
+- Use `jev models` to fetch the current model catalog. It accepts no pipeline
+  input and returns `name`, `description`, and `release_date` strings. Filter
+  or sort with Nu; the list is not cached and does not preflight evaluations.
 
 For example, build related questions once, preview one outgoing state, then
 apply the same questions independently to table rows:
@@ -38,11 +41,19 @@ let questions = {
 | where jev.spam.noul >= 0.98
 ```
 
+To inspect available names before choosing a model:
+
+```nu
+jev models | sort-by name | select name release_date
+```
+
 ## Inspect and consume results
 
 - Use `--dry-run` to inspect the exact outbound request before sending data.
   It needs no key or network. Never include credentials in examples or output.
-- Live calls need a TypeSafe API key and permitted network access. If a sandbox
+- Live calls, including `jev models`, need a TypeSafe API key and permitted
+  network access. The listing accepts `--base-url`, `--timeout`, and `--config`
+  but no evaluation model or table options. If a sandbox
   blocks access, report the call as unverified, not as an API failure.
 - `jev ask` returns `{model, answers, usage}`; `jev annotate` adds `answers`
   under `jev` or `--into`. Read `noul`, `choice`, or `score` from each named

@@ -8,6 +8,7 @@ use crate::api::client::JevClientPool;
 use crate::commands::{
     annotate::JevAnnotate,
     ask::JevAsk,
+    models::JevModels,
     question::{choice::JevQuestionChoice, noul::JevQuestionNoul, score::JevQuestionScore},
     root::Jev,
 };
@@ -41,6 +42,7 @@ impl Plugin for JevPlugin {
             Box::new(Jev),
             Box::new(JevAsk),
             Box::new(JevAnnotate),
+            Box::new(JevModels),
             Box::new(JevQuestionNoul),
             Box::new(JevQuestionChoice),
             Box::new(JevQuestionScore),

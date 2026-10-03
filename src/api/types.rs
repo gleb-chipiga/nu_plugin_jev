@@ -155,11 +155,49 @@ pub(crate) struct Usage {
     pub(crate) output_tokens: u64,
 }
 
+/// Contains the service's ordered catalog of available models.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct ModelMetadataList {
+    /// Model entries in service-provided order.
+    pub(crate) models: Vec<ModelMetadata>,
+}
+
+/// Keeps published model metadata as opaque service-provided strings.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct ModelMetadata {
+    /// Model name or alias.
+    pub(crate) name: String,
+    /// Service description of the model.
+    pub(crate) description: String,
+    /// Release-date text without local parsing or normalization.
+    pub(crate) release_date: String,
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value as JsonValue, json};
 
-    use super::{SystemOneRequest, SystemOneResponse};
+    use super::{ModelMetadataList, SystemOneRequest, SystemOneResponse};
+
+    /// Accepts extra fields but requires three string fields in every entry.
+    #[test]
+    fn parses_model_metadata_contract() {
+        let list: ModelMetadataList = serde_json::from_value(json!({"models": [
+            {"name": "jev-latest", "description": "General", "release_date": "unknown", "new_field": 1},
+            {"name": "jev-fixed", "description": "Pinned", "release_date": "2026-09-15"}
+        ], "extra": true})).unwrap();
+        assert_eq!(list.models.len(), 2);
+        assert_eq!(list.models[0].release_date, "unknown");
+        assert_eq!(list.models[1].name, "jev-fixed");
+        for invalid in [
+            json!({}),
+            json!({"models": {}}),
+            json!({"models": [{"name": "jev", "description": "General"}]}),
+            json!({"models": [{"name": "jev", "description": 1, "release_date": "today"}]}),
+        ] {
+            assert!(serde_json::from_value::<ModelMetadataList>(invalid).is_err());
+        }
+    }
 
     /// Ensures a mixed-answer envelope retains its wire shape.
     #[test]

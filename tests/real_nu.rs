@@ -582,9 +582,9 @@ let third = ({message: 3} | jev ask $q | get answers.match.noul)
     }
 }
 
-/// Keeps the installed Nu namespace limited to the six declared commands.
+/// Keeps the installed Nu namespace limited to the seven declared commands.
 #[test]
-fn real_nu_registers_only_the_six_core_commands() {
+fn real_nu_registers_only_the_seven_core_commands() {
     if Command::new("nu").arg("--version").output().is_err() {
         return;
     }
@@ -611,6 +611,7 @@ fn real_nu_registers_only_the_six_core_commands() {
             "jev",
             "jev annotate",
             "jev ask",
+            "jev models",
             "jev question choice",
             "jev question noul",
             "jev question score"
@@ -630,7 +631,7 @@ fn real_nu_help_lists_focused_short_options() {
             "--plugins",
             env!("CARGO_BIN_EXE_nu_plugin_jev"),
             "--commands",
-            "{ask: (help jev ask), annotate: (help jev annotate)} | to json --raw",
+            "{ask: (help jev ask), annotate: (help jev annotate), models: (help jev models)} | to json --raw",
         ])
         .output()
         .expect("run isolated Nu");
@@ -642,6 +643,7 @@ fn real_nu_help_lists_focused_short_options() {
     let help: serde_json::Value = serde_json::from_slice(&output.stdout).expect("Nu help text");
     let ask = help["ask"].as_str().expect("ask help");
     let annotate = help["annotate"].as_str().expect("annotate help");
+    let models = help["models"].as_str().expect("models help");
     for line in ["-c, --context", "-m, --model"] {
         assert!(ask.contains(line));
         assert!(annotate.contains(line));
@@ -659,6 +661,162 @@ fn real_nu_help_lists_focused_short_options() {
         assert!(!help.contains("-b, --base-url"));
         assert!(!help.contains("-t, --timeout"));
     }
+    for long_only in ["--base-url", "--timeout", "--config"] {
+        assert!(models.contains(long_only));
+    }
+    for absent in ["--model", "--jobs", "--dry-run"] {
+        assert!(!models.contains(absent));
+    }
+}
+
+/// Serves two independent model catalogs while recording bodyless GET paths.
+fn serve_model_catalogs(names: &[&str]) -> (String, thread::JoinHandle<Vec<(String, String)>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind model mock");
+    let root = format!("http://{}", listener.local_addr().expect("local address"));
+    let names = names
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    let handle = thread::spawn(move || {
+        names.into_iter().map(|name| {
+            let (mut stream, _) = listener.accept().expect("accept model request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone model socket"));
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read model request line");
+            let parts: Vec<_> = line.split_whitespace().collect();
+            let method = parts[0].to_owned();
+            let path = parts[1].to_owned();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).expect("read model request header");
+                if line == "\r\n" { break; }
+            }
+            let response = serde_json::json!({"models": [{
+                "name": name, "description": "Mock model", "release_date": "opaque"
+            }]}).to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).expect("write model response");
+            (method, path)
+        }).collect()
+    });
+    (root, handle)
+}
+
+/// Composes model rows with native Nu commands and observes fresh service data.
+#[test]
+fn real_nu_models_are_fresh_native_records() {
+    if Command::new("nu").arg("--version").output().is_err() {
+        return;
+    }
+    let (url, server) = serve_model_catalogs(&["first", "second"]);
+    let source = "{first: (jev models | sort-by name | select name description release_date), second: (jev models | where name == 'second' | select name release_date)} | to json --raw";
+    let output = Command::new("nu")
+        .args([
+            "--no-config-file",
+            "--plugins",
+            env!("CARGO_BIN_EXE_nu_plugin_jev"),
+            "--commands",
+            source,
+        ])
+        .env("TYPESAFE_API_KEY", "local-model-key")
+        .env("NU_PLUGIN_JEV_BASE_URL", url)
+        .output()
+        .expect("run isolated Nu model pipeline");
+    assert!(
+        output.status.success(),
+        "Nu failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("Nu model JSON");
+    assert_eq!(
+        value,
+        serde_json::json!({
+        "first": [{"name": "first", "description": "Mock model", "release_date": "opaque"}],
+        "second": [{"name": "second", "release_date": "opaque"}]
+        })
+    );
+    assert_eq!(
+        server.join().unwrap(),
+        vec![
+            ("GET".to_owned(), "/v1/models".to_owned()),
+            ("GET".to_owned(), "/v1/models".to_owned()),
+        ]
+    );
+}
+
+/// Reads changed user TOML again for a second models call in the same Nu session.
+#[test]
+fn real_nu_models_reload_toml_between_calls() {
+    if Command::new("nu").arg("--version").output().is_err() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("jev-model-toml-reload-{}", std::process::id()));
+    let user = root.join("user");
+    std::fs::create_dir_all(user.join("nu_plugin_jev")).expect("user config directory");
+    let config = user.join("nu_plugin_jev/config.toml");
+    std::fs::write(&config, "timeout_ms = 5000\n").expect("initial user TOML");
+    let (url, server) = serve_model_catalogs(&["first"]);
+    let source = r#"
+let first = (jev models --base-url '{URL}' | get 0.name)
+'timeout_ms = 0' | save --force '{CONFIG}'
+let second_error = (try { jev models --base-url '{URL}' } catch {|err| $err.msg })
+{first: $first, second_error: $second_error} | to json --raw
+"#
+    .replace("{URL}", &url)
+    .replace("{CONFIG}", &config.to_string_lossy());
+    let output = Command::new("nu")
+        .args([
+            "--no-config-file",
+            "--plugins",
+            env!("CARGO_BIN_EXE_nu_plugin_jev"),
+            "--commands",
+            &source,
+        ])
+        .current_dir(&root)
+        .env("XDG_CONFIG_HOME", &user)
+        .env("TYPESAFE_API_KEY", "local-model-key")
+        .env_remove("NU_PLUGIN_JEV_CONFIG")
+        .env_remove("NU_PLUGIN_JEV_TIMEOUT_MS")
+        .output()
+        .expect("run isolated Nu model reload pipeline");
+    std::fs::remove_dir_all(&root).expect("remove isolated fixture");
+    assert!(
+        output.status.success(),
+        "Nu failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("Nu JSON");
+    assert_eq!(result["first"], "first");
+    assert!(
+        result["second_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("user TOML timeout_ms")),
+        "expected updated TOML to fail validation: {result}"
+    );
+    assert_eq!(
+        server.join().expect("join model mock"),
+        vec![("GET".to_owned(), "/v1/models".to_owned())]
+    );
+}
+
+/// Rejects an actual lazy Nu stream without requiring an API key or HTTP server.
+#[test]
+fn real_nu_models_reject_stream_input() {
+    if Command::new("nu").arg("--version").output().is_err() {
+        return;
+    }
+    let output = Command::new("nu")
+        .args([
+            "--no-config-file",
+            "--plugins",
+            env!("CARGO_BIN_EXE_nu_plugin_jev"),
+            "--commands",
+            "1..10 | each { |n| $n } | jev models",
+        ])
+        .env("TYPESAFE_API_KEY", "")
+        .output()
+        .expect("run isolated Nu stream rejection");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not accept pipeline input"));
 }
 
 /// Accepts and retains requests without replying until the test stops the server.

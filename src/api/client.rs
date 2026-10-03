@@ -13,16 +13,17 @@ use reqwest::{
     Client, StatusCode, Url,
     header::{CONTENT_TYPE, HeaderMap, RETRY_AFTER},
 };
+use serde::de::DeserializeOwned;
 use tokio::time::Instant;
 
 use crate::{
-    config::{ApiKey, InvocationConfig, ProxyPolicy},
+    config::{ApiKey, InvocationConfig, ProxyPolicy, TransportConfig, TransportSettings},
     error::{ErrorKind, JevError},
 };
 
 use super::{
     cancel::CancelSignal,
-    types::{SystemOneRequest, SystemOneResponse},
+    types::{ModelMetadataList, SystemOneRequest, SystemOneResponse},
     validate::validate_response,
 };
 
@@ -72,6 +73,14 @@ pub(crate) struct PreparedRequest {
     pub(crate) wire: SystemOneRequest,
     /// The exact reusable HTTP body and canonical cache-key body.
     pub(crate) body: Bytes,
+}
+
+/// Distinguishes a bodyless catalog lookup from a JSON evaluation request.
+enum HttpOperation<'a> {
+    /// Authenticated GET without content type or body.
+    Models,
+    /// Authenticated POST with an already encoded JSON body.
+    SystemOne(&'a Bytes),
 }
 
 impl PreparedRequest {
@@ -162,32 +171,61 @@ impl JevClient {
         Ok(response)
     }
 
+    /// Fetches one uncached model catalog with the evaluation transport policy.
+    pub(crate) async fn models(
+        &self,
+        config: &TransportConfig,
+        key: &ApiKey,
+        cancel: CancelSignal,
+    ) -> Result<ModelMetadataList, JevError> {
+        self.send(HttpOperation::Models, config, key, cancel).await
+    }
+
     /// Sends one authenticated System One operation with retryable status handling.
     async fn send_system_one(
         &self,
         body: &Bytes,
         config: &InvocationConfig,
         key: &ApiKey,
-        mut cancel: CancelSignal,
+        cancel: CancelSignal,
     ) -> Result<SystemOneResponse, JevError> {
+        self.send(HttpOperation::SystemOne(body), config, key, cancel)
+            .await
+    }
+
+    /// Applies the same status retries, deadline, and cancellation to both endpoints.
+    async fn send<T: DeserializeOwned>(
+        &self,
+        operation: HttpOperation<'_>,
+        config: &impl TransportSettings,
+        key: &ApiKey,
+        mut cancel: CancelSignal,
+    ) -> Result<T, JevError> {
         if cancel.is_cancelled() {
             return Err(JevError::new(
                 ErrorKind::Cancelled,
                 "Jev invocation was cancelled",
             ));
         }
-        let url = system_one_url(&config.base_url)?;
-        let deadline = Instant::now() + config.timeout;
-        let operation = async {
-            for attempt in 0..=config.retries {
+        let (root, timeout, retries) = config.transport();
+        let url = match operation {
+            HttpOperation::Models => models_url(root)?,
+            HttpOperation::SystemOne(_) => system_one_url(root)?,
+        };
+        let deadline = Instant::now() + timeout;
+        let task = async {
+            for attempt in 0..=retries {
                 let attempt_number = attempt + 1;
                 tracing::debug!(attempt = attempt_number, "Jev HTTP attempt started");
-                let request = self
-                    .http
-                    .post(url.clone())
-                    .bearer_auth(key.as_str())
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(body.clone());
+                let request = match operation {
+                    HttpOperation::Models => self.http.get(url.clone()).bearer_auth(key.as_str()),
+                    HttpOperation::SystemOne(body) => self
+                        .http
+                        .post(url.clone())
+                        .bearer_auth(key.as_str())
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(body.clone()),
+                };
                 let response = request.send().await.map_err(|_| {
                     tracing::debug!(attempt = attempt_number, "Jev HTTP transport failed");
                     JevError::new(ErrorKind::Transport, "Jev HTTP transport failed")
@@ -210,14 +248,14 @@ impl JevClient {
                     );
                 }
                 if status.is_success() {
-                    return response.json::<SystemOneResponse>().await.map_err(|_| {
+                    return response.json::<T>().await.map_err(|_| {
                         JevError::new(
                             ErrorKind::Response,
                             "Jev returned malformed JSON or missing fields",
                         )
                     });
                 }
-                if attempt < config.retries && retryable(status) {
+                if attempt < retries && retryable(status) {
                     let delay = retry_delay(response.headers(), SystemTime::now(), attempt);
                     if Instant::now()
                         .checked_add(delay)
@@ -243,7 +281,7 @@ impl JevClient {
             unreachable!("retry loop returns on success or terminal failure")
         };
         let cancelled = cancel.cancelled();
-        let timed_operation = tokio::time::timeout_at(deadline, operation);
+        let timed_operation = tokio::time::timeout_at(deadline, task);
         futures::pin_mut!(cancelled, timed_operation);
         match select(cancelled, timed_operation).await {
             Either::Left(((), _)) => Err(JevError::new(
@@ -262,6 +300,16 @@ impl JevClient {
 
 /// Appends the fixed System One endpoint below the configured service root.
 fn system_one_url(root: &Url) -> Result<Url, JevError> {
+    endpoint_url(root, "systemone")
+}
+
+/// Appends the fixed model-discovery endpoint below the configured root.
+fn models_url(root: &Url) -> Result<Url, JevError> {
+    endpoint_url(root, "models")
+}
+
+/// Joins a fixed v1 endpoint without changing the caller-selected root.
+fn endpoint_url(root: &Url, endpoint: &str) -> Result<Url, JevError> {
     let mut url = root.clone();
     let mut segments = url.path_segments_mut().map_err(|_| {
         JevError::new(
@@ -269,7 +317,7 @@ fn system_one_url(root: &Url) -> Result<Url, JevError> {
             "Jev service root cannot contain path segments",
         )
     })?;
-    segments.pop_if_empty().push("v1").push("systemone");
+    segments.pop_if_empty().push("v1").push(endpoint);
     drop(segments);
     Ok(url)
 }
@@ -362,14 +410,15 @@ mod tests {
             cancel::CancelHandle,
             types::{Question, SystemOneRequest},
         },
-        config::{ApiKey, InvocationConfig, ProxyPolicy},
+        config::{ApiKey, InvocationConfig, ProxyPolicy, TransportConfig},
         error::{ErrorKind, JevError},
         tracing::trace_evaluation,
     };
 
     use super::{
         Bytes, JevClient, JevClientPool, jittered_backoff, jittered_backoff_with_entropy,
-        retry_after, retry_after_ms, retry_delay, retryable, server_request_id, system_one_url,
+        models_url, retry_after, retry_after_ms, retry_delay, retryable, server_request_id,
+        system_one_url,
     };
 
     /// Captures only fields needed to verify outgoing mock requests.
@@ -507,6 +556,24 @@ mod tests {
         }
     }
 
+    /// Creates transport-only settings for model-discovery mock requests.
+    fn models_config(base_url: reqwest::Url) -> TransportConfig {
+        TransportConfig {
+            base_url,
+            proxy: ProxyPolicy::Auto,
+            timeout: Duration::from_secs(2),
+            retries: 0,
+        }
+    }
+
+    /// Returns a catalog with two ordered entries and forward-compatible fields.
+    fn model_list() -> serde_json::Value {
+        json!({"models": [
+            {"name": "jev-latest", "description": "General", "release_date": "unknown", "extra": 1},
+            {"name": "jev-fixed", "description": "Pinned", "release_date": "2026-09-15"}
+        ], "extra": true})
+    }
+
     /// Builds one typed Noul request for transport tests.
     fn request() -> SystemOneRequest {
         SystemOneRequest {
@@ -537,7 +604,168 @@ mod tests {
                 system_one_url(&root).unwrap().as_str(),
                 "http://localhost:1234/v1/systemone"
             );
+            assert_eq!(
+                models_url(&root).unwrap().as_str(),
+                "http://localhost:1234/v1/models"
+            );
         }
+    }
+
+    /// Verifies bodyless authenticated GET, service order, and an empty catalog.
+    #[test]
+    fn models_get_is_bodyless_and_uncached() {
+        let (url, server) = serve(vec![
+            MockResponse::json(200, model_list()),
+            MockResponse::json(200, json!({"models": []})),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let client = JevClient::new().unwrap();
+            let config = models_config(url);
+            let key = ApiKey::for_test("local-model-key");
+            let (_handle, signal) = CancelHandle::new();
+            let first = client.models(&config, &key, signal).await.unwrap();
+            assert_eq!(
+                first
+                    .models
+                    .iter()
+                    .map(|item| item.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["jev-latest", "jev-fixed"]
+            );
+            assert_eq!(first.models[0].release_date, "unknown");
+            let (_handle, signal) = CancelHandle::new();
+            assert!(
+                client
+                    .models(&config, &key, signal)
+                    .await
+                    .unwrap()
+                    .models
+                    .is_empty()
+            );
+        });
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert_eq!(
+                (request.method.as_str(), request.path.as_str()),
+                ("GET", "/v1/models")
+            );
+            assert_eq!(
+                request.authorization.as_deref(),
+                Some("Bearer local-model-key")
+            );
+            assert!(request.content_type.is_none());
+            assert!(request.body.is_empty());
+        }
+    }
+
+    /// Shares status retry policy but never retries malformed or unauthorized responses.
+    #[test]
+    fn models_retry_and_response_contract() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (url, server) = serve(vec![
+            MockResponse::json(503, json!({})).header("Retry-After", "0"),
+            MockResponse::json(200, model_list()),
+        ]);
+        runtime.block_on(async {
+            let mut config = models_config(url);
+            config.retries = 1;
+            let (_handle, signal) = CancelHandle::new();
+            assert_eq!(
+                JevClient::new()
+                    .unwrap()
+                    .models(&config, &ApiKey::for_test("key"), signal)
+                    .await
+                    .unwrap()
+                    .models
+                    .len(),
+                2
+            );
+        });
+        assert_eq!(server.join().unwrap().len(), 2);
+        for (status, body) in [
+            (401, json!({"secret": "not-for-errors"})),
+            (
+                200,
+                json!({"models": [{"name": "x", "description": 1, "release_date": "today"}]}),
+            ),
+            (302, json!({})),
+        ] {
+            let (url, server) = serve(vec![
+                MockResponse::json(status, body).header("Location", "http://example.invalid/"),
+            ]);
+            runtime.block_on(async {
+                let mut config = models_config(url);
+                config.retries = 2;
+                let (_handle, signal) = CancelHandle::new();
+                let error = JevClient::new()
+                    .unwrap()
+                    .models(&config, &ApiKey::for_test("key"), signal)
+                    .await
+                    .unwrap_err();
+                assert!(!error.to_string().contains("not-for-errors"));
+                assert!(!error.to_string().contains("key"));
+            });
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+
+    /// Enforces one total deadline and cancels a stalled model-list response.
+    #[test]
+    fn models_timeout_and_cancellation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (url, server) = serve(vec![MockResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: model_list().to_string(),
+            delay: Duration::from_millis(100),
+        }]);
+        runtime.block_on(async {
+            let mut config = models_config(url);
+            config.timeout = Duration::from_millis(10);
+            let (_handle, signal) = CancelHandle::new();
+            let error = JevClient::new()
+                .unwrap()
+                .models(&config, &ApiKey::for_test("secret"), signal)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Timeout);
+        });
+        server.join().unwrap();
+        let (url, server) = serve(vec![MockResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: model_list().to_string(),
+            delay: Duration::from_millis(100),
+        }]);
+        runtime.block_on(async {
+            let config = models_config(url);
+            let (handle, signal) = CancelHandle::new();
+            let task = JevClient::new().unwrap();
+            let key = ApiKey::for_test("secret");
+            let request = task.models(&config, &key, signal);
+            tokio::pin!(request);
+            let delay = tokio::time::sleep(Duration::from_millis(10));
+            futures::pin_mut!(delay);
+            match futures::future::select(&mut request, delay).await {
+                futures::future::Either::Left((result, _)) => {
+                    panic!("model request completed before cancellation: {result:?}")
+                }
+                futures::future::Either::Right(((), _)) => handle.cancel(),
+            }
+            assert_eq!(request.await.unwrap_err().kind, ErrorKind::Cancelled);
+        });
+        server.join().unwrap();
     }
 
     /// Parses both service guidance formats and excludes unapproved statuses.

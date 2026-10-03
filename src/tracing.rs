@@ -1,4 +1,4 @@
-//! Configures non-blocking process diagnostics and traces logical evaluations.
+//! Configures non-blocking process diagnostics and traces logical API operations.
 
 use std::{future::Future, time::Instant};
 
@@ -7,7 +7,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    api::types::SystemOneResponse,
+    api::types::{ModelMetadataList, SystemOneResponse},
     error::{ErrorKind, JevError},
 };
 
@@ -29,6 +29,42 @@ pub(crate) fn init() -> Result<WorkerGuard, Box<dyn std::error::Error + Send + S
         .with_ansi(false)
         .try_init()?;
     Ok(guard)
+}
+
+/// Traces one catalog lookup without recording credentials or model contents.
+pub(crate) async fn trace_models<F>(
+    request_id: &str,
+    operation: F,
+) -> Result<ModelMetadataList, JevError>
+where
+    F: Future<Output = Result<ModelMetadataList, JevError>>,
+{
+    let span = ::tracing::warn_span!("jev_models", request_id);
+    async move {
+        let started = Instant::now();
+        ::tracing::info!("model listing started");
+        let result = operation.await;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match &result {
+            Ok(list) => ::tracing::info!(
+                duration_ms,
+                count = list.models.len(),
+                "model listing completed"
+            ),
+            Err(error) if error.kind == ErrorKind::Cancelled => {
+                ::tracing::debug!(duration_ms, "model listing cancelled");
+            }
+            Err(error) => ::tracing::warn!(
+                duration_ms,
+                kind = error.kind.as_str(),
+                status = ?error.status,
+                "model listing failed"
+            ),
+        }
+        result
+    }
+    .instrument(span)
+    .await
 }
 
 /// Traces one logical evaluation without recording credentials or request content.

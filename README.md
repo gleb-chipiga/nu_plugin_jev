@@ -11,6 +11,7 @@ The command set is deliberately small:
 | --- | --- |
 | `jev ask` | Ask several named questions about one state in one request. |
 | `jev annotate` | Ask the same questions independently for each table row. |
+| `jev models` | List currently available model metadata. |
 | `jev question noul` | Build a probability-of-true question. |
 | `jev question choice` | Build a categorical question. |
 | `jev question score` | Build an ordered-score question. |
@@ -37,6 +38,19 @@ to use the system allocator.
 
 Live requests need an API key from `TYPESAFE_API_KEY` or a private TOML file.
 Question constructors and `--dry-run` work without a key or network access.
+
+## List current models
+
+```nu
+jev models | sort-by name | select name description release_date
+```
+
+`jev models` makes an authenticated, bodyless `GET /v1/models` and returns a
+table of string fields in service order. It accepts no pipeline input. The
+list is fetched on every call: names and aliases can change, and `jev ask`
+and `jev annotate` do not consult it before evaluating. Use native Nu table
+commands to inspect it. The command accepts `--base-url`, `--timeout`, and
+`--config`, but needs neither a selected evaluation model nor table settings.
 
 ## Ask about one state
 
@@ -137,6 +151,9 @@ files even when the plugin process persists.
 | Table jobs | `NU_PLUGIN_JEV_JOBS` | `jobs` | 16 |
 | Additional retries | `NU_PLUGIN_JEV_RETRIES` | `retries` | 3 |
 | Proxy policy | `NU_PLUGIN_JEV_PROXY` | `proxy` | `auto` |
+
+`jev models` reads only the transport, retry, proxy, and credential settings;
+invalid evaluation-only model, jobs, or cache values do not block a listing.
 
 The optional user file is `nu_plugin_jev/config.toml` in the platform user
 config directory (usually `~/.config/nu_plugin_jev/config.toml` on Linux). The
