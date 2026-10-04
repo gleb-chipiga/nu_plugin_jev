@@ -36,7 +36,7 @@ HTTPS evaluations SHALL offer HTTP/2 through ALPN when supported by the endpoint
 
 ### Requirement: Proxy routing without silent fallback
 
-In `auto` mode, HTTP requests SHALL use reqwest's standard process environment and OS proxy discovery, including applicable `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` behavior. In `direct` mode, they SHALL bypass all proxies. An explicit `http://` or `socks5h://` proxy SHALL override automatic discovery and SHALL NOT be bypassed by a global `NO_PROXY`; `socks5h://` SHALL resolve destination hostnames through the proxy. A failure of an explicitly selected proxy SHALL surface as an error rather than silently retrying via a system proxy or a direct connection. Proxy-policy changes between invocations SHALL select reusable clients by effective policy; a client SHALL NOT be built per row, and the retained client cache SHALL be bounded.
+In `auto` mode, requests SHALL use reqwest's process/OS proxy discovery, including applicable `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`; `direct` SHALL bypass proxies. An explicit `http://` or `socks5h://` proxy SHALL override discovery and global `NO_PROXY`; `socks5h://` SHALL resolve destination hostnames through the proxy. Explicit proxy failure SHALL return an error, never fall back to a system proxy or direct connection.
 
 #### Scenario: Automatic proxy bypass
 
@@ -53,6 +53,10 @@ In `auto` mode, HTTP requests SHALL use reqwest's standard process environment a
 - **WHEN** the selected explicit proxy cannot be reached
 - **THEN** the evaluation fails with a redacted transport error and does not connect directly
 
+### Requirement: Reusable clients follow the effective proxy policy
+
+Proxy-policy changes between invocations SHALL select clients by effective policy. A client SHALL NOT be built per table row, and the retained client cache SHALL be bounded.
+
 #### Scenario: Reuse within a table
 
 - **WHEN** multiple rows in one invocation share the same effective proxy policy
@@ -60,7 +64,7 @@ In `auto` mode, HTTP requests SHALL use reqwest's standard process environment a
 
 ### Requirement: Typed response contract validation
 
-An evaluation response SHALL include model, named answers, and usage. Answer names and variants SHALL match the submitted questions. Noul SHALL preserve `noul`; Choice SHALL preserve `choice`, `confidence`, and `probabilities`; Score SHALL preserve `score`, `confidence`, `legend`, and `probabilities`. Required fields, representable numeric values, probability/confidence domains, and membership of returned options/levels SHALL be validated. Token counts SHALL be nonnegative. Invalid responses SHALL cause a response error rather than a fabricated decision.
+Responses SHALL contain model, named answers, and usage. Names and variants SHALL match questions. Noul SHALL retain `noul`; Choice SHALL retain `choice`, `confidence`, and `probabilities`; Score SHALL retain `score`, `confidence`, `legend`, and `probabilities`. The plugin SHALL validate required fields, representable numbers, probability/confidence ranges, returned option/level membership, and nonnegative token counts. Invalid responses SHALL fail rather than fabricate decisions.
 
 #### Scenario: Resolved model differs from requested alias
 
@@ -79,7 +83,7 @@ An evaluation response SHALL include model, named answers, and usage. Answer nam
 
 ### Requirement: Bounded successful response bodies
 
-The plugin SHALL accept at most 16 MiB (16,777,216 bytes) of body data from a successful System One or model-list response. It SHALL reject an oversized declared `Content-Length` before reading the body and SHALL also enforce the limit while reading a response without a usable length declaration. An oversized body SHALL produce a nonretryable response error without JSON decoding, logging its contents, or returning partial data. The limit SHALL apply to each successful response separately, not to the sum of retries or rows.
+Each successful System One or model-list response SHALL be limited to 16 MiB (16,777,216 body bytes), independently of retries and rows. An oversized declared `Content-Length` SHALL be rejected before body reading; a response without a usable length SHALL be limited while reading. Oversize SHALL produce a nonretryable response error without JSON decoding, logging body contents, or returning partial data.
 
 #### Scenario: Declared oversized body
 
@@ -122,7 +126,7 @@ HTTP statuses `429`, `502`, `503`, `504`, and `529` SHALL be retried up to the c
 
 ### Requirement: Retry delay respects service guidance
 
-A valid finite, nonnegative, representable `retry-after-ms` value SHALL determine the retry delay in milliseconds and take precedence over `Retry-After`. If it is absent or invalid, a valid `Retry-After` value in delta seconds or HTTP-date form SHALL determine the delay. Without usable guidance, retries SHALL use capped exponential backoff: a 500 ms initial base doubled for each subsequent retry, capped at 5 seconds, with 0–25% downward jitter applied to each base. Waiting SHALL be cancellable. If the required delay cannot fit within the remaining deadline, the request SHALL time out rather than retry before the advised time.
+Retry delay SHALL follow finite, nonnegative, representable `retry-after-ms` first, then valid `Retry-After` delta seconds or HTTP date. Without valid guidance, it SHALL use a 500 ms initial base, double per retry up to 5 s, and apply 0–25% downward jitter. Waiting SHALL be cancellable. If the delay exceeds the remaining deadline, the request SHALL time out without an early retry.
 
 #### Scenario: Millisecond guidance takes precedence
 
@@ -165,17 +169,7 @@ Timeout SHALL bound one dispatched logical evaluation, including all of its atte
 
 ### Requirement: Stable actionable error information
 
-Errors SHALL identify validation/state/field-collision, HTTP, transport, timeout, or response failure categories as applicable. HTTP failures SHALL retain their status, and non-HTTP failures SHALL have no HTTP status. When an HTTP response provides a usable `x-typesafe-request-id`, non-blocking per-attempt diagnostics SHALL correlate that bounded, sanitized server identifier with the local logical `request_id` and attempt number. The server identifier SHALL NOT replace the local identity or change the Nu response and row-error schemas. Diagnostics SHALL be bounded and credential-redacted rather than dumping raw headers or unrestricted server bodies.
-
-#### Scenario: Server response identity is available
-
-- **WHEN** an HTTP attempt receives a response carrying a valid `x-typesafe-request-id` and debug tracing is enabled
-- **THEN** its diagnostics include the sanitized server identifier, local logical request identity, and attempt number without logging other response headers
-
-#### Scenario: Server response identity is unusable
-
-- **WHEN** the header is missing, malformed, or exceeds the diagnostic length limit
-- **THEN** the evaluation and its output remain unchanged and no untrusted header value is logged
+Errors SHALL identify validation, state, field collision, HTTP, transport, timeout, or response failure. HTTP failures SHALL retain status; non-HTTP failures SHALL have none.
 
 #### Scenario: Row HTTP failure information
 
@@ -187,9 +181,23 @@ Errors SHALL identify validation/state/field-collision, HTTP, transport, timeout
 - **WHEN** a request expires without an HTTP response
 - **THEN** its classification is `timeout` and it does not invent a status code
 
+### Requirement: Correlated bounded server response diagnostics
+
+For a usable `x-typesafe-request-id`, non-blocking per-attempt diagnostics SHALL correlate its bounded, sanitized value with the local logical `request_id` and attempt number. The server ID SHALL NOT replace local identity or change Nu response or row-error schemas. Diagnostics SHALL be bounded and credential-redacted, without raw header dumps or unrestricted response bodies.
+
+#### Scenario: Server response identity is available
+
+- **WHEN** an HTTP attempt receives a response carrying a valid `x-typesafe-request-id` and debug tracing is enabled
+- **THEN** its diagnostics include the sanitized server identifier, local logical request identity, and attempt number without logging other response headers
+
+#### Scenario: Server response identity is unusable
+
+- **WHEN** the header is missing, malformed, or exceeds the diagnostic length limit
+- **THEN** the evaluation and its output remain unchanged and no untrusted header value is logged
+
 ### Requirement: Authenticated model-list endpoint and response
 
-Model discovery SHALL use `GET /v1/models` under the configured HTTP(S) service root with the calling user's bearer API key and no request body. A trailing slash on the root SHALL NOT change the resolved path. The response SHALL have a `models` array; each entry SHALL contain string `name`, `description`, and `release_date` values. Unknown response fields SHALL NOT cause a response error by themselves, but missing or wrong-typed required fields SHALL cause a response error rather than a partial or fabricated list. The release-date value SHALL remain an opaque string rather than being rejected for not matching a client-side date parser.
+Model discovery SHALL send a bodyless `GET /v1/models` under the configured HTTP(S) root with the caller's bearer key; a trailing root slash SHALL NOT change the path. The response SHALL contain a `models` array of entries with string `name`, `description`, and `release_date`. Unknown fields SHALL be tolerated, but missing or wrong-typed required fields SHALL fail without a partial or fabricated list. Release dates SHALL remain opaque strings, without client-side date validation.
 
 #### Scenario: Authenticated local listing
 
@@ -204,7 +212,7 @@ Model discovery SHALL use `GET /v1/models` under the configured HTTP(S) service 
 
 ### Requirement: Model discovery shares live transport safeguards
 
-`jev models` SHALL resolve caller-scoped credentials, service root, proxy, timeout, and retries using the same precedence and validation as other live HTTP commands. A missing or invalid selected key SHALL fail before dispatch. The selected proxy policy, no-redirect rule, bounded retryable status set and retry-delay guidance, total deadline, cancellation, and redacted error classification SHALL apply to the model-list GET. Nonretryable 4xx responses, malformed JSON, and ambiguous transport failures SHALL not be retried; the HTTP status of a terminal response SHALL remain available without exposing request headers, keys, proxy credentials, or unbounded response bodies.
+`jev models` SHALL use live-command precedence and validation for caller key, root, proxy, timeout, and retries; missing/invalid keys SHALL fail before dispatch. GET SHALL share proxy policy, no-redirect rule, retryable statuses and delays, total deadline, cancellation, and redacted errors. Nonretryable 4xx, malformed JSON, and ambiguous transport failures SHALL not retry. Terminal HTTP status SHALL remain available; headers, keys, proxy credentials, and unbounded bodies SHALL not leak.
 
 #### Scenario: Retryable status then success
 
@@ -222,11 +230,9 @@ Model discovery SHALL use `GET /v1/models` under the configured HTTP(S) service 
 - **WHEN** the caller interrupts an in-progress models request or retry wait
 - **THEN** pending network work stops without waiting for the full timeout
 
-### Requirement: Measure successful logical HTTP operations and service root
+### Requirement: Return selected service root as metadata
 
-For every successful logical System One evaluation or model-list lookup, independently of the `--metrics` output flag, the returned metadata record's `base_url` SHALL identify the validated, normalized service root selected for that invocation. Its fixed path is `meta.base_url` on `ask` and `models`, or `jev_meta.base_url` on `annotate`. The root SHALL NOT be derived from or attributed to the TypeSafe response body, substituted with an appended `/v1/...` endpoint, or confused with the proxy URL. `request_bytes` SHALL be the compact UTF-8 JSON request-body length for one attempt, and SHALL be zero for the bodyless `GET /v1/models`. `response_bytes` SHALL be the byte length of the final successful response body consumed for JSON decoding.
-
-`elapsed` SHALL measure from immediately before the first explicit HTTP attempt through successful response decoding and contract validation, including retry waits and later attempts but excluding pre-dispatch preparation and table queue time. `attempt_elapsed` SHALL measure from immediately before the final successful HTTP attempt through that same decoding and validation, excluding previous attempts and retry waits. Both durations SHALL use the same completion instant; with one successful attempt they SHALL be equal. When returned to Nu, both SHALL be nonnegative Nu durations. `attempts` SHALL count explicit HTTP attempts in that logical operation. `http_version` SHALL identify the HTTP protocol version of the final successful response as a string. These values SHALL NOT claim to measure headers, TLS/proxy framing, complete network traffic, cumulative retry bodies, or server-side processing alone. A `metrics` record on `ask`/`models`, or `jev_metrics` on `annotate`, SHALL be returned only with a validated success and `--metrics`; it SHALL contain no `base_url`, `model`, `usage`, request state, questions, answer content, credentials, proxy details, or inferred new-connection status. Validated evaluation `model` and `usage` SHALL instead appear in always-present `meta` on `ask` or `jev_meta` on `annotate`; annotation's optional `jev_metrics` SHALL additionally include a local `request_id` for sharing and aggregation.
+For every validated System One evaluation or model-list lookup, metadata SHALL contain the invocation's selected, validated, normalized service root at `meta.base_url` (`ask`, `models`) or `jev_meta.base_url` (`annotate`), even without `--metrics`. The root SHALL NOT come from the response body, include an appended `/v1/...` endpoint, or be confused with the proxy URL.
 
 #### Scenario: Selected service root survives retries
 
@@ -234,11 +240,24 @@ For every successful logical System One evaluation or model-list lookup, indepen
 - **THEN** its returned metadata record's `base_url` (`meta.base_url` on `ask`/`models`, `jev_meta.base_url` on `annotate`) equals that selected root with or without `--metrics`, and completion tracing records the same root
 - **AND** it contains neither the proxy URL nor the full request endpoint
 
+### Requirement: Measure successful HTTP body bytes
+
+On a successful logical operation, `request_bytes` SHALL equal one attempt's compact UTF-8 JSON request body, or zero for bodyless `GET /v1/models`. `response_bytes` SHALL equal the final successful response body's consumed byte length for JSON decoding. Neither field SHALL include headers, TLS/proxy framing, HTTP frames, cumulative retry bodies, or character counts; they SHALL NOT claim to measure complete network traffic.
+
 #### Scenario: Bodyless model lookup
 
 - **WHEN** `GET /v1/models` returns a valid model list after one or more attempts
 - **THEN** `request_bytes` is exactly zero, `response_bytes` measures only the final successful response body, and `attempts` counts explicit GET attempts
 - **AND** the same deadline, retry-delay, and cancellation boundaries apply as for System One
+
+#### Scenario: Protocol overhead is outside body metrics
+
+- **WHEN** the request uses HTTP/2, a proxy, or multibyte JSON content
+- **THEN** byte fields are based on the serialized request and consumed final response bodies, not headers, frame overhead, or character count
+
+### Requirement: Measure successful HTTP attempts and durations
+
+`attempts` SHALL count explicit attempts and `http_version` SHALL name the final successful response protocol. `elapsed` SHALL run from before the first attempt through decoding and contract validation, including retries and waits but excluding preparation and table queueing. `attempt_elapsed` SHALL use the same completion instant, starting before the final attempt. Both SHALL be nonnegative Nu durations, equal on one-attempt success, and SHALL NOT claim to measure server processing alone.
 
 #### Scenario: One successful attempt
 
@@ -259,12 +278,17 @@ For every successful logical System One evaluation or model-list lookup, indepen
 - **THEN** `http_version` names the protocol version of that final successful response
 - **AND** it does not claim whether a new connection was established for the attempt
 
+### Requirement: Return requested metrics only for validated success
+
+With `--metrics`, validated `ask`/`models` SHALL return `metrics` and `annotate` SHALL return `jev_metrics`; otherwise neither SHALL appear. Metrics SHALL omit `base_url`, `model`, `usage`, state, questions, answers, credentials, proxy details, and inferred connection status. Evaluation `model` and `usage` SHALL always be in `meta`/`jev_meta`; annotation metrics SHALL include local `request_id` for sharing and aggregation.
+
+#### Scenario: Successful measurement placement
+
+- **WHEN** a validated evaluation succeeds with `--metrics`
+- **THEN** its metrics contain `request_bytes`, `response_bytes`, `elapsed`, `attempt_elapsed`, `attempts`, and `http_version`
+- **AND** evaluation `model` and `usage` remain in always-present metadata rather than metrics
+
 #### Scenario: Invalid or failed evaluation
 
 - **WHEN** the final response is malformed, fails answer validation, or the evaluation ends in an HTTP/transport/timeout error
 - **THEN** no successful metrics record is returned or cached
-
-#### Scenario: Protocol overhead is outside body metrics
-
-- **WHEN** the request uses HTTP/2, a proxy, or multibyte JSON content
-- **THEN** byte fields are based on the serialized request and consumed final response bodies, not headers, frame overhead, or character count

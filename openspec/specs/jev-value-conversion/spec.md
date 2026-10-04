@@ -8,7 +8,7 @@ Preserve structured Nu data when building Jev states and expose JSON responses a
 
 ### Requirement: Recursive structured conversion
 
-The plugin SHALL convert Nu strings, integers, finite floats, booleans, nothing, lists, and records recursively to corresponding JSON strings, numbers, booleans, null, arrays, and objects. Records and lists SHALL NOT be serialized to text or NUON. JSON-looking strings SHALL remain strings. A selected outbound Nu record containing duplicate keys at any depth SHALL fail conversion with the offending path before its request is submitted, rather than allowing JSON object construction to discard a value. Unselected source fields SHALL remain outside this validation boundary.
+The plugin SHALL recursively convert Nu strings, integers, finite floats, booleans, nothing, lists, and records to corresponding JSON strings, numbers, booleans, null, arrays, and objects. Records and lists SHALL NOT become text or NUON; JSON-looking strings SHALL remain strings.
 
 #### Scenario: Nested record state
 
@@ -19,6 +19,10 @@ The plugin SHALL convert Nu strings, integers, finite floats, booleans, nothing,
 
 - **WHEN** a string value contains `{"message":"hello"}`
 - **THEN** its request state is a JSON string rather than a parsed object
+
+### Requirement: Selected outbound records reject duplicate keys
+
+A selected outbound Nu record with duplicate keys at any depth SHALL fail conversion with the offending path before submission, rather than silently discarding a value during JSON object construction. Unselected source fields SHALL remain outside this validation boundary.
 
 #### Scenario: Duplicate nested outbound key
 
@@ -70,7 +74,7 @@ The final API state SHALL be a string, object, or array. Nested JSON scalars SHA
 
 ### Requirement: Explicit additional context wrapping
 
-For table commands, whole-row selection, cell-path selection, or explicit field projection SHALL occur before recursive conversion and context wrapping. Only the chosen outbound input and explicit context SHALL be converted; unrelated source fields SHALL NOT be converted or transmitted. When `--context` is absent, the converted chosen input SHALL be the state. When `--context` is present, the state SHALL be exactly `{input: <converted input>, context: <converted context>}`. Flag presence SHALL be distinguished from explicit null. The plugin SHALL NOT merge context into the input or overwrite its fields. Final state admissibility SHALL be checked after wrapping.
+For table commands, whole-row, cell-path, or field projection SHALL precede conversion and wrapping. Only selected input and explicit context SHALL be converted; other fields SHALL NOT be converted or sent. Without `--context`, chosen input SHALL be state; with it, state SHALL be exactly `{input: <converted input>, context: <converted context>}`. Flag absence SHALL differ from explicit null. Context SHALL NOT merge with or overwrite input; final-state validity SHALL be checked after wrapping.
 
 #### Scenario: Input has a field named context
 

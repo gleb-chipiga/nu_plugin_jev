@@ -28,7 +28,7 @@ Evaluation commands SHALL accept a nonempty record of named questions. Each ques
 
 ### Requirement: Schema-aligned raw question fields
 
-Raw question maps SHALL follow the TypeSafe `0.2.0` field shapes. Instructions SHALL accept omission, string, object, array, or null. Noul criteria SHALL accept omission, null, or a record whose `true` and `false` descriptions accept string/object/array/null. Choice SHALL require a criteria record with descriptions of those same root types. Score SHALL require a nonempty list of string/object/array level descriptions; root null SHALL be rejected. Structured descriptions SHALL permit ordinary nested JSON scalars. Missing optional fields and explicit null fields SHALL remain distinguishable. Raw maps SHALL NOT receive constructor-only cardinality maxima. Unknown fields in a raw question record SHALL be rejected rather than ignored; duplicate keys in nested records selected for that question SHALL follow the lossless outbound conversion rule.
+Raw questions SHALL follow TypeSafe `0.2.0`: instructions may be absent, string, object, array, or null. Noul criteria may be absent, null, or a record with `true`/`false` descriptions of those types. Choice SHALL require a criteria record of those types. Score SHALL require nonempty string/object/array levels and reject root null. Structured descriptions SHALL allow nested JSON scalars. Absence SHALL differ from explicit null; raw maps SHALL NOT inherit constructor-only cardinality maxima.
 
 #### Scenario: Structured instructions
 
@@ -45,6 +45,10 @@ Raw question maps SHALL follow the TypeSafe `0.2.0` field shapes. Instructions S
 - **WHEN** instructions are an integer or a Score level is null
 - **THEN** validation fails and identifies the offending question field
 
+### Requirement: Raw question fields retain lossless validation
+
+Unknown raw question fields SHALL fail rather than be ignored. Duplicate keys in selected nested Nu records SHALL follow the lossless outbound conversion rule and fail with their location before HTTP dispatch.
+
 #### Scenario: Unknown raw question field
 
 - **WHEN** a raw Noul, Choice, or Score question includes a misspelled or unsupported top-level field such as `instrucitons`
@@ -57,7 +61,7 @@ Raw question maps SHALL follow the TypeSafe `0.2.0` field shapes. Instructions S
 
 ### Requirement: Offline constructors return ordinary data
 
-`jev question noul`, `jev question choice`, and `jev question score` SHALL return ordinary Nu records in request-question format. Constructors SHALL accept instructions using an `any` argument shape followed by question-field validation. They SHALL work without configuration or credentials and SHALL NOT perform HTTP requests or execute Nu closures. Their results SHALL be usable in records loaded from NUON or returned from Nu modules. Nonempty pipeline input SHALL be rejected rather than silently ignored; instructions SHALL be supplied as arguments.
+`jev question noul`, `jev question choice`, and `jev question score` SHALL return ordinary Nu records in request-question format. They SHALL accept `any` instructions as arguments and validate question fields. They SHALL need no configuration or credentials, make no HTTP request, and execute no Nu closure. Results SHALL compose with NUON-loaded records or Nu modules. Nonempty pipeline input SHALL fail rather than be ignored.
 
 #### Scenario: Assemble a policy from constructors
 

@@ -8,7 +8,7 @@ Let Nushell users discover the model names exposed to their TypeSafe account as 
 
 ### Requirement: List model metadata as Nu rows
 
-`jev models` SHALL accept no state or questions and SHALL return `{models: <authenticated service's model entries>, meta: {base_url: <selected validated service root>}}` on validated success, even without `--metrics`. Every model entry SHALL remain a record with string `name`, `description`, and `release_date` fields. The `models` list SHALL preserve the service's entry order and string values, including opaque release-date text; an empty service list SHALL remain `models: []`. Individual model records SHALL NOT repeat `base_url`, and the lookup SHALL NOT fabricate `model` or `usage`. Nonempty pipeline input SHALL be rejected without consuming a stream or contacting the service. The command SHALL expose `--base-url`, `--timeout`, and `--config` for applicable existing settings, but SHALL NOT require a model name, table scheduling settings, or question-related flags. The outer metadata destination SHALL always be `meta`. With `--metrics`, the result SHALL additionally contain `metrics: {request_bytes, response_bytes, elapsed, attempt_elapsed, attempts, http_version}`; the bodyless GET SHALL report `request_bytes: 0`. The selected `base_url` SHALL appear only in `meta`, not inside `metrics`. Failures SHALL return errors without fabricated success fields. `--metrics` SHALL NOT enable caching, a model-selection side effect, or an extra API request.
+On validated success, `jev models` SHALL return `{models: <authenticated service entries>, meta: {base_url: <selected validated root>}}`, even without `--metrics`. Each entry SHALL have string `name`, `description`, and `release_date`. Order and string values, including opaque dates, SHALL be preserved; an empty list SHALL remain empty. Rows SHALL NOT repeat `base_url` or fabricate `model` or `usage`; the outer metadata field SHALL always be `meta`.
 
 #### Scenario: Native table operations
 
@@ -21,10 +21,29 @@ Let Nushell users discover the model names exposed to their TypeSafe account as 
 - **WHEN** the service returns `{models: []}`
 - **THEN** `jev models` returns `{models: [], meta: {base_url: <selected root>}}` rather than a fabricated default model
 
+#### Scenario: Unflagged listing retains provenance
+
+- **WHEN** the caller runs `jev models` without `--metrics`
+- **THEN** the command returns `{models: <ordinary list>, meta: {base_url: <selected root>}}` without `metrics`
+- **AND** native row processing uses `jev models | get models`
+
+#### Scenario: Fixed metadata destination
+
+- **WHEN** the caller runs `jev models` and the lookup succeeds
+- **THEN** the result contains `meta: {base_url: <selected root>}` beside `models`
+
+### Requirement: Model discovery rejects irrelevant input
+
+`jev models` SHALL accept no state or questions. Nonempty pipeline input SHALL fail before consuming a stream or contacting the service. The command SHALL expose `--base-url`, `--timeout`, and `--config` for applicable settings, without requiring a model name, table scheduling settings, or question-related flags.
+
 #### Scenario: Input is not silently ignored
 
 - **WHEN** a nonempty list stream or other state is piped into `jev models`
 - **THEN** the command rejects it before consuming the stream or sending an HTTP request
+
+### Requirement: Optional model-list metrics
+
+With `--metrics`, success SHALL also return `metrics: {request_bytes, response_bytes, elapsed, attempt_elapsed, attempts, http_version}`; the bodyless GET SHALL report zero request bytes. `base_url` SHALL remain only in `meta`. Failures SHALL return errors without fabricated success fields. `--metrics` SHALL NOT enable caching, select a model, or send another API request.
 
 #### Scenario: Listing with metrics
 
@@ -37,17 +56,6 @@ Let Nushell users discover the model names exposed to their TypeSafe account as 
 
 - **WHEN** the service returns `{models: []}` and the caller runs `jev models --metrics`
 - **THEN** the result is `{models: [], meta: {base_url: <selected root>}, metrics: <successful lookup measurements>}`
-
-#### Scenario: Unflagged listing retains provenance
-
-- **WHEN** the caller runs `jev models` without `--metrics`
-- **THEN** the command returns `{models: <ordinary list>, meta: {base_url: <selected root>}}` without `metrics`
-- **AND** native row processing uses `jev models | get models`
-
-#### Scenario: Fixed metadata destination
-
-- **WHEN** the caller runs `jev models` and the lookup succeeds
-- **THEN** the result contains `meta: {base_url: <selected root>}` beside `models`
 
 #### Scenario: Invalid input and failed lookup have no success metrics
 

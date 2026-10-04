@@ -8,7 +8,7 @@ Provide one-state System One evaluations and exact request previews through `jev
 
 ### Requirement: Ask evaluates one state against all named questions
 
-`<state> | jev ask <questions>` SHALL submit one System One evaluation containing the selected model, one state, and the full named questions map. On validated live success it SHALL return `{answers, meta: {base_url, model, usage}}`, preserving answer names and typed answer fields. `base_url` SHALL be the selected validated service root, while `model` and `usage` SHALL come from the validated API response. The legacy top-level `model` and `usage` fields SHALL move into fixed `meta`. No API response provenance SHALL be fabricated for dry-run or offline token estimation.
+`<state> | jev ask <questions>` SHALL submit one System One evaluation with the selected model, one state, and every named question. Validated live success SHALL return `{answers, meta: {base_url, model, usage}}`, preserving typed answer names and fields. `base_url` SHALL be the selected validated root; `model` and `usage` SHALL come from the API response, not legacy top-level fields. Dry runs and offline token estimates SHALL NOT fabricate API response provenance.
 
 #### Scenario: Mixed answers in one response
 
@@ -55,7 +55,7 @@ A list or finite input stream passed to `jev ask` SHALL be one array state and S
 
 ### Requirement: Exact single-state dry runs
 
-`--dry-run` on `jev ask` SHALL return `{request: <exact JSON-shaped Nu request body>, request_bytes: <integer>}`. The nested `request` SHALL contain the `model`, final `state`, and `questions` that the live evaluation would send. `request_bytes` SHALL equal the compact UTF-8 JSON serialization length of that body, excluding the preview wrapper and HTTP transport overhead. The preview SHALL perform normal request validation but SHALL NOT require an API key, a supported token-estimation model, or HTTP access. `--context` SHALL be reflected in `request.state`. The same output contract SHALL hold when the plugin is built without the `token-estimation` Cargo feature.
+`jev ask --dry-run` SHALL return `{request: <exact JSON-shaped Nu body>, request_bytes: <integer>}`. `request` SHALL contain the live body's model, final state (including `--context`), and questions. `request_bytes` SHALL equal compact UTF-8 JSON bytes of that body, excluding the wrapper and transport overhead.
 
 #### Scenario: Preview matches submitted body
 
@@ -80,9 +80,18 @@ A list or finite input stream passed to `jev ask` SHALL be one array state and S
 - **WHEN** the state contains multibyte UTF-8 or JSON-escaped characters
 - **THEN** `request_bytes` counts serialized JSON bytes, not Nu display characters or Unicode scalar values
 
+### Requirement: Dry-run validation without live dependencies
+
+Dry runs SHALL validate the request normally but SHALL NOT require an API key, supported token-estimation model, or HTTP access. The same preview contract SHALL hold without the `token-estimation` Cargo feature.
+
+#### Scenario: Offline request preview
+
+- **WHEN** a valid dry run is performed without a key and with the service unavailable
+- **THEN** the exact request and byte length are returned without an HTTP call
+
 ### Requirement: Optional live metrics for one state
 
-`jev ask --metrics` SHALL perform the ordinary live evaluation and, on validated success, add `metrics: {request_bytes, response_bytes, elapsed, attempt_elapsed, attempts, http_version}` beside `answers` and fixed `meta`. `metrics` SHALL contain HTTP measurements only: no `base_url`, `model`, or `usage`. Without `--metrics`, the same `answers` and `meta` records SHALL remain and no HTTP measurements SHALL be added. `--metrics` SHALL require a live call and SHALL fail with a labeled argument error when combined with `--dry-run` or, when available, `--estimate-tokens`.
+`jev ask --metrics` SHALL run normally and, on validated success, add `metrics: {request_bytes, response_bytes, elapsed, attempt_elapsed, attempts, http_version}` beside `answers` and fixed `meta`. Metrics SHALL exclude `base_url`, `model`, and `usage`. Without the flag, `answers` and `meta` SHALL remain without measurements. Combining `--metrics` with `--dry-run` or available `--estimate-tokens` SHALL fail with a labeled argument error before HTTP.
 
 #### Scenario: Successful ask with metrics
 

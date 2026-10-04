@@ -26,3 +26,12 @@
 - Read `skills/jev-nushell/SKILL.md` when preparing Jev/Nushell usage examples
   or workflows for this repository, even if the root-level skill directory is
   not included in an agent's automatic skill discovery paths.
+
+## OpenSpec specifications
+
+- Follow the official spec-driven guidance: each `### Requirement:` description
+  (the text before its first scenario) must state one testable behavior, use
+  `SHALL` or `MUST`, and be at most 500 characters long.
+- Put examples and edge cases in `#### Scenario:` blocks with `WHEN`/`THEN`.
+  Split multiple behaviors into separate requirements, each with at least one
+  scenario; do not shorten text mechanically just to satisfy the length limit.

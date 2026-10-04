@@ -8,7 +8,7 @@ Annotate Nu record streams with independent Jev evaluations for native downstrea
 
 ### Requirement: Annotation preserves rows and adds named answers
 
-`jev annotate <questions>` SHALL incrementally evaluate each input record as an independent state against the complete questions map and emit the original record with `answers` under the top-level `answers` field by default. `--into <name>` SHALL select a nonempty literal top-level answer field instead. Each successful live row SHALL also have the separate fixed, always-present `jev_meta` record from `add-request-metrics`, plus optional fixed `jev_metrics` when `--metrics` is selected; `--into` SHALL change neither destination. Successful annotation SHALL preserve every original field, including fields not sent when state selection is used. A single input record SHALL be treated as a one-row input; an empty table SHALL produce an empty output stream.
+`jev annotate <questions>` SHALL incrementally evaluate each record independently with all named questions and emit its original fields plus answers under top-level `answers` by default. `--into <name>` SHALL choose another nonempty literal answer field. Each successful live row SHALL also receive fixed `jev_meta` and optional `jev_metrics` with `--metrics`; `--into` SHALL not move them. Unsent source fields SHALL remain. A single record SHALL be one row; an empty table SHALL yield no rows.
 
 #### Scenario: Multiple questions for one row
 
@@ -31,13 +31,7 @@ Annotate Nu record streams with independent Jev evaluations for native downstrea
 
 ### Requirement: Output destinations do not overwrite input data
 
-The answer destination selected by `--into` SHALL be a nonempty literal name distinct from fixed `jev_meta` and, when `--metrics` is enabled, fixed `jev_metrics`. An invalid answer destination SHALL fail before input consumption. An existing enabled destination field in a row SHALL cause a terminal field-collision error as soon as that row is read and before its request is constructed or submitted, including when the field is excluded from outbound state. The collision SHALL stop input admission, cancel outstanding local evaluations, and terminate the stream independently of `--on-error fail|keep|record` or ordered output; the conflicting row SHALL NOT be returned unchanged or with `jev_error`. Rows already delivered cannot be rolled back, and the plugin SHALL NOT materialize the stream to search for later collisions. Error-record insertion SHALL NOT overwrite an existing `jev_error`; inability to attach an error record SHALL terminate with an error. With `--on-error record`, the answer destination SHALL differ from `jev_error`.
-
-#### Scenario: Annotation field collision
-
-- **WHEN** an input row already has the configured annotation field
-- **THEN** the stream terminates with a field-collision error before that row is sent to the service, even with `--on-error keep` or `record`
-- **AND** its existing field is not overwritten or emitted as if it contained a new Jev answer
+`--into` SHALL select a nonempty literal answer field distinct from fixed `jev_meta` and, when enabled, `jev_metrics`. Invalid destinations SHALL fail before input consumption. With `--on-error record`, the answer field SHALL also differ from `jev_error`. The old `--meta` switch SHALL be rejected.
 
 #### Scenario: Identical annotation and metadata destinations
 
@@ -59,6 +53,21 @@ The answer destination selected by `--into` SHALL be a nonempty literal name dis
 - **WHEN** `--into jev_metrics` is supplied without `--metrics`
 - **THEN** the name is accepted as the answer destination if it does not collide with a source field
 
+#### Scenario: Error destination remains reserved
+
+- **WHEN** `--on-error record` is supplied with `--into jev_error`
+- **THEN** invocation fails before consuming input rows
+
+### Requirement: Enabled output destinations never overwrite rows
+
+An existing enabled destination in a row SHALL cause terminal collision on reading, before request construction or dispatch, even when excluded from state. Collision SHALL stop admission, cancel outstanding work, and end the stream regardless of row-error policy or ordering. The row SHALL NOT pass through unchanged or with `jev_error`. Delivered rows cannot be rolled back; the plugin SHALL NOT collect the stream to search ahead.
+
+#### Scenario: Annotation field collision
+
+- **WHEN** an input row already has the configured annotation field
+- **THEN** the stream terminates with a field-collision error before that row is sent to the service, even with `--on-error keep` or `record`
+- **AND** its existing field is not overwritten or emitted as if it contained a new Jev answer
+
 #### Scenario: Metrics field collision
 
 - **WHEN** a row already contains the enabled `jev_metrics` destination, even if `--fields` excludes that source field
@@ -75,10 +84,14 @@ The answer destination selected by `--into` SHALL be a nonempty literal name dis
 - **THEN** the collision stops admission, cancels outstanding local work, and terminates without waiting for the earlier row's ordered result
 - **AND** no request is submitted for the conflicting row
 
-#### Scenario: Error destination remains reserved
+### Requirement: Error records do not overwrite source fields
 
-- **WHEN** `--on-error record` is supplied with `--into jev_error`
-- **THEN** invocation fails before consuming input rows
+Error-record insertion SHALL NOT overwrite an existing `jev_error`; if the field cannot be attached, the invocation SHALL terminate with an error.
+
+#### Scenario: Existing error destination
+
+- **WHEN** a failed row already contains `jev_error` under `--on-error record`
+- **THEN** the invocation terminates rather than replacing that source field
 
 ### Requirement: Cell-path state selection and static context
 
@@ -102,7 +115,7 @@ The answer destination selected by `--into` SHALL be a nonempty literal name dis
 
 ### Requirement: Explicit row-preserving field projection
 
-`--fields <list<string>>` on `jev annotate` SHALL construct an outbound record containing exactly the listed top-level fields with their original names and values before JSON conversion. Names SHALL be literal, including names containing dots, rather than cell paths. The list SHALL be nonempty and contain distinct strings. `--fields` and `--state` SHALL be mutually exclusive. Invalid lists or conflicting flags SHALL fail before input consumption or HTTP dispatch, regardless of row error policy or preview mode. A missing projected field SHALL cause a per-row state error under the selected row error policy; it SHALL NOT be skipped or substituted with null. Projection SHALL NOT remove or modify any fields of the original output row or bypass output-destination collision checks. Complex state construction SHALL remain the responsibility of ordinary Nu pipelines.
+`jev annotate --fields <list<string>>` SHALL build outbound state from exactly those top-level fields with original names and values before JSON conversion. Names, including dotted ones, SHALL be literal, not cell paths. The list SHALL be nonempty with distinct strings and incompatible with `--state`. Invalid arguments SHALL fail before input or HTTP, regardless of row policy or preview mode. Projection SHALL preserve the output row; complex state construction SHALL remain in Nu pipelines.
 
 #### Scenario: Selected columns with a complete source row
 
@@ -127,6 +140,10 @@ The answer destination selected by `--into` SHALL be a nonempty literal name dis
 - **WHEN** `--fields` is an empty list, contains a non-string or duplicate name, or is supplied together with `--state`
 - **THEN** invocation fails without reading input rows or submitting requests, even with `--on-error keep` or `--dry-run`
 
+### Requirement: Projected rows retain state and collision semantics
+
+A missing projected field SHALL cause a per-row state error under the selected row policy, never be skipped or replaced with null. Projection SHALL NOT bypass output-destination collision checks, even for fields excluded from outbound state.
+
 #### Scenario: Missing projected field follows row policy
 
 - **WHEN** a row lacks `sender` and `--fields [message sender] --on-error record` is supplied
@@ -141,7 +158,7 @@ The answer destination selected by `--into` SHALL be a nonempty literal name dis
 
 ### Requirement: Typed annotations compose with native Nu processing
 
-Annotation SHALL preserve typed answers for ordinary Nu cell-path access. The plugin SHALL NOT apply an implicit probability threshold or perform semantic filtering internally. Documentation SHALL show native `where` and `sort-by` over answer fields and native `reject` when callers want to remove annotations. Failed rows returned by `keep` or `record` SHALL remain available to downstream Nu commands without fabricating answer fields; documentation SHALL show that callers handle these rows explicitly when applying a decision predicate.
+Annotation SHALL preserve typed answers for native Nu cell paths without implicit probability thresholds or internal semantic filtering. Documentation SHALL show `where`, `sort-by`, and `reject` over answer fields. Failed `keep`/`record` rows SHALL remain available downstream without fabricated answers; documentation SHALL show callers handling them explicitly before applying decision predicates.
 
 #### Scenario: Caller chooses an inclusive threshold
 
@@ -157,7 +174,7 @@ Annotation SHALL preserve typed answers for ordinary Nu cell-path access. The pl
 
 ### Requirement: Independent row states without automatic packing
 
-`jev annotate` SHALL build a separate request body for each valid row using that row's selected or projected input and explicit context. It SHALL NOT automatically combine multiple independent rows into a shared array/object state, include neighboring rows, or rewrite questions with synthetic row references. Distinct canonical request bodies SHALL create independent logical evaluations; equivalent bodies SHALL remain eligible for duplicate sharing regardless of differences in unselected source fields. Each evaluation SHALL contain all named questions for that row. Documentation SHALL distinguish an array used as one intentional joint state from independent row processing, and SHALL NOT present the absence of a batch endpoint as proof that client-side packing is impossible. Packing independent rows SHALL remain outside this change pending separate validation of quality, cross-row influence, context limits, partial failures, caching, and usage attribution. Duplicate sharing and HTTP retries SHALL NOT be described as a remote batch endpoint.
+`jev annotate` SHALL build one request body per valid row from its selected/projected input and explicit context, with all named questions. It SHALL NOT pack independent rows into a shared state, include neighbors, or add synthetic row references. Distinct canonical bodies SHALL cause independent evaluations; equivalent bodies MAY share one despite different unselected source fields.
 
 #### Scenario: Three distinct row states
 
@@ -171,9 +188,18 @@ Annotation SHALL preserve typed answers for ordinary Nu cell-path access. The pl
 - **THEN** each request's state contains only that row's `message` field, and the named questions remain unchanged
 - **AND** no request adds a `rows` collection or rewrites the questions to refer to row indices
 
+### Requirement: Explain independent rows and intentional joint state
+
+Documentation SHALL distinguish one intentional array state from independent row processing. It SHALL NOT claim that lack of a batch endpoint makes client-side packing impossible or call duplicate sharing/retries a remote batch endpoint. Packing SHALL remain outside this change pending validation of quality, cross-row influence, context limits, partial failures, caching, and usage attribution.
+
+#### Scenario: Describe request sharing without batch claims
+
+- **WHEN** documentation explains annotation, in-flight sharing, or retries
+- **THEN** it identifies independent row evaluations and does not describe them as a remote batch endpoint
+
 ### Requirement: Bounded outstanding work and input read-ahead
 
-`--jobs N` SHALL limit outstanding unique logical evaluations, including their retries, to at most `N`. Plugin-controlled admission SHALL retain no more than `2N` row outcomes that have not yet been yielded or discarded on termination. This bound SHALL include queued rows, duplicate waiters, completed outcomes awaiting order, and queued output. Table input SHALL NOT be fully collected before results are returned. The separately bounded completed cache and upstream Nu protocol buffering SHALL be distinguished from this work bound.
+`--jobs N` SHALL bound outstanding unique evaluations, including retries, by `N`. Admission SHALL retain at most `2N` row outcomes not yet yielded or discarded, counting queued rows, duplicate waiters, ordered completed outcomes, and queued output. Input SHALL stream rather than be fully collected. The completed cache and upstream Nu protocol buffering SHALL be separate from this work bound.
 
 #### Scenario: Slow first row in ordered mode
 
@@ -233,7 +259,7 @@ When downstream stops consuming and drops the output stream, the invocation SHAL
 
 ### Requirement: Terminal failure policy
 
-`--on-error fail` SHALL be the default. After retry policy is exhausted, the first observed terminal row failure SHALL stop input admission and cancel remaining evaluations without waiting for its ordered slot. The stream SHALL emit a terminal Nu error value and no successful values after that error. Rows already delivered SHALL not be rolled back. Invalid invocation arguments, configuration, credentials, or question maps SHALL fail before stream processing regardless of row error mode; existing upstream Nu errors SHALL remain terminal.
+`--on-error fail` SHALL be the default. After retries, the first observed terminal row failure SHALL stop admission and cancel remaining work without waiting for its ordered slot. The stream SHALL emit a terminal Nu error, with no later successes; delivered rows SHALL not roll back. Invalid arguments, config, credentials, or questions SHALL fail before stream processing in every row mode. Upstream Nu errors SHALL remain terminal.
 
 #### Scenario: Later row fails while first row is stalled
 
@@ -243,7 +269,7 @@ When downstream stops consuming and drops the output stream, the invocation SHAL
 
 ### Requirement: Keep and record row failure policies
 
-With `--on-error keep`, an ordinary failed row SHALL be returned unchanged. With `--on-error record`, an ordinary failed record SHALL be preserved with `jev_error: {kind, message, status}`, where non-HTTP status is null. Failed rows SHALL receive no new annotation or metadata. Non-record rows SHALL be errors; `keep` SHALL return them unchanged, while `record` SHALL terminate because it cannot attach a field. Output-destination collisions and an existing `jev_error` field that prevents recording SHALL instead terminate the invocation immediately, regardless of `keep` or `record`; neither policy SHALL pass through a conflicting row as an apparent success.
+`--on-error keep` SHALL return an ordinary failed row unchanged. `record` SHALL preserve a failed record with `jev_error: {kind, message, status}`, using null status for non-HTTP errors. Neither mode SHALL fabricate annotation or metadata. Non-record rows SHALL be errors: `keep` returns them unchanged, while `record` terminates because it cannot attach a field. Output collisions or existing `jev_error` SHALL terminate immediately, not pass through as success.
 
 #### Scenario: Annotation keeps a failed row
 
@@ -263,7 +289,7 @@ With `--on-error keep`, an ordinary failed row SHALL be returned unchanged. With
 
 ### Requirement: Canonical request equivalence
 
-Deduplication keys SHALL cover the complete canonical request body and service root, including final state, questions, requested model, and all other response-affecting request parameters. Context SHALL participate through the final state. Object field order SHALL not change equivalence; array order, scalar representations, and omitted-versus-null fields SHALL remain distinct. Key comparisons SHALL NOT rely solely on hash equality. Credentials SHALL NOT be stored in keys, and outcomes SHALL NOT be shared across credential-isolated invocations.
+Deduplication keys SHALL include canonical full request body and service root: final state (including context), questions, requested model, and other response-affecting parameters. Object field order SHALL not matter; array order, scalar representation, and omitted versus null SHALL. Comparisons SHALL NOT rely only on hashes. Keys SHALL omit credentials, and outcomes SHALL NOT cross credential-isolated invocations.
 
 #### Scenario: Object order and array order
 
@@ -284,7 +310,7 @@ Deduplication keys SHALL cover the complete canonical request body and service r
 
 ### Requirement: Mandatory in-flight single-flight deduplication
 
-Identical requests admitted while one logical evaluation is in flight SHALL join that evaluation rather than dispatch a second independent evaluation. Its retries SHALL remain part of the same shared operation. Single-flight SHALL apply independently of completed-cache capacity or entry eligibility. Every original row SHALL still have its own output outcome within the bounded admission window. A completed failure SHALL be delivered to its current waiters and removed without being retained in the completed cache.
+Identical requests admitted during one in-flight evaluation SHALL join it, including its retries, rather than dispatch again. Single-flight SHALL apply regardless of completed-cache capacity or eligibility. Each original row SHALL retain its own outcome within bounded admission. A completed failure SHALL reach current waiters and be removed, never cached as a completed result.
 
 #### Scenario: Concurrent duplicate during retries
 
@@ -305,7 +331,16 @@ Identical requests admitted while one logical evaluation is in flight SHALL join
 
 ### Requirement: Bounded LRU of successful outcomes
 
-`jev annotate` SHALL check the completed cache before the in-flight lookup, refresh recency on a cache hit, and cache only successful outcomes. Cache eligibility SHALL NOT depend on subsequent native Nu filtering. Retained cache entries SHALL satisfy both configured `max_entries` and `max_approx_bytes`. Approximate entry weights SHALL deterministically account for canonical key bytes, the serialized successful response, request identity, and a documented fixed per-entry overhead estimate. Insertion SHALL evict least-recently-used entries as necessary; later duplicates of evicted entries MAY initiate new logical evaluations. An entry exceeding the byte limit by itself SHALL be returned to current rows without caching it or evicting other entries for its insertion. Cache eviction SHALL NOT cancel active evaluations or invalidate outcomes held by admitted rows. Documentation SHALL distinguish these bounds from a strict process-memory ceiling and SHALL NOT promise once-only evaluation for an entire invocation.
+`jev annotate` SHALL check completed cache before in-flight work, refresh recency on hits, and cache only successes regardless of later native Nu filtering. Entries SHALL satisfy both `max_entries` and `max_approx_bytes`. Weight SHALL deterministically include canonical key bytes, serialized successful response, request identity, and documented fixed per-entry overhead.
+
+#### Scenario: Cache hit changes recency
+
+- **WHEN** A and B are cached in that order, A is reused, and C requires eviction with a two-entry limit
+- **THEN** B is evicted and A remains reusable
+
+### Requirement: Completed-cache eviction permits re-evaluation
+
+Insertion SHALL evict least-recently-used entries to meet both limits. A duplicate after eviction MAY start another evaluation. Eviction SHALL NOT cancel active work or invalidate outcomes already held by admitted rows. Documentation SHALL distinguish cache bounds from a strict process-memory ceiling and SHALL NOT promise once-only evaluation throughout an invocation.
 
 #### Scenario: Entry count triggers eviction
 
@@ -319,16 +354,15 @@ Identical requests admitted while one logical evaluation is in flight SHALL join
 - **THEN** least-recently-used entries are evicted until the byte limit is satisfied
 - **AND** key bytes are included rather than accounting for responses alone
 
-#### Scenario: Cache hit changes recency
-
-- **WHEN** A and B are cached in that order, A is reused, and C requires eviction with a two-entry limit
-- **THEN** B is evicted and A remains reusable
-
 #### Scenario: Duplicate after eviction
 
 - **WHEN** a successful request's entry has been evicted and an identical request appears with no equivalent operation in flight
 - **THEN** a new logical evaluation is dispatched normally
 - **AND** earlier rows keep their already-associated successful outcomes
+
+### Requirement: Oversized cache entries bypass insertion
+
+A successful entry exceeding the byte limit alone SHALL reach current rows without being cached or evicting existing entries for that insertion.
 
 #### Scenario: Oversized success bypasses caching
 
@@ -347,7 +381,7 @@ In-flight state and completed results SHALL belong exclusively to one table invo
 
 ### Requirement: Always-present `jev_meta` and optional `jev_metrics` on annotations
 
-Every successfully evaluated live `jev annotate` row SHALL preserve its complete source record and add answers plus fixed `jev_meta: {base_url, model, usage}`. `base_url` SHALL be the selected validated service root; `model` and `usage` SHALL come from the validated API response. `--metrics` SHALL additionally add fixed `jev_metrics: {request_id, request_bytes, response_bytes, elapsed, attempt_elapsed, attempts, http_version}`. The old `--meta` flag SHALL be rejected. `request_id` is a local identity for the logical evaluation, not a server idempotency key or billing receipt. Neither `base_url`, `model`, nor `usage` SHALL be repeated in `jev_metrics`. Rows sharing an in-flight or cached evaluation SHALL reuse provenance, measurements, and request identity; retries SHALL retain that identity, while re-evaluation after eviction SHALL receive a new one. Documentation SHALL instruct users to enable `--metrics` and aggregate usage and body sizes once per distinct `request_id` when accounting for shared evaluations. `--metrics` SHALL fail before input consumption when combined with `--dry-run` or, when available, `--estimate-tokens`.
+Every successful live annotation SHALL preserve the source record and add answers plus fixed `jev_meta: {base_url, model, usage}`. `base_url` SHALL be the selected validated root; `model` and `usage` SHALL come from the API response. The old `--meta` flag SHALL be rejected.
 
 #### Scenario: Default metadata without metrics
 
@@ -359,6 +393,10 @@ Every successfully evaluated live `jev annotate` row SHALL preserve its complete
 
 - **WHEN** a row is successfully annotated with a custom answer `--into ai`
 - **THEN** its selected root, returned model, and usage remain under `jev_meta` beside `ai`
+
+### Requirement: Optional fixed annotation measurements
+
+With `--metrics`, successful rows SHALL add fixed `jev_metrics: {request_id, request_bytes, response_bytes, elapsed, attempt_elapsed, attempts, http_version}` without repeating `base_url`, `model`, or `usage`. The flag SHALL fail before input consumption with `--dry-run` or available `--estimate-tokens`.
 
 #### Scenario: Default metrics destination
 
@@ -376,6 +414,20 @@ Every successfully evaluated live `jev annotate` row SHALL preserve its complete
 - **WHEN** a row already has `jev_metrics` and `--metrics` enables that destination
 - **THEN** the stream terminates immediately with a field-collision error without overwriting source data or sending that row
 
+#### Scenario: Failed row has no success metrics
+
+- **WHEN** an ordinary row failure is handled under `--on-error keep` or `record`
+- **THEN** that row receives neither new answers nor fabricated `jev_meta` or `jev_metrics` fields
+
+#### Scenario: Metrics reject offline modes
+
+- **WHEN** `--metrics` is combined with `--dry-run` or an available `--estimate-tokens` switch
+- **THEN** invocation fails before consuming input rows or sending HTTP
+
+### Requirement: Shared evaluation identity and accounting
+
+`request_id` SHALL identify one local logical evaluation, not a server idempotency key or billing receipt. In-flight/cache sharing SHALL reuse provenance, measurements, and ID; retries SHALL retain it, re-evaluation after eviction SHALL get a new ID. Documentation SHALL tell users to enable `--metrics` and count usage and body sizes once per distinct ID for shared evaluations.
+
 #### Scenario: Duplicate rows share one evaluation's metrics
 
 - **WHEN** two rows join one in-flight evaluation or reuse its completed cache entry with `--metrics`
@@ -389,19 +441,9 @@ Every successfully evaluated live `jev annotate` row SHALL preserve its complete
 - **THEN** its `jev_metrics.request_id` differs from the evicted evaluation's identity
 - **AND** usage and body sizes from both logical evaluations remain countable
 
-#### Scenario: Failed row has no success metrics
-
-- **WHEN** an ordinary row failure is handled under `--on-error keep` or `record`
-- **THEN** that row receives neither new answers nor fabricated `jev_meta` or `jev_metrics` fields
-
-#### Scenario: Metrics reject offline modes
-
-- **WHEN** `--metrics` is combined with `--dry-run` or an available `--estimate-tokens` switch
-- **THEN** invocation fails before consuming input rows or sending HTTP
-
 ### Requirement: Streaming request previews
 
-`--dry-run` on `jev annotate` SHALL emit one `{request: <exact request body>, request_bytes: <integer>}` record per valid input row in input order without collecting the whole table, requiring credentials, making HTTP calls, or collapsing duplicates. `request_bytes` SHALL equal the compact UTF-8 JSON serialization length of the nested body, excluding the preview wrapper and HTTP transport overhead. Previewed state SHALL respect cell paths, explicit field projection, and context. The wrapper SHALL not pretend that an API response or live `jev_meta` or `jev_metrics` exists. `--metrics` SHALL be rejected before input consumption in preview mode. Ordinary row validation failures SHALL follow `fail`, `keep`, or `record`; destination collisions SHALL remain terminal before a request preview is emitted for the conflicting row. Documentation SHALL explain that keep/record previews can therefore contain unchanged or error-bearing source rows for non-collision failures among preview wrappers. The output contract SHALL not depend on the `token-estimation` Cargo feature.
+`jev annotate --dry-run` SHALL stream one `{request: <exact body>, request_bytes: <integer>}` per valid row in input order, without collecting the table or collapsing duplicates. Bytes SHALL equal compact UTF-8 JSON body length, excluding wrapper and transport overhead. State SHALL respect cell paths, field projection, and context. Downstream truncation SHALL leave read-ahead bounded.
 
 #### Scenario: Duplicate rows in preview
 
@@ -421,6 +463,16 @@ Every successfully evaluated live `jev annotate` row SHALL preserve its complete
 - **AND** each `request_bytes` equals that request's captured JSON body byte length
 - **AND** excluded source fields never appear in either body
 
+#### Scenario: Downstream truncates preview
+
+- **WHEN** a long input is processed with `jev annotate --dry-run | first 10`
+- **THEN** only a bounded prefix is consumed and wrapped
+- **AND** no API request is sent
+
+### Requirement: Preview safety and row-error policy
+
+Dry-run previews SHALL need no credentials or HTTP and SHALL contain no fabricated API response, `jev_meta`, or `jev_metrics`. `--metrics` SHALL fail before input consumption. Ordinary row failures SHALL follow `fail`, `keep`, or `record`; collisions SHALL terminate before a conflicting preview. Documentation SHALL explain mixed preview wrappers and unchanged/error-bearing rows under keep/record. Behavior SHALL not depend on the `token-estimation` feature.
+
 #### Scenario: Failed row keeps its existing preview policy
 
 - **WHEN** one row lacks a projected field and `--on-error record` is selected
@@ -436,9 +488,3 @@ Every successfully evaluated live `jev annotate` row SHALL preserve its complete
 
 - **WHEN** a valid row is processed with `jev annotate --dry-run`
 - **THEN** its preview wrapper contains `request` and `request_bytes`, but no `jev_meta` or `jev_metrics`
-
-#### Scenario: Downstream truncates preview
-
-- **WHEN** a long input is processed with `jev annotate --dry-run | first 10`
-- **THEN** only a bounded prefix is consumed and wrapped
-- **AND** no API request is sent

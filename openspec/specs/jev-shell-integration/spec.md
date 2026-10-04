@@ -8,7 +8,7 @@ Expose Jev decisions through a standard Nushell plugin with consistent naming, d
 
 ### Requirement: Consistent plugin identity and discovery
 
-The project SHALL use `nu_plugin_jev` as its repository, Cargo crate, and binary name, and SHALL expose `jev` as its Nushell namespace. Registration SHALL support `plugin add <binary-path>` followed by `plugin use jev`. The complete registered command inventory SHALL be `jev`, `jev ask`, `jev annotate`, `jev models`, `jev question noul`, `jev question choice`, and `jev question score`. Scalar projection and filtering SHALL remain ordinary Nu operations; this change SHALL NOT register `jev noul`, `jev choice`, `jev score`, or `jev where`.
+The repository, crate, and binary SHALL be named `nu_plugin_jev`, with Nu namespace `jev`. Registration SHALL support `plugin add <binary-path>` then `plugin use jev`. Registered commands SHALL be exactly `jev`, `jev ask`, `jev annotate`, `jev models`, `jev question noul`, `jev question choice`, and `jev question score`. Scalar projection and filtering SHALL use Nu; `jev noul`, `jev choice`, `jev score`, and `jev where` SHALL NOT be registered.
 
 #### Scenario: Register and inspect the plugin
 
@@ -29,7 +29,7 @@ The project SHALL use `nu_plugin_jev` as its repository, Cargo crate, and binary
 
 ### Requirement: Truthful Nushell command input and output types
 
-The registered Nu signatures SHALL declare `jev` as `nothing -> string`, `jev ask` as `any -> record`, `jev annotate` as `any -> list<any>`, `jev models` as `nothing -> record`, and each `jev question` constructor as `nothing -> record`. The broad `any` types SHALL preserve runtime validation of accepted Jev states and table rows; they SHALL NOT imply every value can be submitted to the service. The annotation output declaration SHALL allow unchanged non-record values under `--on-error keep`. The offline root command SHALL reject nonempty pipeline input instead of silently ignoring it.
+Nu signatures SHALL declare `jev`: `nothing -> string`; `jev ask`: `any -> record`; `jev annotate`: `any -> list<any>`; `jev models` and each question constructor: `nothing -> record`. `any` SHALL allow runtime validation, not imply every state or row is valid. Annotation's output type SHALL allow unchanged non-record rows under `--on-error keep`. Bare `jev` SHALL reject nonempty pipeline input rather than ignore it.
 
 #### Scenario: Command type discovery
 
@@ -83,7 +83,7 @@ The Cargo package SHALL enable its optional `mimalloc` feature by default and us
 
 ### Requirement: Per-setting configuration precedence
 
-Applicable settings SHALL resolve independently from command flags, `$env.config.plugins.jev`, caller environment variables, selected local TOML, user TOML, and defaults, in that order. This SHALL preserve the pre-existing order of flags, Nu plugin config, and environment above the new file-backed layers. Every TOML field, including `api_key` and each nested cache limit, SHALL be optional; empty TOML files SHALL be valid, and omitted fields SHALL inherit independently from lower-priority sources. The selected value SHALL be validated, and an invalid selected value SHALL cause an error rather than fall through. Configuration SHALL be resolved for each invocation and remain consistent for its rows.
+Each applicable setting SHALL resolve independently in this order: command flag, `$env.config.plugins.jev`, caller environment, selected local TOML, user TOML, default. Flags, Nu config, and environment SHALL retain their precedence above file-backed layers. Resolution SHALL occur per invocation and stay fixed for its rows.
 
 #### Scenario: Flag overrides config and environment
 
@@ -96,6 +96,10 @@ Applicable settings SHALL resolve independently from command flags, `$env.config
 - **THEN** the flag value is used
 - **AND** omitting the flag selects Nu plugin config, then caller environment, then local TOML, then user TOML in that order as each higher source is omitted
 - **AND** an unrelated setting may still come from either TOML file independently
+
+### Requirement: Partial configuration and selected-value validation
+
+Every TOML field, including `api_key` and nested cache limits, SHALL be optional. Empty files SHALL be valid, and omitted fields SHALL inherit independently from lower-priority sources. A selected value SHALL be validated; an invalid value SHALL fail rather than fall through to another source.
 
 #### Scenario: Partial files compose independently
 
@@ -110,12 +114,16 @@ Applicable settings SHALL resolve independently from command flags, `$env.config
 
 ### Requirement: Plugin-scoped configuration names
 
-Plugin-owned environment settings SHALL use the `NU_PLUGIN_JEV_` prefix, including model, base URL, timeout, jobs, retries, proxy, explicit config-file selection, and process-level tracing. The implicit local file SHALL be `.nu_plugin_jev.toml`, and the per-user file SHALL be `nu_plugin_jev/config.toml` below the platform's configuration root. `$env.config.plugins.jev` SHALL retain the Nu command-namespace spelling. `TYPESAFE_API_KEY` SHALL remain the caller-scoped service credential. The replaced `TYPESAFE_MODEL`, `TYPESAFE_BASE_URL`, `TYPESAFE_TIMEOUT_MS`, `TYPESAFE_JOBS`, `TYPESAFE_RETRIES`, `JEV_PROXY`, `JEV_CONFIG`, and `JEV_LOG` variables SHALL NOT be read as aliases. The old `.jev.toml` and `jev/config.toml` files SHALL NOT be discovered implicitly, though `--config` MAY explicitly select a file of either name. Documentation SHALL provide the old-to-new mapping and explain that existing local settings must be renamed or moved.
+Plugin-owned environment settings SHALL use `NU_PLUGIN_JEV_` for model, base URL, timeout, jobs, retries, proxy, config-file selection, and process tracing. `$env.config.plugins.jev` SHALL keep the Nu namespace; `TYPESAFE_API_KEY` SHALL remain the caller credential. Old `TYPESAFE_MODEL`, `TYPESAFE_BASE_URL`, `TYPESAFE_TIMEOUT_MS`, `TYPESAFE_JOBS`, `TYPESAFE_RETRIES`, `JEV_PROXY`, `JEV_CONFIG`, and `JEV_LOG` SHALL NOT be aliases.
 
 #### Scenario: Old environment settings do not override plugin defaults
 
 - **WHEN** only `TYPESAFE_MODEL` supplies a model and a valid dry run has no model flag, Nu plugin-config value, new environment variable, or TOML value
 - **THEN** the request body uses the default `jev-latest` model
+
+### Requirement: Plugin-scoped TOML file names
+
+The implicit local file SHALL be `.nu_plugin_jev.toml`; the per-user file SHALL be `nu_plugin_jev/config.toml` under the platform configuration root. Old `.jev.toml` and `jev/config.toml` SHALL NOT be found implicitly, but `--config` MAY select either. Documentation SHALL map old names to new ones and explain that existing local settings must be renamed or moved.
 
 #### Scenario: Old local file is not discovered
 
@@ -125,7 +133,7 @@ Plugin-owned environment settings SHALL use the `NU_PLUGIN_JEV_` prefix, includi
 
 ### Requirement: Documented settings and defaults
 
-The request and scheduling settings SHALL be model (`NU_PLUGIN_JEV_MODEL`, default `jev-latest`), base URL (`NU_PLUGIN_JEV_BASE_URL`, default `https://api.typesafe.ai`), timeout (`NU_PLUGIN_JEV_TIMEOUT_MS`, default `30sec`), table jobs (`NU_PLUGIN_JEV_JOBS`, default `16`), retries (`NU_PLUGIN_JEV_RETRIES`, default `3`), and proxy policy (`NU_PLUGIN_JEV_PROXY`, default `auto`). Nu plugin-config keys SHALL be `model`, `base_url`, `timeout`, `jobs`, `retries`, and `proxy`. TOML keys SHALL be `model`, `base_url`, `timeout_ms`, `jobs`, `retries`, and `proxy`. Model, base URL, timeout, and table jobs SHALL have their corresponding command flags on applicable commands. Retries and proxy policy SHALL be configurable through Nu config, environment, and TOML without per-setting command flags. Timeout SHALL be a positive Nu duration in flags/Nu config or a positive integer millisecond count in environment/TOML; jobs SHALL be a positive integer and retries a nonnegative integer. The proxy policy SHALL be `auto`, `direct`, or an explicit `http://` or `socks5h://` URL.
+Settings SHALL have these environment/default pairs: `NU_PLUGIN_JEV_MODEL`/`jev-latest`, `NU_PLUGIN_JEV_BASE_URL`/`https://api.typesafe.ai`, `NU_PLUGIN_JEV_TIMEOUT_MS`/`30sec`, `NU_PLUGIN_JEV_JOBS`/`16`, `NU_PLUGIN_JEV_RETRIES`/`3`, and `NU_PLUGIN_JEV_PROXY`/`auto`. Jobs apply to tables. Documentation SHALL state these defaults.
 
 #### Scenario: Defaults without optional configuration
 
@@ -134,14 +142,27 @@ The request and scheduling settings SHALL be model (`NU_PLUGIN_JEV_MODEL`, defau
 - **AND** a table invocation selects 16 jobs
 - **AND** the proxy policy is `auto`
 
+### Requirement: Setting names and command flags
+
+Nu config SHALL use `model`, `base_url`, `timeout`, `jobs`, `retries`, and `proxy`; TOML SHALL use the same keys except `timeout_ms` for timeout. Applicable commands SHALL expose flags for model, base URL, timeout, and table jobs. Retries and proxy SHALL be configurable through Nu config, environment, and TOML without per-setting flags.
+
 #### Scenario: Environment fallback
 
 - **WHEN** plugin config and flags omit timeout and `NU_PLUGIN_JEV_TIMEOUT_MS` is `5000`
 - **THEN** the evaluation deadline is five seconds
 
+### Requirement: Validate configured setting types
+
+Timeout SHALL be a positive Nu duration in flags/Nu config or positive integer milliseconds in environment/TOML. Jobs SHALL be a positive integer; retries SHALL be nonnegative. Proxy policy SHALL be `auto`, `direct`, or an explicit `http://` or `socks5h://` URL.
+
+#### Scenario: Invalid timeout setting
+
+- **WHEN** a selected timeout from environment or TOML is zero or not an integer millisecond count
+- **THEN** the invocation rejects it before HTTP dispatch rather than using another source
+
 ### Requirement: Configurable completed-cache limits
 
-Table invocations SHALL resolve completed-cache limits independently from `$env.config.plugins.jev.cache.max_entries` and `cache.max_approx_bytes`, then `[cache]` values in local and user TOML, with defaults of `1024` entries and `16777216` approximate bytes (16 MiB). Both selected values SHALL be positive integers, and the byte limit SHALL be expressed in bytes. Cache limits SHALL have no command flags or environment-variable overrides. Invalid selected limits SHALL fail before input consumption or HTTP dispatch. These limits SHALL NOT reduce or disable mandatory in-flight deduplication.
+Table completed-cache limits SHALL resolve independently from `$env.config.plugins.jev.cache.max_entries` and `cache.max_approx_bytes`, then local and user TOML `[cache]`, defaulting to `1024` entries and `16777216` approximate bytes (16 MiB). Limits SHALL be positive integers, with bytes expressed as bytes; no command flag or environment override SHALL apply. Invalid limits SHALL fail before input or HTTP and SHALL NOT disable mandatory in-flight deduplication.
 
 #### Scenario: Independent cache defaults
 
@@ -155,7 +176,7 @@ Table invocations SHALL resolve completed-cache limits independently from `$env.
 
 ### Requirement: Invocation-scoped TOML discovery and file selection
 
-`jev ask` and `jev annotate` SHALL optionally read `nu_plugin_jev/config.toml` from the platform's per-user configuration directory and one local TOML file. On Unix, caller-scoped absolute `XDG_CONFIG_HOME` SHALL select the user configuration root; otherwise the platform default SHALL apply. The implicit local file SHALL be `.nu_plugin_jev.toml` in the calling Nu invocation's current directory, with no parent-directory search. `--config <path>` SHALL select a different local file; caller-scoped `NU_PLUGIN_JEV_CONFIG` SHALL do so when the flag is absent. Relative selected paths SHALL resolve against `EngineInterface::get_current_dir()` for that invocation, not the plugin executable's process working directory. Missing implicit files SHALL be ignored; a missing or unreadable explicitly selected file SHALL fail before input rows are read or HTTP begins. A selected explicit path identical to the user path SHALL be loaded only once. Present files SHALL be parsed with a bounded size, and malformed TOML or unknown keys SHALL fail safely; lower-priority recognized values SHALL receive semantic validation only when selected. Files SHALL be read once per invocation on a non-Tokio-worker thread and SHALL NOT be cached as a process-global configuration snapshot. The plugin SHALL NOT change its process working directory. Root usage and offline question constructors SHALL not require or load TOML files.
+`jev ask` and `jev annotate` SHALL optionally read user `nu_plugin_jev/config.toml` and one local TOML file. On Unix, caller-scoped absolute `XDG_CONFIG_HOME` SHALL select the user configuration root; otherwise the platform default applies. Implicit local `.nu_plugin_jev.toml` SHALL come only from the calling Nu invocation's current directory, without parent search. Missing implicit files SHALL be ignored.
 
 #### Scenario: Automatically discovered local defaults
 
@@ -163,11 +184,19 @@ Table invocations SHALL resolve completed-cache limits independently from `$env.
 - **THEN** that file supplies settings absent from higher-priority sources
 - **AND** no file from a parent directory is loaded
 
+### Requirement: Explicit local TOML selection
+
+`--config <path>` SHALL select the local file; absent that flag, caller-scoped `NU_PLUGIN_JEV_CONFIG` SHALL select it. Relative paths SHALL resolve against that invocation's `EngineInterface::get_current_dir()`, not plugin process cwd. Missing or unreadable explicit files SHALL fail before rows or HTTP. An explicit path identical to the user file SHALL load only once. The plugin SHALL NOT change its process cwd.
+
 #### Scenario: Explicit local-file selection
 
 - **WHEN** `--config` and `NU_PLUGIN_JEV_CONFIG` name different files
 - **THEN** the flag-selected file is used as the sole local TOML layer
 - **AND** a missing flag-selected file is an error rather than a fallback to `.nu_plugin_jev.toml`
+
+### Requirement: Safe invocation-scoped TOML reading
+
+Present TOML SHALL be size-bounded and read once per invocation on a non-Tokio-worker thread, never kept as a process-global snapshot. Malformed TOML and unknown keys SHALL fail safely. Recognized lower-priority values SHALL receive semantic validation only if selected. Settings SHALL stay fixed for the invocation while later invocations may see file edits.
 
 #### Scenario: Reused process serves different directories
 
@@ -181,6 +210,15 @@ Table invocations SHALL resolve completed-cache limits independently from `$env.
 - **THEN** the next invocation sees the updated setting without restarting the plugin
 - **AND** the earlier invocation's snapshot remains unchanged
 
+### Requirement: Offline usage does not require TOML
+
+Root usage and offline question constructors SHALL neither require nor load TOML. Dry runs SHALL use selected TOML defaults when present but SHALL NOT require a key or connect to the service.
+
+#### Scenario: Root and constructors ignore TOML
+
+- **WHEN** the user invokes bare `jev` or a question constructor with malformed local TOML
+- **THEN** the offline command remains available without loading that file
+
 #### Scenario: Offline preview with TOML defaults
 
 - **WHEN** a valid TOML file supplies model and an optional key, and the caller runs `jev ask --dry-run`
@@ -189,7 +227,7 @@ Table invocations SHALL resolve completed-cache limits independently from `$env.
 
 ### Requirement: Automatically discovered local transport boundary
 
-An implicitly discovered `.nu_plugin_jev.toml` SHALL reject `base_url` and `proxy` fields, including when a higher-priority source also supplies either field. This prevents a project file from silently redirecting a key selected from the caller environment or user file, or changing proxy routing. A local file selected explicitly by `--config` or `NU_PLUGIN_JEV_CONFIG` MAY set these fields; the existing base-URL and proxy validation SHALL still apply. The error SHALL identify the forbidden field without printing its value.
+Implicit `.nu_plugin_jev.toml` SHALL reject `base_url` and `proxy`, even if a higher-priority source supplies them, so project files cannot redirect caller/user credentials or proxy routing. Files explicitly selected by `--config` or `NU_PLUGIN_JEV_CONFIG` MAY set those fields, subject to normal validation. Errors SHALL name the forbidden field without printing its value.
 
 #### Scenario: Untrusted project endpoint
 
@@ -204,7 +242,7 @@ An implicitly discovered `.nu_plugin_jev.toml` SHALL reject `base_url` and `prox
 
 ### Requirement: Caller-scoped environment credentials
 
-Live HTTP commands SHALL select `TYPESAFE_API_KEY` from the calling Nu environment, then `api_key` from selected local TOML, then `api_key` from user TOML on each invocation. A present but empty or invalid higher-priority credential SHALL fail before HTTP rather than falling back. Missing credentials SHALL cause a call-level error before HTTP dispatch. The plugin SHALL NOT accept credentials through command flags or ordinary Nu plugin config. Question constructors, root usage, and dry runs SHALL work without a key.
+On each invocation, live commands SHALL select caller Nu `TYPESAFE_API_KEY`, then local TOML `api_key`, then user TOML `api_key`. An empty or invalid selected key SHALL fail before HTTP, without fallback; a missing key SHALL cause a call-level error. Credentials SHALL NOT come from flags or ordinary Nu plugin config. Constructors, root usage, and dry runs SHALL work without a key.
 
 #### Scenario: Key changes in a reused plugin process
 
@@ -235,8 +273,7 @@ Live HTTP commands SHALL select `TYPESAFE_API_KEY` from the calling Nu environme
 
 ### Requirement: Caller-scoped Jev proxy selection
 
-Live invocations SHALL resolve `$env.config.plugins.jev.proxy` before caller-scoped `NU_PLUGIN_JEV_PROXY`, then permitted local TOML, then user TOML, defaulting to `auto` when all are absent. The selected Jev proxy policy SHALL be validated before input consumption or HTTP dispatch and remain fixed for that invocation. An invalid selected value SHALL NOT fall back to an ordinary system proxy or another Jev setting. Changes to the Jev-specific policy between invocations SHALL work in a reused plugin process. Ordinary process proxy environment and OS proxy settings SHALL be captured by the automatic client at plugin startup; changing them SHALL require restarting that process.
-User-facing documentation SHALL distinguish this process-start automatic proxy policy from per-invocation Jev-specific selection and SHALL explain that an explicit Jev proxy is not bypassed by global `NO_PROXY`.
+Live proxy policy SHALL resolve from `$env.config.plugins.jev.proxy`, caller `NU_PLUGIN_JEV_PROXY`, permitted local TOML, user TOML, then `auto`. It SHALL be validated before input or HTTP and fixed per invocation. Invalid selected policy SHALL fail without falling back to a system proxy or another Jev setting. Jev-specific policy changes SHALL work across invocations in a reused plugin process.
 
 #### Scenario: Plugin config overrides Jev proxy environment
 
@@ -252,6 +289,10 @@ User-facing documentation SHALL distinguish this process-start automatic proxy p
 
 - **WHEN** the selected `proxy` value is not `auto`, `direct`, or a valid supported proxy URL
 - **THEN** the invocation fails before consuming input rows or opening an HTTP connection
+
+### Requirement: Automatic proxy settings are process-scoped
+
+The automatic client SHALL capture ordinary process environment and OS proxy settings at startup; changes SHALL require a plugin restart. Documentation SHALL distinguish these from per-invocation Jev policy and explain that global `NO_PROXY` does not bypass an explicit Jev proxy.
 
 #### Scenario: Ordinary proxy setting changes
 
@@ -269,9 +310,17 @@ The repository SHALL include `skills/jev-nushell/SKILL.md` for agents composing 
 
 ### Requirement: Opt-in newline-delimited NUON diagnostics
 
-`NU_PLUGIN_JEV_LOG_FORMAT` SHALL select `text` or `nuon` at plugin process startup, defaulting to the current text format. An invalid explicit format SHALL cause a startup error without writing diagnostic data to the plugin protocol. In `nuon` mode, each diagnostic event actually written to stderr SHALL occupy exactly one physical line containing one compact NUON record. Each record SHALL have `timestamp` (UTC RFC3339 string), `level` (string), `target` (string), `message` (string), `fields` (record), and `spans` (root-to-leaf list of records containing `name` and `fields`). The formatter SHALL preserve supported primitive event and span fields as typed values, render unsupported debug-only values as strings, and escape embedded newlines so one event never occupies multiple physical lines. The plugin SHALL NOT represent a span's creation or closure as an event unless instrumentation explicitly emits one.
+`NU_PLUGIN_JEV_LOG_FORMAT` SHALL select `text` or `nuon` at plugin startup, defaulting to text. An invalid explicit value SHALL fail startup without writing diagnostics into the plugin protocol.
 
-The `nuon-tracing-format` Cargo feature SHALL compile the NUON formatter and SHALL be included in the crate's default features. Without that feature, text diagnostics and target filtering SHALL remain available, while an explicit `NU_PLUGIN_JEV_LOG_FORMAT=nuon` SHALL fail startup with a value-redacted feature-unavailable error.
+#### Scenario: Default presentation and invalid format
+
+- **WHEN** `NU_PLUGIN_JEV_LOG_FORMAT` is unset
+- **THEN** diagnostics retain their existing human-readable stderr presentation
+- **AND** an invalid explicit format is rejected before serving plugin commands rather than silently selecting another format
+
+### Requirement: One typed NUON record per diagnostic event
+
+In `nuon` mode, each stderr event SHALL be one physical line of compact NUON with UTC RFC3339 `timestamp`, string `level`, `target`, `message`, record `fields`, and root-to-leaf record list `spans` (`name`, `fields`). Primitive event/span fields SHALL retain types; unsupported debug-only fields SHALL become strings. Newlines SHALL be escaped. Span creation/closure SHALL NOT become events unless instrumentation emits them.
 
 #### Scenario: Parse mixed-source diagnostics in Nu
 
@@ -285,11 +334,9 @@ The `nuon-tracing-format` Cargo feature SHALL compile the NUON formatter and SHA
 - **THEN** the NUON record retains `duration_ms` as a number and the request identity in `spans`
 - **AND** a message containing a newline remains one parseable physical line
 
-#### Scenario: Default presentation and invalid format
+### Requirement: NUON formatter is feature-gated
 
-- **WHEN** `NU_PLUGIN_JEV_LOG_FORMAT` is unset
-- **THEN** diagnostics retain their existing human-readable stderr presentation
-- **AND** an invalid explicit format is rejected before serving plugin commands rather than silently selecting another format
+The `nuon-tracing-format` Cargo feature SHALL compile the NUON formatter and be enabled by default. Without it, text diagnostics and target filtering SHALL remain available; explicit `NU_PLUGIN_JEV_LOG_FORMAT=nuon` SHALL fail startup with a value-redacted feature-unavailable error.
 
 #### Scenario: Build without NUON diagnostics
 
@@ -299,18 +346,25 @@ The `nuon-tracing-format` Cargo feature SHALL compile the NUON formatter and SHA
 
 ### Requirement: Process-level evaluation diagnostics
 
-The plugin SHALL initialize non-blocking diagnostics before entering its Tokio runtime and write them to stderr, not to Nu pipeline values or the stdout plugin protocol. `NU_PLUGIN_JEV_LOG` SHALL configure one process-wide target/level filter at plugin startup. When absent, it SHALL enable `nu_plugin_jev=warn` and no dependency targets. The existing bare values `off`, `error`, `warn`, `info`, `debug`, and `trace` SHALL retain their plugin-only meaning. An advanced value of one or more comma-separated `target=level` directives SHALL accept explicit plugin or dependency targets, keep `nu_plugin_jev=warn` unless the plugin base target is explicitly overridden, and leave all unlisted dependency targets disabled. More-specific target directives SHALL override matching broader directives. An invalid explicit filter SHALL cause a startup error rather than silently dropping directives; neither `RUST_LOG` nor legacy `JEV_LOG` SHALL act as a fallback. Rust `log` records and `tracing` events that reach the plugin process SHALL obey the same filter and selected formatter; enabling a target SHALL NOT imply that a dependency emits any particular event or enable additional connection-verbose behavior. Changing the filter or format in an already running plugin SHALL require a process restart. At plugin `info`, logical evaluation starts, completions, and failures SHALL be observable with the local `request_id` and elapsed time when the operation ends. Completion events SHALL include the returned model and usage; failure events SHALL include error kind and HTTP status when available. At plugin `debug`, diagnostics SHALL additionally identify HTTP attempts, retry delays, and table-result reuse without revealing request bodies.
-
-#### Scenario: Correlated request diagnostics
-
-- **WHEN** an evaluation retries before succeeding with `NU_PLUGIN_JEV_LOG=debug`
-- **THEN** its attempts and completion diagnostics appear on stderr under the same local `request_id`
-- **AND** the Nu response remains ordinary command data without diagnostic records
+The plugin SHALL initialize non-blocking diagnostics before entering Tokio and write to stderr, never Nu pipeline values or stdout protocol. `NU_PLUGIN_JEV_LOG` SHALL select a process-wide target/level filter at startup; filter or format changes SHALL require restart. Neither `RUST_LOG` nor legacy `JEV_LOG` SHALL be a fallback.
 
 #### Scenario: Change tracing level in a Nu session
 
 - **WHEN** the caller changes `NU_PLUGIN_JEV_LOG` and restarts the plugin process
 - **THEN** subsequent evaluations use the newly selected diagnostic level
+
+### Requirement: Plugin-only diagnostic filter shorthand
+
+Absent `NU_PLUGIN_JEV_LOG`, the filter SHALL enable `nu_plugin_jev=warn` and no dependency targets. Bare `off`, `error`, `warn`, `info`, `debug`, and `trace` SHALL keep their plugin-only meaning.
+
+#### Scenario: Existing shorthand remains scoped
+
+- **WHEN** `NU_PLUGIN_JEV_LOG=debug` is selected
+- **THEN** plugin-owned debug diagnostics appear without enabling `reqwest` or other dependency diagnostics
+
+### Requirement: Explicit dependency diagnostic targets
+
+Comma-separated `target=level` directives SHALL allow explicit plugin/dependency targets, retain `nu_plugin_jev=warn` unless overridden, disable unlisted dependencies, and let more-specific targets override broader ones. Invalid explicit filters SHALL fail startup. Rust `log` and `tracing` records SHALL share the filter and formatter; enabling a target SHALL NOT guarantee dependency events or connection-verbose behavior.
 
 #### Scenario: Explicit dependency target
 
@@ -318,20 +372,25 @@ The plugin SHALL initialize non-blocking diagnostics before entering its Tokio r
 - **THEN** that record uses the same configured stderr format as plugin-owned events
 - **AND** unrelated dependency targets remain disabled
 
-#### Scenario: Existing shorthand remains scoped
-
-- **WHEN** `NU_PLUGIN_JEV_LOG=debug` is selected
-- **THEN** plugin-owned debug diagnostics appear without enabling `reqwest` or other dependency diagnostics
-
 #### Scenario: Invalid filter fails visibly
 
 - **WHEN** `NU_PLUGIN_JEV_LOG` contains a malformed target directive or level
 - **THEN** plugin initialization fails with a diagnostic that does not reproduce credentials or request content
 - **AND** no plugin command or HTTP request is executed
 
+### Requirement: Correlated evaluation diagnostic content
+
+At plugin `info`, evaluation starts, completions, and failures SHALL carry local `request_id` and elapsed time on completion/failure. Success SHALL include returned model and usage; failure SHALL include error kind and HTTP status when available. At `debug`, diagnostics SHALL also identify attempts, retry delays, and table-result reuse without request bodies.
+
+#### Scenario: Correlated request diagnostics
+
+- **WHEN** an evaluation retries before succeeding with `NU_PLUGIN_JEV_LOG=debug`
+- **THEN** its attempts and completion diagnostics appear on stderr under the same local `request_id`
+- **AND** the Nu response remains ordinary command data without diagnostic records
+
 ### Requirement: Credentials are not exposed
 
-The plugin SHALL NOT include API keys, authorization headers, proxy credentials, or configured proxy URLs in returned values, request previews, error records, help, or plugin-authored diagnostic events. TOML syntax/permission errors SHALL NOT quote source lines or raw parser snippets that might contain secrets. Default diagnostics SHALL NOT include state or question bodies. Dependency targets SHALL be disabled by default. Because explicitly enabled third-party events are authored outside the plugin's redaction boundary, user-facing documentation SHALL warn that they may contain sensitive URLs, headers, or payload details and SHALL NOT promise automatic redaction of those events. Diagnostics SHALL NOT write into the plugin's stdout protocol stream.
+Returned values, previews, errors, help, and plugin-authored diagnostics SHALL NOT expose API keys, authorization headers, proxy credentials, or configured proxy URLs. TOML syntax/permission errors SHALL NOT quote source lines or raw parser snippets. Default diagnostics SHALL omit state and question bodies. Diagnostics SHALL NOT enter the stdout plugin protocol.
 
 #### Scenario: Failed authenticated request
 
@@ -350,6 +409,10 @@ The plugin SHALL NOT include API keys, authorization headers, proxy credentials,
 - **THEN** the error identifies the file and location without quoting that line or the key
 - **AND** no request is dispatched
 
+### Requirement: Explicit third-party diagnostic privacy boundary
+
+Dependency targets SHALL be disabled by default. Because explicitly enabled third-party events are outside the plugin's redaction boundary, documentation SHALL warn that they may contain sensitive URLs, headers, or payloads and SHALL NOT promise automatic redaction.
+
 #### Scenario: Third-party logging is explicit
 
 - **WHEN** `NU_PLUGIN_JEV_LOG` does not name a third-party target
@@ -358,7 +421,7 @@ The plugin SHALL NOT include API keys, authorization headers, proxy credentials,
 
 ### Requirement: Correlated successful HTTP measurements in diagnostics
 
-For each successful live System One evaluation or model-list lookup, the plugin SHALL add `request_bytes`, `response_bytes`, `elapsed_ns`, `attempt_elapsed_ns`, and `attempts` as integer fields and `http_version` and `base_url` as string fields to its plugin-owned `evaluation completed` or `model listing completed` tracing event at `info`. The HTTP fields SHALL come from the same successful measurement used for optional `--metrics` output; `base_url` SHALL come from the same selected, validated service root returned in `meta.base_url` on `ask`/`models` or `jev_meta.base_url` on `annotate`, whether or not `--metrics` is present. It SHALL not be the appended endpoint or proxy URL. `elapsed_ns` and `attempt_elapsed_ns` SHALL represent the same intervals as optional `metrics.elapsed`/`metrics.attempt_elapsed` on `ask`/`models`, or `jev_metrics.elapsed`/`jev_metrics.attempt_elapsed` on `annotate`, expressed in nanoseconds; the existing `duration_ms` SHALL remain a separate, broader operation-duration field. Each event SHALL preserve its local `request_id` correlation; evaluation completion retains model and usage, while model listing retains its model count and SHALL NOT fabricate token usage. Apart from the explicitly requested service root, events SHALL contain no state, questions, request/response body, credentials, full request URL, or proxy details. Joining an in-flight evaluation or serving a completed cache entry SHALL NOT create another successful evaluation completion event. Failed, cancelled, dry-run, and offline token-estimation operations SHALL NOT produce fabricated successful measurement fields.
+At `info`, each successful evaluation or model lookup SHALL emit one plugin-owned `evaluation completed` or `model listing completed` event. It SHALL carry integer `request_bytes`, `response_bytes`, `elapsed_ns`, `attempt_elapsed_ns`, `attempts`, and string `http_version`, `base_url`. HTTP fields SHALL match optional `--metrics`; `base_url` SHALL be the selected validated root also returned in `meta.base_url` (`ask`, `models`) or `jev_meta.base_url` (`annotate`), even without the flag.
 
 #### Scenario: Unflagged success is measured in tracing
 
@@ -366,11 +429,26 @@ For each successful live System One evaluation or model-list lookup, the plugin 
 - **THEN** its completion diagnostic includes `base_url`, `request_bytes`, `response_bytes`, `elapsed_ns`, `attempt_elapsed_ns`, `attempts`, and `http_version` under the same local `request_id`
 - **AND** the unflagged Nu result includes the same selected root at `meta.base_url`, along with the returned model and usage
 
+#### Scenario: Model-list lookup has the same tracing contract
+
+- **WHEN** `jev models` succeeds with or without `--metrics` and plugin `info` tracing enabled
+- **THEN** one `model listing completed` event includes the selected `base_url`, zero `request_bytes`, response bytes, both durations, explicit GET attempt count, and final HTTP version
+- **AND** the event's `base_url` equals `meta.base_url`, and with `--metrics` its HTTP fields agree with the returned `metrics`
+- **AND** the event preserves its model count without inventing `usage` tokens
+
+### Requirement: Trace measurements match returned measurements
+
+`elapsed_ns` and `attempt_elapsed_ns` SHALL match optional Nu `metrics`/`jev_metrics` durations in nanoseconds; `duration_ms` SHALL remain a separate broader operation duration. Events SHALL retain local `request_id`; evaluation completions SHALL retain model and usage, while model listings SHALL retain model count without token usage. `base_url` SHALL be neither an appended endpoint nor proxy URL. Events SHALL omit state, questions, bodies, credentials, full request URLs, and proxy details.
+
 #### Scenario: Tracing and returned metrics agree
 
 - **WHEN** `jev ask` succeeds with `--metrics`
 - **THEN** the completion event's `base_url` equals returned `meta.base_url`, while its byte counts, attempt count, and HTTP version equal the returned `metrics` fields
 - **AND** both nanosecond fields equal their respective returned Nu durations, while `duration_ms` retains its existing separate meaning
+
+### Requirement: Trace one completion per actual HTTP evaluation
+
+Joining an in-flight evaluation or serving a completed cache entry SHALL NOT emit another successful evaluation completion event. Failed, cancelled, dry-run, and offline token-estimation operations SHALL NOT fabricate successful measurement fields.
 
 #### Scenario: Retry and deduplication do not multiply completions
 
@@ -379,13 +457,6 @@ For each successful live System One evaluation or model-list lookup, the plugin 
 - **AND** `attempt_elapsed_ns` excludes the earlier attempt and wait while including final response validation
 - **AND** no additional completion event is produced for rows that reuse its result
 - **AND** with `--metrics`, every reused row's `jev_metrics.request_id` equals that completion event's local `request_id`
-
-#### Scenario: Model-list lookup has the same tracing contract
-
-- **WHEN** `jev models` succeeds with or without `--metrics` and plugin `info` tracing enabled
-- **THEN** one `model listing completed` event includes the selected `base_url`, zero `request_bytes`, response bytes, both durations, explicit GET attempt count, and final HTTP version
-- **AND** the event's `base_url` equals `meta.base_url`, and with `--metrics` its HTTP fields agree with the returned `metrics`
-- **AND** the event preserves its model count without inventing `usage` tokens
 
 #### Scenario: No fabricated successful measurements
 
