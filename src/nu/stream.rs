@@ -115,6 +115,15 @@ struct PendingGroup {
     rows: Vec<InputRow>,
 }
 
+/// Owns invocation-local row routing, duplicate groups, and ordered outcomes.
+struct SupervisorState {
+    cache: CompletedCache,
+    pending_groups: VecDeque<PendingGroup>,
+    in_flight: HashMap<RequestKey, Vec<InputRow>>,
+    ordered: BTreeMap<u64, RowOutcome>,
+    next_sequence: u64,
+}
+
 /// Identifies one completed logical HTTP evaluation and its shared local identity.
 type Completion = (
     RequestKey,
@@ -201,7 +210,13 @@ fn produce(
             }
         });
         let Some(permit) = permit else { break };
+        if cancel.is_cancelled() {
+            break;
+        }
         let Some(source) = input.next() else { break };
+        if cancel.is_cancelled() {
+            break;
+        }
         let request = build(&source).and_then(|wire| {
             let prepared = PreparedRequest::new(wire)?;
             let key = RequestKey::from_body(Arc::clone(&service_root), prepared.body.clone());
@@ -213,7 +228,19 @@ fn produce(
             request: Some(request),
             permit,
         };
-        if sender.blocking_send(row).is_err() {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let sent = runtime.block_on(async {
+            let cancelled = cancel.cancelled().fuse();
+            let send = sender.send(row).fuse();
+            futures::pin_mut!(cancelled, send);
+            futures::select_biased! {
+                _ = cancelled => false,
+                result = send => result.is_ok(),
+            }
+        });
+        if !sent {
             break;
         }
         sequence = sequence.wrapping_add(1);
@@ -236,19 +263,21 @@ async fn supervise(
         fail_fast,
     } = setup;
     let jobs = config.jobs.expect("table settings include jobs").get();
-    let mut cache = CompletedCache::new(config.cache.expect("table settings include cache limits"));
+    let mut state = SupervisorState {
+        cache: CompletedCache::new(config.cache.expect("table settings include cache limits")),
+        pending_groups: VecDeque::new(),
+        in_flight: HashMap::new(),
+        ordered: BTreeMap::new(),
+        next_sequence: 0,
+    };
     let config = Arc::new(config);
     let key = Arc::new(key);
-    let mut pending_groups: VecDeque<PendingGroup> = VecDeque::new();
-    let mut in_flight: HashMap<RequestKey, Vec<InputRow>> = HashMap::new();
     let mut active: FuturesUnordered<BoxFuture<'static, Completion>> = FuturesUnordered::new();
-    let mut ordered: BTreeMap<u64, RowOutcome> = BTreeMap::new();
-    let mut next_sequence = 0_u64;
     let mut input_closed = false;
 
     loop {
         while active.len() < jobs {
-            let Some(group) = pending_groups.pop_front() else {
+            let Some(group) = state.pending_groups.pop_front() else {
                 break;
             };
             let PendingGroup {
@@ -257,7 +286,7 @@ async fn supervise(
                 rows,
             } = group;
             let request_id = next_request_id();
-            in_flight.insert(request_key.clone(), rows);
+            state.in_flight.insert(request_key.clone(), rows);
             let client = client.clone();
             let config = Arc::clone(&config);
             let key = Arc::clone(&key);
@@ -281,7 +310,7 @@ async fn supervise(
                 .boxed(),
             );
         }
-        if input_closed && pending_groups.is_empty() && active.is_empty() {
+        if input_closed && state.pending_groups.is_empty() && active.is_empty() {
             break;
         }
         let event = {
@@ -324,101 +353,23 @@ async fn supervise(
                 break;
             }
             Event::Row(None) => input_closed = true,
-            Event::Row(Some(mut row)) => {
-                let (request, request_key) =
-                    match row.request.take().expect("producer prepares every row") {
-                        Ok(request) => request,
-                        Err(error) => {
-                            if !emit(
-                                row.finish(Err(Arc::new(error))),
-                                &output,
-                                &mut ordered,
-                                &mut next_sequence,
-                                unordered,
-                                fail_fast,
-                                &mut signal,
-                            )
-                            .await
-                            {
-                                break;
-                            }
-                            continue;
-                        }
-                    };
-                if let Some(cached) = cache.get(&request_key) {
-                    tracing::debug!(
-                        request_id = %cached.request_id,
-                        row_sequence = row.sequence,
-                        "completed Jev result cache hit"
-                    );
-                    if !emit(
-                        row.finish(Ok(cached)),
-                        &output,
-                        &mut ordered,
-                        &mut next_sequence,
-                        unordered,
-                        fail_fast,
-                        &mut signal,
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                } else if let Some(waiters) = in_flight.get_mut(&request_key) {
-                    tracing::debug!(
-                        row_sequence = row.sequence,
-                        "joined in-flight Jev evaluation"
-                    );
-                    waiters.push(row);
-                } else if let Some(group) = pending_groups
-                    .iter_mut()
-                    .find(|group| group.key == request_key)
-                {
-                    tracing::debug!(row_sequence = row.sequence, "joined queued Jev evaluation");
-                    group.rows.push(row);
-                } else {
-                    pending_groups.push_back(PendingGroup {
-                        key: request_key,
-                        request,
-                        rows: vec![row],
-                    });
+            Event::Row(Some(row)) => {
+                if !route_row(row, &mut state, &output, &mut signal, unordered, fail_fast).await {
+                    break;
                 }
             }
-            Event::Completed(Some((request_key, request_id, result))) => {
-                let waiters = in_flight
-                    .remove(&request_key)
-                    .expect("active request has waiters");
-                tracing::debug!(
-                    request_id = %request_id,
-                    shared_rows = waiters.len(),
-                    "Jev evaluation outcome ready"
-                );
-                let shared = match result {
-                    Ok(response) => {
-                        let result = Arc::new(SharedResponse::new(response, request_id));
-                        cache.insert(request_key, Arc::clone(&result));
-                        Ok(result)
-                    }
-                    Err(error) => Err(Arc::new(error)),
-                };
-                let mut keep_running = true;
-                for row in waiters {
-                    if !emit(
-                        row.finish(shared.clone()),
-                        &output,
-                        &mut ordered,
-                        &mut next_sequence,
-                        unordered,
-                        fail_fast,
-                        &mut signal,
-                    )
-                    .await
-                    {
-                        keep_running = false;
-                        break;
-                    }
-                }
-                if !keep_running {
+            Event::Completed(Some(completion)) => {
+                if !finish_request(
+                    completion,
+                    &mut input,
+                    &output,
+                    &mut state,
+                    &mut signal,
+                    unordered,
+                    fail_fast,
+                )
+                .await
+                {
                     break;
                 }
             }
@@ -426,6 +377,123 @@ async fn supervise(
         }
     }
     cancel.cancel();
+}
+
+/// Routes already-admitted rows before retiring one completed single-flight group.
+async fn finish_request(
+    (request_key, request_id, result): Completion,
+    input: &mut mpsc::Receiver<InputRow>,
+    output: &mpsc::Sender<RowOutcome>,
+    state: &mut SupervisorState,
+    signal: &mut CancelSignal,
+    unordered: bool,
+    fail_fast: bool,
+) -> bool {
+    let queued = input.len();
+    for _ in 0..queued {
+        let Ok(row) = input.try_recv() else { break };
+        if !route_row(row, state, output, signal, unordered, fail_fast).await {
+            return false;
+        }
+    }
+    let waiters = state
+        .in_flight
+        .remove(&request_key)
+        .expect("active request has waiters");
+    tracing::debug!(
+        request_id = %request_id,
+        shared_rows = waiters.len(),
+        "Jev evaluation outcome ready"
+    );
+    let shared = match result {
+        Ok(response) => {
+            let result = Arc::new(SharedResponse::new(response, request_id));
+            state.cache.insert(request_key, Arc::clone(&result));
+            Ok(result)
+        }
+        Err(error) => Err(Arc::new(error)),
+    };
+    for row in waiters {
+        if !emit(
+            row.finish(shared.clone()),
+            output,
+            &mut state.ordered,
+            &mut state.next_sequence,
+            unordered,
+            fail_fast,
+            signal,
+        )
+        .await
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Routes one accepted input row to cached, active, queued, or new work.
+async fn route_row(
+    mut row: InputRow,
+    state: &mut SupervisorState,
+    output: &mpsc::Sender<RowOutcome>,
+    signal: &mut CancelSignal,
+    unordered: bool,
+    fail_fast: bool,
+) -> bool {
+    let (request, request_key) = match row.request.take().expect("producer prepares every row") {
+        Ok(request) => request,
+        Err(error) => {
+            return emit(
+                row.finish(Err(Arc::new(error))),
+                output,
+                &mut state.ordered,
+                &mut state.next_sequence,
+                unordered,
+                fail_fast,
+                signal,
+            )
+            .await;
+        }
+    };
+    if let Some(cached) = state.cache.get(&request_key) {
+        tracing::debug!(
+            request_id = %cached.request_id,
+            row_sequence = row.sequence,
+            "completed Jev result cache hit"
+        );
+        emit(
+            row.finish(Ok(cached)),
+            output,
+            &mut state.ordered,
+            &mut state.next_sequence,
+            unordered,
+            fail_fast,
+            signal,
+        )
+        .await
+    } else if let Some(waiters) = state.in_flight.get_mut(&request_key) {
+        tracing::debug!(
+            row_sequence = row.sequence,
+            "joined in-flight Jev evaluation"
+        );
+        waiters.push(row);
+        true
+    } else if let Some(group) = state
+        .pending_groups
+        .iter_mut()
+        .find(|group| group.key == request_key)
+    {
+        tracing::debug!(row_sequence = row.sequence, "joined queued Jev evaluation");
+        group.rows.push(row);
+        true
+    } else {
+        state.pending_groups.push_back(PendingGroup {
+            key: request_key,
+            request,
+            rows: vec![row],
+        });
+        true
+    }
 }
 
 /// Describes which bounded source of work became ready in the supervisor.
@@ -505,7 +573,7 @@ mod tests {
         nu::value::to_json,
     };
 
-    use super::{InputRow, StreamSetup, emit, start};
+    use super::{InputRow, StreamSetup, emit, finish_request, start, supervise};
 
     /// Builds a stable successful response for scheduler tests.
     fn answer(input_tokens: u64) -> serde_json::Value {
@@ -590,6 +658,83 @@ mod tests {
             output.receiver.is_closed(),
             "supervisor did not close a full output after cancellation"
         );
+    }
+
+    /// An external iterator may stall, but its returned row is discarded after cancellation.
+    #[test]
+    fn blocked_upstream_does_not_dispatch_after_interrupt_or_drop() {
+        /// Holds one upstream call until the test releases it.
+        struct GatedInput {
+            gate: Arc<std::sync::atomic::AtomicBool>,
+            entered: Arc<std::sync::atomic::AtomicBool>,
+            exited: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl Iterator for GatedInput {
+            type Item = Value;
+
+            /// Simulates a third-party `next()` that cannot observe plugin cancellation.
+            fn next(&mut self) -> Option<Self::Item> {
+                self.entered.store(true, Ordering::SeqCst);
+                while !self.gate.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Some(Value::test_string("late"))
+            }
+        }
+
+        impl Drop for GatedInput {
+            /// Signals that the dedicated producer has stopped using the iterator.
+            fn drop(&mut self) {
+                self.exited.store(true, Ordering::SeqCst);
+            }
+        }
+
+        for drop_output in [false, true] {
+            let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let built = Arc::new(AtomicUsize::new(0));
+            let built_for_request = Arc::clone(&built);
+            let (cancel, signal) = CancelHandle::new();
+            let output = start(
+                runtime(),
+                setup("http://127.0.0.1:9", 1),
+                Box::new(GatedInput {
+                    gate: Arc::clone(&gate),
+                    entered: Arc::clone(&entered),
+                    exited: Arc::clone(&exited),
+                }),
+                Box::new(move |value| {
+                    built_for_request.fetch_add(1, Ordering::SeqCst);
+                    build(value)
+                }),
+                None,
+                (cancel.clone(), signal),
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(entered.load(Ordering::SeqCst));
+            if drop_output {
+                drop(output);
+            } else {
+                cancel.cancel();
+                while !output.receiver.is_closed() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert!(output.receiver.is_closed());
+                drop(output);
+            }
+            gate.store(true, Ordering::SeqCst);
+            while !exited.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(exited.load(Ordering::SeqCst));
+            assert_eq!(built.load(Ordering::SeqCst), 0);
+        }
     }
 
     /// Builds a fixed Noul request from the input row's JSON state.
@@ -777,7 +922,7 @@ mod tests {
     }
 
     /// Delays one local response long enough for duplicate admission or failure bypass.
-    fn serve_delayed_one() -> (String, thread::JoinHandle<()>) {
+    fn serve_delayed_one(response: serde_json::Value) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let root = format!("http://{}", listener.local_addr().unwrap());
@@ -820,7 +965,7 @@ mod tests {
                 return;
             }
             thread::sleep(Duration::from_millis(120));
-            let response = answer(1).to_string();
+            let response = response.to_string();
             let _ = write!(
                 stream,
                 concat!(
@@ -832,6 +977,120 @@ mod tests {
             );
         });
         (root, handle)
+    }
+
+    /// Gates the first real HTTP response and counts every accepted request.
+    struct GatedServer {
+        root: String,
+        started: Option<tokio::sync::oneshot::Receiver<()>>,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        stop: std::sync::mpsc::Sender<()>,
+        worker: thread::JoinHandle<usize>,
+    }
+
+    impl GatedServer {
+        /// Starts a loopback server that holds its first response until explicitly released.
+        fn new(response: serde_json::Value) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let root = format!("http://{}", listener.local_addr().unwrap());
+            let response = response.to_string();
+            let (started_tx, started) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let (stop, stop_rx) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                let mut started_tx = Some(started_tx);
+                let mut requests = 0;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline && stop_rx.try_recv().is_err() {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => panic!("gated server accept failed: {error}"),
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let mut length = 0;
+                    loop {
+                        line.clear();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    requests += 1;
+                    if let Some(started_tx) = started_tx.take() {
+                        let _ = started_tx.send(());
+                        release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    }
+                    write!(
+                        stream,
+                        concat!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                            "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
+                        ),
+                        response.len(),
+                        response = response
+                    )
+                    .unwrap();
+                }
+                requests
+            });
+            Self {
+                root,
+                started: Some(started),
+                release: Some(release),
+                stop,
+                worker,
+            }
+        }
+
+        /// Waits until the first HTTP request body has reached the server.
+        async fn wait_started(&mut self) {
+            self.started.take().unwrap().await.unwrap();
+        }
+
+        /// Allows the held first response to reach the client.
+        fn release(&mut self) {
+            self.release.take().unwrap().send(()).unwrap();
+        }
+
+        /// Stops the fixture and returns the number of accepted HTTP requests.
+        fn finish(self) -> usize {
+            self.stop.send(()).unwrap();
+            self.worker.join().unwrap()
+        }
+    }
+
+    /// Prepares one manually admitted row for the real HTTP supervisor test.
+    async fn prepared_input_row(
+        sequence: u64,
+        root: Arc<str>,
+        admission: Arc<tokio::sync::Semaphore>,
+    ) -> InputRow {
+        let source = Value::test_string("same");
+        let prepared = crate::api::client::PreparedRequest::new(build(&source).unwrap()).unwrap();
+        let key = crate::nu::cache::RequestKey::from_body(root, prepared.body.clone());
+        InputRow {
+            sequence,
+            source,
+            request: Some(Ok((prepared, key))),
+            permit: admission.acquire_owned().await.unwrap(),
+        }
     }
 
     /// Returns one retryable status before a valid response for the same logical request.
@@ -1050,7 +1309,7 @@ mod tests {
     /// Mandatory in-flight sharing works even when the completed cache cannot retain a result.
     #[test]
     fn concurrent_duplicates_share_when_cache_is_ineligible() {
-        let (base_url, server) = serve_delayed_one();
+        let (base_url, server) = serve_delayed_one(answer(1));
         let mut setup = setup(&base_url, 2);
         setup.config.cache.as_mut().unwrap().max_approx_bytes =
             std::num::NonZeroUsize::new(1).unwrap();
@@ -1070,6 +1329,190 @@ mod tests {
             rows[0].result.as_ref().unwrap().request_id,
             rows[1].result.as_ref().unwrap().request_id
         );
+        server.join().unwrap();
+    }
+
+    /// Joins a channel-admitted duplicate before retiring a success or error group.
+    #[test]
+    fn completion_routes_queued_duplicates_before_retirement() {
+        for success in [true, false] {
+            runtime().block_on(async {
+                let source = Value::test_string("same");
+                let prepared =
+                    crate::api::client::PreparedRequest::new(build(&source).unwrap()).unwrap();
+                let key = crate::nu::cache::RequestKey::from_body(
+                    Arc::from("http://example.test/"),
+                    prepared.body.clone(),
+                );
+                let admission = Arc::new(tokio::sync::Semaphore::new(2));
+                let first = InputRow {
+                    sequence: 0,
+                    source: source.clone(),
+                    request: None,
+                    permit: Arc::clone(&admission).acquire_owned().await.unwrap(),
+                };
+                let second = InputRow {
+                    sequence: 1,
+                    source,
+                    request: Some(Ok((prepared, key.clone()))),
+                    permit: admission.acquire_owned().await.unwrap(),
+                };
+                let (input_sender, mut input) = tokio::sync::mpsc::channel(2);
+                input_sender.send(second).await.unwrap();
+                let (output, mut outcomes) = tokio::sync::mpsc::channel(2);
+                let config = setup("http://example.test", 2).config;
+                let mut limits = config.cache.unwrap();
+                limits.max_approx_bytes = std::num::NonZeroUsize::new(1).unwrap();
+                let mut state = super::SupervisorState {
+                    cache: crate::nu::cache::CompletedCache::new(limits),
+                    pending_groups: std::collections::VecDeque::new(),
+                    in_flight: std::collections::HashMap::from([(key.clone(), vec![first])]),
+                    ordered: std::collections::BTreeMap::new(),
+                    next_sequence: 0,
+                };
+                let result = if success {
+                    Ok(crate::api::client::MeasuredSuccess {
+                        response: serde_json::from_value(answer(1)).unwrap(),
+                        base_url: "http://example.test/".into(),
+                        measurement: crate::api::client::HttpMeasurement {
+                            request_bytes: 1,
+                            response_bytes: 1,
+                            elapsed: Duration::ZERO,
+                            attempt_elapsed: Duration::ZERO,
+                            attempts: 1,
+                            http_version: reqwest::Version::HTTP_11,
+                        },
+                    })
+                } else {
+                    Err(crate::error::JevError::Response("test failure"))
+                };
+                let (_cancel, mut signal) = CancelHandle::new();
+                assert!(
+                    finish_request(
+                        (key, "jev-shared".into(), result),
+                        &mut input,
+                        &output,
+                        &mut state,
+                        &mut signal,
+                        false,
+                        false,
+                    )
+                    .await
+                );
+                assert!(input.is_empty());
+                assert!(state.pending_groups.is_empty());
+                assert!(state.in_flight.is_empty());
+                let first = outcomes.recv().await.unwrap();
+                let second = outcomes.recv().await.unwrap();
+                assert_eq!((first.sequence, second.sequence), (0, 1));
+                match (first.result, second.result) {
+                    (Ok(first), Ok(second)) => {
+                        assert!(success);
+                        assert!(Arc::ptr_eq(&first, &second));
+                        assert_eq!(first.request_id, "jev-shared");
+                    }
+                    (Err(first), Err(second)) => {
+                        assert!(!success);
+                        assert!(Arc::ptr_eq(&first, &second));
+                    }
+                    _ => panic!("duplicate outcomes diverged"),
+                }
+            });
+        }
+    }
+
+    /// Shares one gated HTTP operation with a duplicate admitted before its response is released.
+    #[test]
+    fn gated_http_completion_shares_admitted_success_and_error() {
+        for success in [true, false] {
+            let response = if success {
+                answer(1)
+            } else {
+                json!({"bad": true})
+            };
+            let mut server = GatedServer::new(response);
+            let mut setup = setup(&server.root, 2);
+            setup.fail_fast = false;
+            setup.config.cache.as_mut().unwrap().max_approx_bytes =
+                std::num::NonZeroUsize::new(1).unwrap();
+            let root: Arc<str> = Arc::from(setup.config.base_url.as_str());
+            let (first, second) = runtime().block_on(async {
+                let admission = Arc::new(tokio::sync::Semaphore::new(2));
+                let (input_sender, input_receiver) = tokio::sync::mpsc::channel(2);
+                let (output_sender, mut output_receiver) = tokio::sync::mpsc::channel(2);
+                let (cancel, signal) = CancelHandle::new();
+                let supervisor = tokio::spawn(supervise(
+                    setup,
+                    input_receiver,
+                    output_sender,
+                    signal,
+                    cancel,
+                ));
+                input_sender
+                    .send(prepared_input_row(0, Arc::clone(&root), Arc::clone(&admission)).await)
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), server.wait_started())
+                    .await
+                    .unwrap();
+                input_sender
+                    .send(prepared_input_row(1, root, admission).await)
+                    .await
+                    .unwrap();
+                drop(input_sender);
+                server.release();
+                let first = tokio::time::timeout(Duration::from_secs(2), output_receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let second = tokio::time::timeout(Duration::from_secs(2), output_receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), supervisor)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                (first, second)
+            });
+            assert_eq!((first.sequence, second.sequence), (0, 1));
+            match (first.result, second.result) {
+                (Ok(first), Ok(second)) => {
+                    assert!(success);
+                    assert!(Arc::ptr_eq(&first, &second));
+                    assert_eq!(first.request_id, second.request_id);
+                }
+                (Err(first), Err(second)) => {
+                    assert!(!success);
+                    assert!(Arc::ptr_eq(&first, &second));
+                }
+                _ => panic!("gated duplicate outcomes diverged"),
+            }
+            assert_eq!(server.finish(), 1);
+        }
+    }
+
+    /// Shares one failed HTTP result with duplicates admitted before completion.
+    #[test]
+    fn concurrent_duplicates_share_an_uncached_error() {
+        let (base_url, server) = serve_delayed_one(json!({"bad": true}));
+        let mut setup = setup(&base_url, 2);
+        setup.fail_fast = false;
+        let rows: Vec<_> = start(
+            runtime(),
+            setup,
+            Box::new(vec![Value::test_string("same"), Value::test_string("same")].into_iter()),
+            Box::new(build),
+            None,
+            CancelHandle::new(),
+        )
+        .unwrap()
+        .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(Arc::ptr_eq(
+            rows[0].result.as_ref().unwrap_err(),
+            rows[1].result.as_ref().unwrap_err()
+        ));
         server.join().unwrap();
     }
 
@@ -1101,7 +1544,7 @@ mod tests {
     /// A terminal row failure bypasses a slow earlier slot in ordered mode.
     #[test]
     fn fail_fast_bypasses_stalled_ordered_row() {
-        let (base_url, server) = serve_delayed_one();
+        let (base_url, server) = serve_delayed_one(answer(1));
         let build = Box::new(|value: &Value| {
             if value.as_int().unwrap() == 1 {
                 Err(crate::error::JevError::State("bad row"))
@@ -1129,7 +1572,7 @@ mod tests {
     /// A destination collision bypasses ordering even when ordinary errors are kept.
     #[test]
     fn field_collision_bypasses_stalled_row_under_keep_policy() {
-        let (base_url, server) = serve_delayed_one();
+        let (base_url, server) = serve_delayed_one(answer(1));
         let build = Box::new(|value: &Value| {
             if value.as_int().unwrap() == 1 {
                 Err(crate::error::JevError::FieldCollision(

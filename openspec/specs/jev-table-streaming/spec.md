@@ -229,7 +229,12 @@ Results SHALL preserve input order by default, including failed rows returned by
 
 ### Requirement: Interrupts cancel the invocation
 
-An engine interrupt SHALL stop further input admission, cancel pending local HTTP/retry work, release retained invocation state, and close the output stream promptly. Interrupt handling SHALL remain active after the command returns its stream and SHALL NOT be treated as an ordinary row error by `keep` or `record`.
+An engine interrupt SHALL promptly stop plugin-controlled input admission,
+HTTP/retry work, and output. The plugin SHALL submit no row after an already
+entered upstream `next()` returns. An external iterator blocked inside `next()`
+cannot be forcibly released by the plugin. Interrupt handling SHALL remain
+active after the command returns its stream and SHALL NOT become a `keep` or
+`record` row error.
 
 #### Scenario: Interrupt after stream creation
 
@@ -242,9 +247,20 @@ An engine interrupt SHALL stop further input admission, cancel pending local HTT
 - **THEN** the invocation stops without waiting for the receiver to consume another row
 - **AND** pending local evaluations are cancelled
 
+#### Scenario: Upstream call is already blocked
+
+- **WHEN** interruption occurs while an external iterator is blocked inside `next()`
+- **THEN** local HTTP and output work stop promptly without waiting for that call
+- **AND** the producer sends no new row or request when `next()` eventually returns
+
 ### Requirement: Downstream truncation stops background work
 
-When downstream stops consuming and drops the output stream, the invocation SHALL stop admitting input and cancel outstanding local work promptly. Detection SHALL NOT depend on the next completed request or a subsequent failed output send. Cancellation SHALL unblock producers/consumers under plugin control. The plugin SHALL NOT promise that requests already accepted by the remote service were undone.
+When downstream drops the output stream, the invocation SHALL promptly stop
+plugin-controlled admission and outstanding local work. Detection SHALL NOT
+depend on another HTTP completion or failed send. Cancellation SHALL unblock
+plugin-controlled producers and consumers; it cannot forcibly end an external
+iterator already blocked in `next()`. Remote requests already accepted SHALL
+not be claimed as undone.
 
 #### Scenario: First ten results from a long input
 
@@ -256,6 +272,12 @@ When downstream stops consuming and drops the output stream, the invocation SHAL
 
 - **WHEN** downstream drops the output while all pending HTTP requests are waiting
 - **THEN** cancellation occurs without needing an HTTP response to trigger another channel send
+
+#### Scenario: Downstream closes during an upstream call
+
+- **WHEN** downstream drops output while an external iterator remains in `next()`
+- **THEN** plugin-controlled work stops promptly
+- **AND** the producer exits without dispatching the returned row once that call finishes
 
 ### Requirement: Terminal failure policy
 
@@ -310,7 +332,12 @@ Deduplication keys SHALL include canonical full request body and service root: f
 
 ### Requirement: Mandatory in-flight single-flight deduplication
 
-Identical requests admitted during one in-flight evaluation SHALL join it, including its retries, rather than dispatch again. Single-flight SHALL apply regardless of completed-cache capacity or eligibility. Each original row SHALL retain its own outcome within bounded admission. A completed failure SHALL reach current waiters and be removed, never cached as a completed result.
+For deduplication, a request SHALL count as admitted when its prepared row
+enters the bounded scheduler input; reserving read-ahead credit alone does not
+identify a request. Identical requests admitted before completion handling
+SHALL join one evaluation and its retries regardless of cache eligibility.
+Each row SHALL retain its bounded outcome. A completed failure SHALL reach
+current waiters and SHALL NOT be cached.
 
 #### Scenario: Concurrent duplicate during retries
 
@@ -328,6 +355,11 @@ Identical requests admitted during one in-flight evaluation SHALL join it, inclu
 
 - **WHEN** a shared evaluation fails in keep mode and its state appears later after that evaluation completes
 - **THEN** the later row can initiate a fresh evaluation rather than receiving a permanently cached failure
+
+#### Scenario: Queued duplicate at completion boundary
+
+- **WHEN** a duplicate is already accepted into scheduler input as its first evaluation finishes, and the success is too large to cache or the evaluation fails
+- **THEN** it receives the first evaluation's outcome without a second HTTP request
 
 ### Requirement: Bounded LRU of successful outcomes
 

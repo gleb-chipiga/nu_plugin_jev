@@ -13,6 +13,7 @@ use std::{
 use nu_plugin::{EngineInterface, EvaluatedCall};
 use nu_protocol::{LabeledError, Record, Span, Value};
 use reqwest::Url;
+use tokio::sync::Semaphore;
 
 /// Identifies which settings apply to the current command family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -428,7 +429,7 @@ pub(crate) fn resolve(
             Some((source, value)) => parse_positive_usize(value, "jobs", source)?,
             None => NonZeroUsize::new(16).expect("nonzero default jobs"),
         };
-        if jobs.get() > usize::MAX / 2 {
+        if jobs.get() > Semaphore::MAX_PERMITS / 2 {
             return Err(config_error(
                 "jobs is too large for a bounded admission window",
             ));
@@ -1098,6 +1099,28 @@ mod tests {
             .env
             .insert("NU_PLUGIN_JEV_RETRIES", Value::test_string("0"));
         assert_eq!(resolve(&sources, ConfigScope::Single).unwrap().retries, 0);
+    }
+
+    /// Rejects a selected jobs count before it can exceed the scheduler semaphore limit.
+    #[test]
+    fn jobs_fit_the_bounded_admission_semaphore() {
+        let largest = tokio::sync::Semaphore::MAX_PERMITS / 2;
+        let mut sources = ConfigSources::default();
+        sources
+            .flags
+            .insert("jobs", Value::test_int(i64::try_from(largest).unwrap()));
+        assert_eq!(
+            resolve(&sources, ConfigScope::Table)
+                .unwrap()
+                .jobs
+                .unwrap()
+                .get(),
+            largest
+        );
+        sources
+            .flags
+            .insert("jobs", Value::test_int(i64::try_from(largest + 1).unwrap()));
+        assert!(resolve(&sources, ConfigScope::Table).is_err());
     }
 
     /// Rejects invalid model settings and unsupported service roots.

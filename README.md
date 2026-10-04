@@ -146,7 +146,10 @@ upstream Nu error text is not copied into a row diagnostic.
 The default error mode is `fail`. Successful duplicates can share an
 in-progress request or a bounded, per-invocation cache. Eviction permits a
 later request for the same state. Output and input are bounded, and stopping
-downstream consumption cancels outstanding local work. With `--metrics`, shared
+downstream consumption cancels outstanding local work. If a third-party input
+iterator is already blocked in `next()`, the plugin cannot force that call to
+return; it discards the row when the call eventually finishes. HTTP waits and
+output stop without waiting for the iterator. With `--metrics`, shared
 annotation rows reuse one `jev_metrics.request_id`; count their usage and body
 bytes once per distinct ID. Metrics contain `request_bytes`, `response_bytes`,
 `elapsed`, `attempt_elapsed`, `attempts`, and `http_version`; both times are Nu
@@ -237,11 +240,11 @@ library does not emit.
 Use the always-present `meta` or `jev_meta` for model and usage data. Add
 `--metrics` for HTTP measurements and annotation request identity.
 
-One logical evaluation has a total timeout, including retry waits. HTTP
-`429`, `502`, `503`, `504`, and `529` may be retried; `Retry-After` guidance
-is honored when valid. Other client errors and invalid responses are not
-retried. Retries can repeat remote work, so `request_id` is not an idempotency
-or billing guarantee.
+One logical evaluation has a total timeout covering retry waits, response
+decoding, and answer validation. HTTP `429`, `502`, `503`, `504`, and `529` may
+be retried; valid `Retry-After` guidance is honored. Other client errors and
+invalid responses are not retried. Retries can repeat remote work, so
+`request_id` guarantees neither idempotency nor billing.
 
 Successful API response bodies are limited to 16 MiB per request. Larger bodies
 fail with a nonretryable response error before JSON decoding, including when

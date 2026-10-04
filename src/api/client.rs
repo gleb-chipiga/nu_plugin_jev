@@ -1,9 +1,10 @@
 //! Implements authenticated, bounded-deadline HTTP calls with status-only retries.
 
 use std::{
+    future::Future,
     io::{self, Write},
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,7 +16,7 @@ use reqwest::{
     header::{CONTENT_TYPE, HeaderMap, RETRY_AFTER},
 };
 use serde::de::DeserializeOwned;
-use tokio::time::Instant;
+use tokio::{sync::Semaphore, task::JoinHandle, time::Instant};
 
 use crate::{
     config::{ApiKey, InvocationConfig, ProxyPolicy, TransportConfig, TransportSettings},
@@ -31,10 +32,53 @@ use super::{
 /// Caps one successful JSON response before decoding or retaining it.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Bounds response CPU work retained across every HTTP client in this process.
+static RESPONSE_CPU_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Returns the process-wide capacity for large response decoding and validation.
+fn response_cpu_limiter() -> Arc<Semaphore> {
+    Arc::clone(RESPONSE_CPU_LIMITER.get_or_init(|| {
+        let parallelism = std::thread::available_parallelism().map_or(4, NonZeroUsize::get);
+        Arc::new(Semaphore::new(parallelism.clamp(1, 8)))
+    }))
+}
+
 /// Reuses one HTTP connection pool for every request using the same policy.
 #[derive(Clone)]
 pub(crate) struct JevClient {
     http: Arc<Client>,
+    response_cpu: Arc<Semaphore>,
+    #[cfg(test)]
+    response_cpu_stage: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+}
+
+/// Aborts a queued blocking task when its awaiting evaluation is dropped.
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    /// Prevents queued work from starting after cancellation or deadline expiry.
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Runs large response CPU work under a process-wide permit held by the closure.
+async fn response_cpu<T: Send + 'static>(
+    limiter: Arc<Semaphore>,
+    failure: &'static str,
+    work: impl FnOnce() -> Result<T, JevError> + Send + 'static,
+) -> Result<T, JevError> {
+    let permit = limiter
+        .acquire_owned()
+        .await
+        .map_err(|_| JevError::Response(failure))?;
+    let mut task = AbortOnDrop(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    }));
+    (&mut task.0)
+        .await
+        .map_err(|_| JevError::Response(failure))?
 }
 
 /// Retains the startup automatic client and a bounded set of alternate pools.
@@ -59,14 +103,23 @@ impl JevClientPool {
         if *policy == ProxyPolicy::Auto {
             return Ok(self.auto.clone());
         }
+        {
+            let mut alternate = self
+                .alternate
+                .lock()
+                .map_err(|_| JevError::Transport("Jev HTTP client pool is unavailable"))?;
+            if let Some(client) = alternate.get(policy) {
+                return Ok(client.clone());
+            }
+        }
+        let client = JevClient::for_policy(policy)?;
         let mut alternate = self
             .alternate
             .lock()
             .map_err(|_| JevError::Transport("Jev HTTP client pool is unavailable"))?;
-        if let Some(client) = alternate.get(policy) {
-            return Ok(client.clone());
+        if let Some(existing) = alternate.get(policy) {
+            return Ok(existing.clone());
         }
-        let client = JevClient::for_policy(policy)?;
         alternate.put(policy.clone(), client.clone());
         Ok(client)
     }
@@ -236,7 +289,18 @@ impl JevClient {
             .map_err(|_| JevError::Transport("cannot initialize Jev HTTP client"))?;
         Ok(Self {
             http: Arc::new(http),
+            response_cpu: response_cpu_limiter(),
+            #[cfg(test)]
+            response_cpu_stage: None,
         })
+    }
+
+    /// Notifies a test when a decoded response reaches offloaded CPU work.
+    #[cfg(test)]
+    fn mark_response_cpu_stage(&self) {
+        if let Some(observer) = &self.response_cpu_stage {
+            let _ = observer.send(());
+        }
     }
 
     /// Evaluates one complete request and validates every returned typed answer.
@@ -305,21 +369,32 @@ impl JevClient {
         key: &ApiKey,
         cancel: CancelSignal,
     ) -> Result<MeasuredSuccess<SystemOneResponse>, JevError> {
-        let pending: PendingSuccess<SystemOneResponse> =
-            self.send_system_one(body, config, key, cancel).await?;
-        let invalid = || JevError::Response("Jev answer does not match the submitted questions");
-        let pending = if pending.response_bytes > 64 * 1024 || request.questions.len() > 64 {
-            tokio::task::spawn_blocking(move || {
+        let deadline = Instant::now() + config.timeout;
+        let task = async {
+            let pending: PendingSuccess<SystemOneResponse> =
+                self.send_system_one(body, config, key, deadline).await?;
+            let invalid =
+                || JevError::Response("Jev answer does not match the submitted questions");
+            let pending = if pending.response_bytes > 64 * 1024 || request.questions.len() > 64 {
+                #[cfg(test)]
+                self.mark_response_cpu_stage();
+                response_cpu(
+                    Arc::clone(&self.response_cpu),
+                    "cannot validate Jev response",
+                    move || {
+                        validate_response(&pending.response, &request.questions)
+                            .map_err(|_| invalid())?;
+                        Ok(pending)
+                    },
+                )
+                .await?
+            } else {
                 validate_response(&pending.response, &request.questions).map_err(|_| invalid())?;
-                Ok::<_, JevError>(pending)
-            })
-            .await
-            .map_err(|_| JevError::Response("cannot validate Jev response"))??
-        } else {
-            validate_response(&pending.response, &request.questions).map_err(|_| invalid())?;
-            pending
+                pending
+            };
+            Ok(pending.complete(&config.base_url))
         };
-        Ok(pending.complete(&config.base_url))
+        run_with_deadline(task, deadline, cancel).await
     }
 
     /// Fetches one uncached model catalog with the evaluation transport policy.
@@ -341,10 +416,14 @@ impl JevClient {
         key: &ApiKey,
         cancel: CancelSignal,
     ) -> Result<MeasuredSuccess<ModelMetadataList>, JevError> {
-        let pending = self
-            .send(HttpOperation::Models, config, key, cancel)
-            .await?;
-        Ok(pending.complete(&config.base_url))
+        let deadline = Instant::now() + config.timeout;
+        let task = async {
+            let pending = self
+                .send(HttpOperation::Models, config, key, deadline)
+                .await?;
+            Ok(pending.complete(&config.base_url))
+        };
+        run_with_deadline(task, deadline, cancel).await
     }
 
     /// Sends one authenticated System One operation with retryable status handling.
@@ -353,9 +432,9 @@ impl JevClient {
         body: &Bytes,
         config: &InvocationConfig,
         key: &ApiKey,
-        cancel: CancelSignal,
+        deadline: Instant,
     ) -> Result<PendingSuccess<SystemOneResponse>, JevError> {
-        self.send(HttpOperation::SystemOne(body), config, key, cancel)
+        self.send(HttpOperation::SystemOne(body), config, key, deadline)
             .await
     }
 
@@ -365,116 +444,132 @@ impl JevClient {
         operation: HttpOperation<'_>,
         config: &impl TransportSettings,
         key: &ApiKey,
-        mut cancel: CancelSignal,
+        deadline: Instant,
     ) -> Result<PendingSuccess<T>, JevError> {
-        if cancel.is_cancelled() {
-            return Err(JevError::Cancelled);
-        }
-        let (root, timeout, retries) = config.transport();
+        let (root, _, retries) = config.transport();
         let url = match operation {
             HttpOperation::Models => models_url(root)?,
             HttpOperation::SystemOne(_) => system_one_url(root)?,
         };
-        let deadline = Instant::now() + timeout;
         let request_bytes = match operation {
             HttpOperation::Models => 0,
             HttpOperation::SystemOne(body) => body.len(),
         };
-        let task = async {
-            let mut first_started = None;
-            for attempt in 0..=retries {
-                let attempt_number = attempt + 1;
-                tracing::debug!(attempt = attempt_number, "Jev HTTP attempt started");
-                let request = match operation {
-                    HttpOperation::Models => self.http.get(url.clone()).bearer_auth(key.as_str()),
-                    HttpOperation::SystemOne(body) => self
-                        .http
-                        .post(url.clone())
-                        .bearer_auth(key.as_str())
-                        .header(CONTENT_TYPE, "application/json")
-                        .body(body.clone()),
-                };
-                let attempt_started = Instant::now();
-                first_started.get_or_insert(attempt_started);
-                let response = request.send().await.map_err(|_| {
-                    tracing::debug!(attempt = attempt_number, "Jev HTTP transport failed");
-                    JevError::Transport("Jev HTTP transport failed")
-                })?;
-                let status = response.status();
-                if let Some(server_request_id) =
-                    server_request_id(response.headers()).filter(|id| !id.contains(key.as_str()))
-                {
-                    tracing::debug!(
-                        attempt = attempt_number,
-                        status = status.as_u16(),
-                        server_request_id,
-                        "Jev HTTP response received"
-                    );
+        let mut first_started = None;
+        for attempt in 0..=retries {
+            let attempt_number = attempt + 1;
+            tracing::debug!(attempt = attempt_number, "Jev HTTP attempt started");
+            let request = match operation {
+                HttpOperation::Models => self.http.get(url.clone()).bearer_auth(key.as_str()),
+                HttpOperation::SystemOne(body) => self
+                    .http
+                    .post(url.clone())
+                    .bearer_auth(key.as_str())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body.clone()),
+            };
+            let attempt_started = Instant::now();
+            first_started.get_or_insert(attempt_started);
+            let response = request.send().await.map_err(|_| {
+                tracing::debug!(attempt = attempt_number, "Jev HTTP transport failed");
+                JevError::Transport("Jev HTTP transport failed")
+            })?;
+            let status = response.status();
+            if let Some(server_request_id) =
+                server_request_id(response.headers()).filter(|id| !id.contains(key.as_str()))
+            {
+                tracing::debug!(
+                    attempt = attempt_number,
+                    status = status.as_u16(),
+                    server_request_id,
+                    "Jev HTTP response received"
+                );
+            } else {
+                tracing::debug!(
+                    attempt = attempt_number,
+                    status = status.as_u16(),
+                    "Jev HTTP response received"
+                );
+            }
+            if status.is_success() {
+                let http_version = response.version();
+                let body = read_success_body(response, MAX_RESPONSE_BYTES).await?;
+                let response_bytes = body.len();
+                let decoded = if response_bytes > 64 * 1024 {
+                    #[cfg(test)]
+                    self.mark_response_cpu_stage();
+                    response_cpu(
+                        Arc::clone(&self.response_cpu),
+                        "cannot decode Jev response",
+                        move || {
+                            serde_json::from_slice::<T>(&body).map_err(|_| {
+                                JevError::Response("Jev returned malformed JSON or missing fields")
+                            })
+                        },
+                    )
+                    .await?
                 } else {
-                    tracing::debug!(
-                        attempt = attempt_number,
-                        status = status.as_u16(),
-                        "Jev HTTP response received"
-                    );
-                }
-                if status.is_success() {
-                    let http_version = response.version();
-                    let body = read_success_body(response, MAX_RESPONSE_BYTES).await?;
-                    let response_bytes = body.len();
-                    let decoded = if response_bytes > 64 * 1024 {
-                        tokio::task::spawn_blocking(move || serde_json::from_slice::<T>(&body))
-                            .await
-                            .map_err(|_| JevError::Response("cannot decode Jev response"))?
-                    } else {
-                        serde_json::from_slice::<T>(&body)
-                    }
-                    .map_err(|_| {
+                    serde_json::from_slice::<T>(&body).map_err(|_| {
                         JevError::Response("Jev returned malformed JSON or missing fields")
-                    })?;
-                    return Ok(PendingSuccess {
-                        response: decoded,
-                        request_bytes,
-                        response_bytes,
-                        first_started: first_started.expect("send attempt has a start"),
-                        attempt_started,
-                        attempts: attempt_number,
-                        http_version,
-                    });
-                }
-                if attempt < retries && retryable(status) {
-                    let delay = retry_delay(response.headers(), SystemTime::now(), attempt);
-                    if Instant::now()
-                        .checked_add(delay)
-                        .is_none_or(|next| next >= deadline)
-                    {
-                        return Err(JevError::Timeout(
-                            "Jev retry delay exceeds the evaluation deadline",
-                        ));
-                    }
-                    tracing::debug!(
-                        status = status.as_u16(),
-                        attempt = attempt_number,
-                        next_attempt = attempt_number + 1,
-                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                        "retrying Jev request"
-                    );
-                    tokio::time::sleep(delay).await;
-                    continue;
-                }
-                return Err(JevError::Http {
-                    status: status.as_u16(),
+                    })?
+                };
+                return Ok(PendingSuccess {
+                    response: decoded,
+                    request_bytes,
+                    response_bytes,
+                    first_started: first_started.expect("send attempt has a start"),
+                    attempt_started,
+                    attempts: attempt_number,
+                    http_version,
                 });
             }
-            unreachable!("retry loop returns on success or terminal failure")
-        };
-        let cancelled = cancel.cancelled();
-        let timed_operation = tokio::time::timeout_at(deadline, task);
-        futures::pin_mut!(cancelled, timed_operation);
-        match select(cancelled, timed_operation).await {
-            Either::Left(((), _)) => Err(JevError::Cancelled),
-            Either::Right((result, _)) => {
-                result.unwrap_or_else(|_| Err(JevError::Timeout("Jev evaluation deadline expired")))
+            if attempt < retries && retryable(status) {
+                let delay = retry_delay(response.headers(), SystemTime::now(), attempt);
+                if Instant::now()
+                    .checked_add(delay)
+                    .is_none_or(|next| next >= deadline)
+                {
+                    return Err(JevError::Timeout(
+                        "Jev retry delay exceeds the evaluation deadline",
+                    ));
+                }
+                tracing::debug!(
+                    status = status.as_u16(),
+                    attempt = attempt_number,
+                    next_attempt = attempt_number + 1,
+                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    "retrying Jev request"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
             }
+            return Err(JevError::Http {
+                status: status.as_u16(),
+            });
+        }
+        unreachable!("retry loop returns on success or terminal failure")
+    }
+}
+
+/// Enforces one cancellation and timeout boundary across transport and response processing.
+async fn run_with_deadline<T>(
+    task: impl Future<Output = Result<T, JevError>>,
+    deadline: Instant,
+    mut cancel: CancelSignal,
+) -> Result<T, JevError> {
+    if cancel.is_cancelled() {
+        return Err(JevError::Cancelled);
+    }
+    let cancelled = cancel.cancelled();
+    let timed_operation = tokio::time::timeout_at(deadline, task);
+    futures::pin_mut!(cancelled, timed_operation);
+    match select(cancelled, timed_operation).await {
+        Either::Left(((), _)) => Err(JevError::Cancelled),
+        Either::Right((Ok(Ok(_)), _)) if Instant::now() >= deadline => {
+            Err(JevError::Timeout("Jev evaluation deadline expired"))
+        }
+        Either::Right((result, _)) => {
+            result.unwrap_or_else(|_| Err(JevError::Timeout("Jev evaluation deadline expired")))
         }
     }
 }
@@ -614,7 +709,10 @@ mod tests {
         io::{BufRead, BufReader, Read, Write},
         net::TcpListener,
         process::Command,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Barrier, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         thread,
         time::{Duration, Instant as StdInstant, SystemTime},
     };
@@ -635,7 +733,8 @@ mod tests {
     use super::{
         Bytes, JevClient, JevClientPool, MAX_RESPONSE_BYTES, jittered_backoff,
         jittered_backoff_with_entropy, models_url, read_success_body, request_body_bytes,
-        retry_after, retry_after_ms, retry_delay, retryable, server_request_id, system_one_url,
+        response_cpu, retry_after, retry_after_ms, retry_delay, retryable, server_request_id,
+        system_one_url,
     };
 
     /// Captures only fields needed to verify outgoing mock requests.
@@ -843,6 +942,34 @@ mod tests {
     fn answer() -> serde_json::Value {
         json!({"model": "jev-2026-09", "answers": {"spam": {"type": "noul", "noul": 0.9}},
             "usage": {"input_tokens": 10, "output_tokens": 2}})
+    }
+
+    /// Constructs a small response whose many questions trigger offloaded validation.
+    fn many_question_exchange() -> (SystemOneRequest, serde_json::Value) {
+        let mut request = request();
+        let questions = Arc::make_mut(&mut request.questions);
+        questions.clear();
+        let answers = (0..65)
+            .map(|index| {
+                let name = format!("q{index}");
+                questions.insert(
+                    name.clone(),
+                    Question::Noul {
+                        instructions: None,
+                        criteria: None,
+                    },
+                );
+                (name, json!({"type": "noul", "noul": 0.5}))
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+        (
+            request,
+            json!({
+                "model": "jev-2026-09",
+                "answers": answers,
+                "usage": {"input_tokens": 10, "output_tokens": 65}
+            }),
+        )
     }
 
     /// Bounds both declared lengths and chunked bodies without parsing their payloads.
@@ -1314,6 +1441,225 @@ mod tests {
             assert!(matches!(request.await.unwrap_err(), JevError::Cancelled));
         });
         server.join().unwrap();
+    }
+
+    /// Includes offloaded answer validation in the same deadline and cancellation boundary.
+    #[test]
+    fn response_validation_obeys_deadline_and_cancellation() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for cancel_early in [false, true] {
+            let (request, answer) = many_question_exchange();
+            let (url, server) = serve(vec![MockResponse::json(200, answer)]);
+            runtime.block_on(async {
+                let mut client = JevClient::new().unwrap();
+                let limiter = Arc::new(tokio::sync::Semaphore::new(0));
+                client.response_cpu = Arc::clone(&limiter);
+                let (stage_sender, mut stage_receiver) = tokio::sync::mpsc::unbounded_channel();
+                client.response_cpu_stage = Some(stage_sender);
+                let mut settings = config(url);
+                settings.timeout = Duration::from_secs(2);
+                let (handle, signal) = CancelHandle::new();
+                let operation = tokio::spawn(async move {
+                    client
+                        .system_one_measured(&request, &settings, &ApiKey::for_test("test"), signal)
+                        .await
+                });
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(1), stage_receiver.recv())
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "response never reached answer validation"
+                );
+                if cancel_early {
+                    handle.cancel();
+                }
+                let error = tokio::time::timeout(Duration::from_secs(3), operation)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .err()
+                    .expect("validation wait must fail");
+                assert_eq!(
+                    error.kind_name(),
+                    if cancel_early { "cancelled" } else { "timeout" }
+                );
+                limiter.add_permits(1);
+                tokio::task::yield_now().await;
+                assert_eq!(limiter.available_permits(), 1);
+            });
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+
+    /// Keeps model decoding under the same logical operation deadline.
+    #[test]
+    fn model_decoding_obeys_deadline() {
+        let mut body = model_list();
+        body["padding"] = json!("x".repeat(70_000));
+        let (url, server) = serve(vec![MockResponse::json(200, body)]);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut client = JevClient::new().unwrap();
+            let limiter = Arc::new(tokio::sync::Semaphore::new(0));
+            client.response_cpu = Arc::clone(&limiter);
+            let (stage_sender, mut stage_receiver) = tokio::sync::mpsc::unbounded_channel();
+            client.response_cpu_stage = Some(stage_sender);
+            let mut settings = models_config(url);
+            settings.timeout = Duration::from_secs(2);
+            let (_handle, signal) = CancelHandle::new();
+            let operation = tokio::spawn(async move {
+                client
+                    .models_measured(&settings, &ApiKey::for_test("test"), signal)
+                    .await
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), stage_receiver.recv())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "model response never reached JSON decoding"
+            );
+            let error = tokio::time::timeout(Duration::from_secs(3), operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .err()
+                .expect("model decoding wait must fail");
+            assert_eq!(error.kind_name(), "timeout");
+            limiter.add_permits(1);
+            tokio::task::yield_now().await;
+            assert_eq!(limiter.available_permits(), 1);
+        });
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    /// Keeps a running blocking closure's permit after its async waiter is cancelled.
+    #[test]
+    fn cancelled_running_response_cpu_retains_permit() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+            let gate = Arc::new(AtomicBool::new(false));
+            let running_gate = Arc::clone(&gate);
+            let (started, entered) = tokio::sync::oneshot::channel();
+            let operation = tokio::spawn(response_cpu(
+                Arc::clone(&limiter),
+                "test response work",
+                move || {
+                    let _ = started.send(());
+                    while !running_gate.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(())
+                },
+            ));
+            entered.await.unwrap();
+            operation.abort();
+            let cancellation = tokio::time::timeout(Duration::from_secs(1), operation).await;
+            let held_while_running = limiter.available_permits();
+            gate.store(true, Ordering::SeqCst);
+            assert!(cancellation.unwrap().unwrap_err().is_cancelled());
+            assert_eq!(held_while_running, 0);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while limiter.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    /// Aborts queued work and repeated waiters without starting their closures.
+    #[test]
+    fn response_cpu_work_is_bounded_after_waiter_drop() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let limiter = Arc::new(tokio::sync::Semaphore::new(2));
+            let gate = Arc::new(AtomicBool::new(false));
+            let running_gate = Arc::clone(&gate);
+            let (started, entered) = tokio::sync::oneshot::channel();
+            let first = tokio::spawn(response_cpu(
+                Arc::clone(&limiter),
+                "test response work",
+                move || {
+                    let _ = started.send(());
+                    while !running_gate.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(())
+                },
+            ));
+            entered.await.unwrap();
+            let executions = Arc::new(AtomicUsize::new(0));
+            let queued_executions = Arc::clone(&executions);
+            let queued = tokio::spawn(response_cpu(
+                Arc::clone(&limiter),
+                "test response work",
+                move || {
+                    queued_executions.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            ));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while limiter.available_permits() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let waiters: Vec<_> = (0..32)
+                .map(|_| {
+                    let limiter = Arc::clone(&limiter);
+                    let executions = Arc::clone(&executions);
+                    tokio::spawn(response_cpu(limiter, "test response work", move || {
+                        executions.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }))
+                })
+                .collect();
+            tokio::task::yield_now().await;
+            waiters.iter().for_each(tokio::task::JoinHandle::abort);
+            queued.abort();
+            first.abort();
+            let cancelled = tokio::time::timeout(Duration::from_secs(1), async {
+                let queued = queued.await;
+                let first = first.await;
+                let waiters = futures::future::join_all(waiters).await;
+                (queued, first, waiters)
+            })
+            .await;
+            gate.store(true, Ordering::SeqCst);
+            let (queued, first, waiters) = cancelled.unwrap();
+            assert!(queued.unwrap_err().is_cancelled());
+            assert!(first.unwrap_err().is_cancelled());
+            for waiter in waiters {
+                assert!(waiter.unwrap_err().is_cancelled());
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while limiter.available_permits() != 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+        });
     }
 
     /// Parses both service guidance formats and excludes unapproved statuses.
@@ -1893,6 +2239,38 @@ mod tests {
         assert!(Arc::strong_count(&direct.http) >= 1);
     }
 
+    /// Concurrent misses retain and return the same cached alternate client.
+    #[test]
+    fn concurrent_policy_selection_rechecks_before_insertion() {
+        let pool = Arc::new(JevClientPool::new().unwrap());
+        let gate = Arc::new(Barrier::new(12));
+        let workers: Vec<_> = (0..12)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                let gate = Arc::clone(&gate);
+                thread::spawn(move || {
+                    gate.wait();
+                    pool.for_policy(&ProxyPolicy::Direct).unwrap()
+                })
+            })
+            .collect();
+        let selected: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(pool.alternate.lock().unwrap().len(), 1);
+        assert!(
+            selected
+                .iter()
+                .all(|client| Arc::ptr_eq(&client.http, &selected[0].http))
+        );
+        assert!(
+            selected
+                .iter()
+                .all(|client| Arc::ptr_eq(&client.response_cpu, &pool.auto.response_cpu))
+        );
+    }
+
     /// Routes through an explicit HTTP proxy even for a localhost target.
     #[test]
     fn explicit_http_proxy_is_authoritative() {
@@ -2221,6 +2599,8 @@ mod tests {
                         .build()
                         .unwrap(),
                 ),
+                response_cpu: super::response_cpu_limiter(),
+                response_cpu_stage: None,
             };
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2262,6 +2642,8 @@ mod tests {
                     .build()
                     .unwrap(),
             ),
+            response_cpu: super::response_cpu_limiter(),
+            response_cpu_stage: None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
