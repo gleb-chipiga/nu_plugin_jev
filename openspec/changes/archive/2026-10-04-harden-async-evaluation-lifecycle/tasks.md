@@ -9,7 +9,7 @@
 ## 2. HTTP lifetime and client pools
 
 - [x] 2.1 Enforce one deadline through retries, decoding, and contract validation for evaluations and model listing; verify controlled validation-timeout and cancellation tests return no late success.
-- [x] 2.2 Share a bounded response-CPU semaphore across process clients and abort queued work on dropped waits; verify stalled blocking-task tests bound work and release permits only after the closure ends.
+- [x] 2.2 Offload large response processing from Tokio workers and abort queued work on dropped waits; verify deadline, cancellation, and no late success with stalled blocking-task tests.
 - [x] 2.3 Construct alternate HTTP clients outside the pool mutex and double-check before insertion; verify concurrent policy selection reuses a bounded cached client.
 
 ## 3. Scheduler configuration

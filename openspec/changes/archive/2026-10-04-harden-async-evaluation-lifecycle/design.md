@@ -13,7 +13,7 @@ Tokio cannot abort a running `spawn_blocking` closure or an arbitrary upstream
 
 **Goals:** Preserve bounded row admission and current output order, make
 single-flight deterministic at the scheduler boundary, enforce one evaluation
-deadline, and bound response CPU work retained after cancellation.
+deadline, and prevent queued response processing after cancellation.
 
 **Non-Goals:** No new flags or response fields, no automatic packing, no promise
 to cancel remote work or force an uncooperative external iterator to return.
@@ -47,16 +47,13 @@ answer validation, and success measurement. Retry guidance compares against
 that same deadline. `jev models` uses the wrapper too, while retaining its
 existing bodyless request and typed decoding.
 
-### Bound non-abortable response CPU work
+### Offload large response processing
 
-All HTTP clients in the process share one Tokio semaphore for large-response
-decode and validation tasks. Its capacity is the available parallelism capped
-at eight, with a fallback of four. Acquire a permit asynchronously before
-spawning; move it into the blocking closure so cancellation does not release
-the capacity until the work actually stops. An abort-on-drop join wrapper
-cancels queued, not-yet-started work. Small responses keep the existing inline
-path, avoiding task overhead. This bounds abandoned blocking closures without
-claiming that an already running closure can be interrupted.
+Run large-response decoding and validation on blocking threads, outside Tokio
+workers. An abort-on-drop join wrapper cancels queued, not-yet-started work
+when its waiter ends. Small responses keep the inline path to avoid task
+overhead. A closure already running on a blocking thread may finish after
+cancellation, but its result cannot be delivered to the cancelled evaluation.
 
 ### Validate capacity and shorten pool locking
 
@@ -68,9 +65,8 @@ remain valid after LRU eviction.
 
 ## Risks / Trade-offs
 
-- **Extra response CPU queueing** -> The shared limit may increase latency for
-  many simultaneous large responses; eight-or-fewer CPU tasks cap retained
-  work while ordinary HTTP concurrency remains controlled by `jobs`.
+- **Running response work after cancellation** -> A blocking closure already
+  started may finish, but the cancelled evaluation cannot publish its result.
 - **Upstream stalls after cancellation** -> HTTP and output stop promptly, but
   the input thread can remain until the external `next()` returns. Document
   this boundary and test that no row is dispatched afterward.

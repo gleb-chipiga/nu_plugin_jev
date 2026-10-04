@@ -43,19 +43,19 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) struct JevClient {
     http: Arc<Client>,
     #[cfg(test)]
-    response_cpu_pause: Option<ResponseCpuPause>,
+    response_work_pause: Option<ResponseWorkPause>,
 }
 
 /// Pauses test-only offloaded work after it starts on a blocking thread.
 #[cfg(test)]
 #[derive(Clone)]
-struct ResponseCpuPause {
+struct ResponseWorkPause {
     entered: tokio::sync::mpsc::UnboundedSender<()>,
     release: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
-impl ResponseCpuPause {
+impl ResponseWorkPause {
     /// Announces entry and waits without blocking a Tokio worker.
     fn wait(&self) {
         let _ = self.entered.send(());
@@ -75,8 +75,8 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-/// Runs large response CPU work outside Tokio workers and aborts queued work on drop.
-async fn offload_response_cpu<T: Send + 'static>(
+/// Runs large response processing outside Tokio workers and aborts queued work on drop.
+async fn offload_response_work<T: Send + 'static>(
     failure: &'static str,
     work: impl FnOnce() -> Result<T, JevError> + Send + 'static,
 ) -> Result<T, JevError> {
@@ -295,7 +295,7 @@ impl JevClient {
         Ok(Self {
             http: Arc::new(http),
             #[cfg(test)]
-            response_cpu_pause: None,
+            response_work_pause: None,
         })
     }
 
@@ -373,8 +373,8 @@ impl JevClient {
                 || JevError::Response("Jev answer does not match the submitted questions");
             let pending = if pending.response_bytes > 64 * 1024 || request.questions.len() > 64 {
                 #[cfg(test)]
-                let pause = self.response_cpu_pause.clone();
-                offload_response_cpu("cannot validate Jev response", move || {
+                let pause = self.response_work_pause.clone();
+                offload_response_work("cannot validate Jev response", move || {
                     #[cfg(test)]
                     if let Some(pause) = pause {
                         pause.wait();
@@ -493,8 +493,8 @@ impl JevClient {
                 let response_bytes = body.len();
                 let decoded = if response_bytes > 64 * 1024 {
                     #[cfg(test)]
-                    let pause = self.response_cpu_pause.clone();
-                    offload_response_cpu("cannot decode Jev response", move || {
+                    let pause = self.response_work_pause.clone();
+                    offload_response_work("cannot decode Jev response", move || {
                         #[cfg(test)]
                         if let Some(pause) = pause {
                             pause.wait();
@@ -727,8 +727,8 @@ mod tests {
     };
 
     use super::{
-        Bytes, JevClient, JevClientPool, MAX_RESPONSE_BYTES, ResponseCpuPause, jittered_backoff,
-        jittered_backoff_with_entropy, models_url, offload_response_cpu, read_success_body,
+        Bytes, JevClient, JevClientPool, MAX_RESPONSE_BYTES, ResponseWorkPause, jittered_backoff,
+        jittered_backoff_with_entropy, models_url, offload_response_work, read_success_body,
         request_body_bytes, retry_after, retry_after_ms, retry_delay, retryable, server_request_id,
         system_one_url,
     };
@@ -1463,7 +1463,7 @@ mod tests {
                 let mut client = JevClient::new().unwrap();
                 let release = ReleaseOnDrop(Arc::new(AtomicBool::new(false)));
                 let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
-                client.response_cpu_pause = Some(ResponseCpuPause {
+                client.response_work_pause = Some(ResponseWorkPause {
                     entered,
                     release: Arc::clone(&release.0),
                 });
@@ -1515,7 +1515,7 @@ mod tests {
             let mut client = JevClient::new().unwrap();
             let release = ReleaseOnDrop(Arc::new(AtomicBool::new(false)));
             let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
-            client.response_cpu_pause = Some(ResponseCpuPause {
+            client.response_work_pause = Some(ResponseWorkPause {
                 entered,
                 release: Arc::clone(&release.0),
             });
@@ -1548,7 +1548,7 @@ mod tests {
 
     /// A cancelled waiter cannot stop a running closure or return its late result.
     #[test]
-    fn cancelled_running_response_cpu_has_no_late_delivery() {
+    fn cancelled_running_response_work_has_no_late_delivery() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1559,7 +1559,7 @@ mod tests {
             let finished = Arc::new(AtomicBool::new(false));
             let completed = Arc::clone(&finished);
             let (started, entered) = tokio::sync::oneshot::channel();
-            let operation = tokio::spawn(offload_response_cpu("test response work", move || {
+            let operation = tokio::spawn(offload_response_work("test response work", move || {
                 let _ = started.send(());
                 while !running_gate.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(1));
@@ -1585,7 +1585,7 @@ mod tests {
 
     /// Dropping an awaiting evaluation aborts its queued blocking closure.
     #[test]
-    fn queued_response_cpu_work_is_aborted_after_waiter_drop() {
+    fn queued_response_work_is_aborted_after_waiter_drop() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .max_blocking_threads(1)
@@ -1596,7 +1596,7 @@ mod tests {
             let release = ReleaseOnDrop(Arc::new(AtomicBool::new(false)));
             let running_gate = Arc::clone(&release.0);
             let (started, entered) = tokio::sync::oneshot::channel();
-            let first = tokio::spawn(offload_response_cpu("test response work", move || {
+            let first = tokio::spawn(offload_response_work("test response work", move || {
                 let _ = started.send(());
                 while !running_gate.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(1));
@@ -1606,7 +1606,7 @@ mod tests {
             entered.await.unwrap();
             let executions = Arc::new(AtomicUsize::new(0));
             let queued_executions = Arc::clone(&executions);
-            let mut queued = Box::pin(offload_response_cpu("test response work", move || {
+            let mut queued = Box::pin(offload_response_work("test response work", move || {
                 queued_executions.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }));
@@ -2551,7 +2551,7 @@ mod tests {
                         .build()
                         .unwrap(),
                 ),
-                response_cpu_pause: None,
+                response_work_pause: None,
             };
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2593,7 +2593,7 @@ mod tests {
                     .build()
                     .unwrap(),
             ),
-            response_cpu_pause: None,
+            response_work_pause: None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

@@ -12,7 +12,7 @@ synchronous upstream iterator can guarantee.
 - Make request admission and completion ordering precise so queued duplicates
   share one evaluation even when its result cannot be cached.
 - Bound the entire HTTP, decoding, and answer-validation operation by one
-  deadline, and limit abandoned blocking response work across invocations.
+  deadline, and abort queued response processing when its waiter is cancelled.
 - Stop plugin-controlled work promptly on cancellation while documenting the
   unavoidable limit of an upstream iterator blocked inside `next()`.
 - Reject scheduler sizes that exceed Tokio's semaphore capacity before reading
@@ -29,7 +29,7 @@ None.
 - `jev-table-streaming`: Define request admission at the scheduler boundary and
   qualify cancellation of an uninterruptible external source.
 - `jev-http-transport`: Include decoding and contract validation in the total
-  deadline, with bounded blocking response work.
+  deadline, without returning a late response after cancellation.
 - `jev-shell-integration`: Reject an unrepresentable table `jobs` value as a
   configuration error instead of panicking.
 
