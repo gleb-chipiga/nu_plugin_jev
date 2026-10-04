@@ -35,3 +35,7 @@
 - Put examples and edge cases in `#### Scenario:` blocks with `WHEN`/`THEN`.
   Split multiple behaviors into separate requirements, each with at least one
   scenario; do not shorten text mechanically just to satisfy the length limit.
+- After editing OpenSpec specs, run `openspec validate --all --strict --no-interactive`
+  and leave no findings for the affected specs, including `INFO` notices.
+  A zero exit code is not enough; `--strict` does not reject informational
+  findings. If archived changes were edited, validate them with `--archived` too.
