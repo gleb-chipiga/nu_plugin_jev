@@ -1,7 +1,9 @@
 //! Evaluates one finite Nushell state against multiple named questions.
 
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
-use nu_protocol::{Example, LabeledError, PipelineData, Record, Signature, SyntaxShape, Value};
+use nu_protocol::{
+    Example, LabeledError, PipelineData, Record, Signature, SyntaxShape, Type, Value,
+};
 
 use crate::{api::validate::parse_questions, nu::typed::answers_to_nu, plugin::JevPlugin};
 
@@ -21,6 +23,7 @@ impl PluginCommand for JevAsk {
     /// Accepts a question record and shared evaluation settings.
     fn signature(&self) -> Signature {
         Signature::build(self.name())
+            .input_output_type(Type::Any, Type::record())
             .required(
                 "questions",
                 SyntaxShape::Record(vec![].into()),
@@ -186,6 +189,17 @@ mod tests {
         assert_eq!(
             preview["request_bytes"],
             json!(serde_json::to_vec(&preview["request"]).unwrap().len())
+        );
+        Ok(())
+    }
+
+    /// Rejects an unknown raw question field before creating a request preview.
+    #[test]
+    fn raw_question_typo_is_not_silently_ignored() -> Result<(), Box<ShellError>> {
+        let mut test = plugin_test()?;
+        assert!(
+            test.eval("'hello' | jev ask {q: {type: noul, instrucitons: 'typo'}} --dry-run")
+                .is_err()
         );
         Ok(())
     }

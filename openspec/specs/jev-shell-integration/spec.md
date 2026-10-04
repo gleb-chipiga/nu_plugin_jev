@@ -27,6 +27,26 @@ The project SHALL use `nu_plugin_jev` as its repository, Cargo crate, and binary
 - **WHEN** `jev` is invoked without credentials
 - **THEN** it returns usage guidance without sending an HTTP request
 
+### Requirement: Truthful Nushell command input and output types
+
+The registered Nu signatures SHALL declare `jev` as `nothing -> string`, `jev ask` as `any -> record`, `jev annotate` as `any -> list<any>`, `jev models` as `nothing -> record`, and each `jev question` constructor as `nothing -> record`. The broad `any` types SHALL preserve runtime validation of accepted Jev states and table rows; they SHALL NOT imply every value can be submitted to the service. The annotation output declaration SHALL allow unchanged non-record values under `--on-error keep`. The offline root command SHALL reject nonempty pipeline input instead of silently ignoring it.
+
+#### Scenario: Command type discovery
+
+- **WHEN** Nu inspects the seven registered command signatures
+- **THEN** it reports the declared input and output types for each command
+- **AND** `jev annotate` does not claim that every emitted item is a record
+
+#### Scenario: Root guidance receives pipeline input
+
+- **WHEN** a nonempty value is piped to bare `jev`
+- **THEN** the invocation fails instead of discarding that value and returning guidance
+
+#### Scenario: Annotation keeps a non-record row
+
+- **WHEN** a non-record input row is handled under `jev annotate --on-error keep`
+- **THEN** the unchanged row remains representable by the command's declared output type
+
 ### Requirement: Focused short flag aliases
 
 `jev ask` SHALL accept `-c` as an alias for `--context` and `-m` as an alias for `--model`. `jev annotate` SHALL accept those aliases plus `-j` for `--jobs`, `-s` for `--state`, `-f` for `--fields`, and `-i` for `--into`. The long flags SHALL remain available. Each alias SHALL share its long flag's value parsing, validation, configuration precedence, dry-run behavior, and live behavior. Other flags, including `--config`, SHALL remain long-only in this change.

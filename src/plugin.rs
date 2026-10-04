@@ -52,10 +52,50 @@ impl Plugin for JevPlugin {
 
 #[cfg(test)]
 mod tests {
+    use nu_plugin::{PluginCommand, SimplePluginCommand};
     use nu_plugin_test_support::PluginTest;
-    use nu_protocol::{ShellError, Span};
+    use nu_protocol::{ShellError, Span, Type};
 
-    use super::JevPlugin;
+    use super::{
+        Jev, JevAnnotate, JevAsk, JevModels, JevPlugin, JevQuestionChoice, JevQuestionNoul,
+        JevQuestionScore,
+    };
+
+    /// Declares stable native output shapes without claiming fixed annotation columns.
+    #[test]
+    fn commands_declare_nushell_input_output_types() {
+        assert_eq!(
+            SimplePluginCommand::signature(&Jev).get_input_type(),
+            Type::Nothing
+        );
+        assert_eq!(
+            SimplePluginCommand::signature(&Jev).get_output_type(None),
+            Some(Type::String)
+        );
+        assert_eq!(
+            JevAsk.signature().get_output_type(None),
+            Some(Type::record())
+        );
+        assert_eq!(JevAsk.signature().get_input_type(), Type::Any);
+        assert_eq!(
+            JevAnnotate.signature().get_output_type(None),
+            Some(Type::list(Type::Any))
+        );
+        assert_eq!(JevAnnotate.signature().get_input_type(), Type::Any);
+        assert_eq!(JevModels.signature().get_input_type(), Type::Nothing);
+        assert_eq!(
+            JevModels.signature().get_output_type(None),
+            Some(Type::record())
+        );
+        for signature in [
+            SimplePluginCommand::signature(&JevQuestionNoul),
+            SimplePluginCommand::signature(&JevQuestionChoice),
+            SimplePluginCommand::signature(&JevQuestionScore),
+        ] {
+            assert_eq!(signature.get_input_type(), Type::Nothing);
+            assert_eq!(signature.get_output_type(None), Some(Type::record()));
+        }
+    }
 
     /// Confirms root guidance runs in the public test engine without credentials.
     #[test]
@@ -67,6 +107,7 @@ mod tests {
         let mut test = PluginTest::new("jev", JevPlugin::new(runtime).into())?;
         let result = test.eval("jev")?.into_value(Span::test_data())?;
         assert!(result.as_str()?.contains("jev ask"));
+        assert!(test.eval("'ignored' | jev").is_err());
         Ok(())
     }
 }

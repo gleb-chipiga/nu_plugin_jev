@@ -117,6 +117,24 @@ mod tests {
         );
     }
 
+    /// Rejects duplicate keys in either outbound state or explicit context.
+    #[test]
+    fn duplicate_keys_in_state_or_context_fail() {
+        let mut duplicate = Record::new();
+        duplicate.push("same", Value::test_int(1));
+        duplicate.push("same", Value::test_int(2));
+        let duplicate = Value::test_record(duplicate);
+
+        let state_error = compose_state(&duplicate, None).unwrap_err();
+        assert!(state_error.msg.contains("duplicate record key"));
+        assert!(state_error.msg.contains("$.same"));
+
+        let context_error =
+            compose_state(&Value::test_string("hello"), Some(&duplicate)).unwrap_err();
+        assert!(context_error.msg.contains("duplicate record key"));
+        assert!(context_error.msg.contains("$.same"));
+    }
+
     /// Allows nested JSON scalars while excluding bare scalar states.
     #[test]
     fn checks_only_top_level_type() {

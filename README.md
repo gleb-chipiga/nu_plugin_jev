@@ -15,12 +15,15 @@ The command set is deliberately small:
 | `jev question noul` | Build a probability-of-true question. |
 | `jev question choice` | Build a categorical question. |
 | `jev question score` | Build an ordered-score question. |
-| `jev` | Show offline usage guidance. |
+| `jev` | Show offline usage guidance; accepts no pipeline input. |
 
 Use native Nu commands such as `where`, `sort-by`, `select`, and `group-by` on
 the typed answers. There are no plugin-specific filtering or sorting commands.
 Related questions share one request; table processing streams with bounded
 concurrency instead of collecting every row.
+Nu declares record results for `ask`, `models`, and question constructors;
+`annotate` declares `list<any>` because `--on-error keep` can pass non-record
+rows through unchanged. Bare `jev` returns a guidance string.
 
 ## Install
 
@@ -57,7 +60,8 @@ commands to inspect it. The command accepts `--base-url`, `--timeout`, and
 ## Ask about one state
 
 Questions are ordinary Nu records. The constructors only build data; they do
-not contact Jev.
+not contact Jev or accept pipeline input. Raw questions reject unknown fields,
+duplicate names, and duplicate nested record keys before an HTTP request.
 
 ```nu
 let questions = {
@@ -83,6 +87,7 @@ The caller chooses thresholds; the plugin does not decide what counts as true.
 The pipeline value is the state. A string stays a string, a record becomes a
 JSON object, and a list becomes a JSON array. A finite stream passed to
 `jev ask` is **one array state**, not a batch of independent requests.
+Duplicate keys in the outbound state or context are rejected.
 
 Add separate context with `--context <value>`. The outgoing state becomes
 `{input: <pipeline value>, context: <value>}`; fields are not merged.
@@ -121,6 +126,8 @@ with `--on-error keep` or `record`.
 instead to send one cell path; these selectors cannot be combined. The
 original row remains intact either way. `--context` has the same wrapping
 behavior as in `jev ask`.
+Duplicate keys in the selected state or context fail; keys in unselected row
+fields are not inspected or sent.
 
 Useful options:
 

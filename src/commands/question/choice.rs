@@ -1,7 +1,7 @@
 //! Exposes the offline Choice question constructor to Nushell.
 
 use nu_plugin::{EngineInterface, EvaluatedCall, SimplePluginCommand};
-use nu_protocol::{Example, LabeledError, Signature, SyntaxShape, Value};
+use nu_protocol::{Example, LabeledError, Signature, SyntaxShape, Type, Value};
 
 use crate::plugin::JevPlugin;
 
@@ -21,6 +21,7 @@ impl SimplePluginCommand for JevQuestionChoice {
     /// Declares instructions and list-or-record criteria.
     fn signature(&self) -> Signature {
         Signature::build(self.name())
+            .input_output_type(Type::Nothing, Type::record())
             .required("instructions", SyntaxShape::Any, "Decision instructions")
             .required("criteria", SyntaxShape::Any, "Option names or descriptions")
     }
@@ -32,7 +33,7 @@ impl SimplePluginCommand for JevQuestionChoice {
 
     /// Explains shorthand and limits in Nu help.
     fn extra_description(&self) -> &str {
-        "A list of 1 to 255 distinct strings becomes option names with null descriptions. A record supplies explicit descriptions. No HTTP request is made."
+        "A list of 1 to 255 distinct strings becomes option names with null descriptions. A record supplies explicit descriptions. No HTTP request is made and pipeline input is not accepted."
     }
 
     /// Shows an offline list-shorthand example.
@@ -50,8 +51,9 @@ impl SimplePluginCommand for JevQuestionChoice {
         _plugin: &JevPlugin,
         _engine: &EngineInterface,
         call: &EvaluatedCall,
-        _input: &Value,
+        input: &Value,
     ) -> Result<Value, LabeledError> {
+        super::reject_pipeline_input(input, call.head)?;
         let instructions: Value = call.req(0).map_err(LabeledError::from)?;
         let criteria: Value = call.req(1).map_err(LabeledError::from)?;
         question_to_nu(build_choice(&instructions, &criteria)?, call.head)

@@ -1,7 +1,7 @@
 //! Exposes the offline Score question constructor to Nushell.
 
 use nu_plugin::{EngineInterface, EvaluatedCall, SimplePluginCommand};
-use nu_protocol::{Example, LabeledError, Signature, SyntaxShape, Value};
+use nu_protocol::{Example, LabeledError, Signature, SyntaxShape, Type, Value};
 
 use crate::plugin::JevPlugin;
 
@@ -21,6 +21,7 @@ impl SimplePluginCommand for JevQuestionScore {
     /// Declares instructions and ordered level descriptions.
     fn signature(&self) -> Signature {
         Signature::build(self.name())
+            .input_output_type(Type::Nothing, Type::record())
             .required("instructions", SyntaxShape::Any, "Scoring instructions")
             .required(
                 "criteria",
@@ -36,7 +37,7 @@ impl SimplePluginCommand for JevQuestionScore {
 
     /// Clarifies ordinal positions and limits in Nu help.
     fn extra_description(&self) -> &str {
-        "One to ten levels are allowed; positions correspond to 0..N-1. At least two levels are usually useful. No HTTP request is made."
+        "One to ten levels are allowed; positions correspond to 0..N-1. At least two levels are usually useful. No HTTP request is made and pipeline input is not accepted."
     }
 
     /// Shows an offline rubric example.
@@ -54,8 +55,9 @@ impl SimplePluginCommand for JevQuestionScore {
         _plugin: &JevPlugin,
         _engine: &EngineInterface,
         call: &EvaluatedCall,
-        _input: &Value,
+        input: &Value,
     ) -> Result<Value, LabeledError> {
+        super::reject_pipeline_input(input, call.head)?;
         let instructions: Value = call.req(0).map_err(LabeledError::from)?;
         let criteria: Value = call.req(1).map_err(LabeledError::from)?;
         question_to_nu(build_score(&instructions, &criteria)?, call.head)

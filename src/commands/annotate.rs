@@ -8,7 +8,7 @@ use std::{
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{
     Example, LabeledError, ListStream, PipelineData, Record, ShellError, SignalAction, Signature,
-    Span, SyntaxShape, Value,
+    Span, SyntaxShape, Type, Value,
     ast::{CellPath, PathMember},
 };
 
@@ -68,6 +68,7 @@ impl PluginCommand for JevAnnotate {
     /// Defines selectors, stream controls, and answer destinations.
     fn signature(&self) -> Signature {
         Signature::build(self.name())
+            .input_output_type(Type::Any, Type::list(Type::Any))
             .required(
                 "questions",
                 SyntaxShape::Record(vec![].into()),
@@ -1109,6 +1110,42 @@ mod tests {
             request.state,
             json!({"message": "hello", "elapsed": "1500000000ns"})
         );
+        let whole = super::TableOptions {
+            selector: super::StateSelector::Whole,
+            ..options
+        };
+        assert!(super::request_builder(&whole, "jev-latest".into(), questions)(&source).is_err());
+    }
+
+    /// Leaves duplicate keys in an unselected row field outside outbound validation.
+    #[test]
+    fn state_selection_ignores_unselected_duplicate_keys() {
+        let mut duplicate = Record::new();
+        duplicate.push("same", Value::test_int(1));
+        duplicate.push("same", Value::test_int(2));
+        let mut source = Record::new();
+        source.push("message", Value::test_string("hello"));
+        source.push("ignored", Value::test_record(duplicate));
+        let source = Value::test_record(source);
+        let questions = crate::api::validate::parse_questions(
+            &crate::nu::value::from_json(json!({"q": {"type": "noul"}}), Span::test_data())
+                .unwrap(),
+        )
+        .unwrap();
+        let options = super::TableOptions {
+            selector: super::StateSelector::Cell("message".parse().unwrap()),
+            context: None,
+            into: "answers".into(),
+            metrics: false,
+            on_error: super::ErrorPolicy::Fail,
+            unordered: false,
+            dry_run: true,
+        };
+
+        let request =
+            super::request_builder(&options, "jev-latest".into(), questions.clone())(&source)
+                .unwrap();
+        assert_eq!(request.state, json!("hello"));
         let whole = super::TableOptions {
             selector: super::StateSelector::Whole,
             ..options

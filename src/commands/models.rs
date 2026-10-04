@@ -2,7 +2,7 @@
 
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{
-    Example, LabeledError, PipelineData, Record, SignalAction, Signature, SyntaxShape, Value,
+    Example, LabeledError, PipelineData, Record, SignalAction, Signature, SyntaxShape, Type, Value,
 };
 
 use crate::{
@@ -29,6 +29,7 @@ impl PluginCommand for JevModels {
     /// Accepts only transport and file-selection flags.
     fn signature(&self) -> Signature {
         Signature::build(self.name())
+            .input_output_type(Type::Nothing, Type::record())
             .named(
                 "base-url",
                 SyntaxShape::String,

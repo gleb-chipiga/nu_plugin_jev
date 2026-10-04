@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use nu_protocol::{LabeledError, Value};
+use nu_protocol::{LabeledError, Span, Value};
 use serde_json::Value as JsonValue;
 
 use crate::{
@@ -23,6 +23,18 @@ pub(crate) mod score;
 /// Converts a description while leaving its root-shape validation to the contract layer.
 fn description(value: &Value) -> Result<JsonValue, LabeledError> {
     to_json(value)
+}
+
+/// Rejects pipeline state that an offline question constructor would ignore.
+fn reject_pipeline_input(input: &Value, span: Span) -> Result<(), LabeledError> {
+    if input.is_nothing() {
+        Ok(())
+    } else {
+        Err(
+            LabeledError::new("jev question does not accept pipeline input")
+                .with_label("pass instructions as an argument instead", span),
+        )
+    }
 }
 
 /// Builds and validates a Noul question, preserving omitted and null criteria.
@@ -282,6 +294,9 @@ mod tests {
             "jev question choice 'kind?' []",
             "jev question score 'urgency?' []",
             "jev question score 'urgency?' [null]",
+            "'ignored' | jev question noul 'spam?'",
+            "'ignored' | jev question choice 'kind?' [spam]",
+            "'ignored' | jev question score 'urgency?' ['low' 'high']",
         ] {
             let failed = match test.eval(source) {
                 Ok(value) => value.into_value(Span::test_data()).is_err(),

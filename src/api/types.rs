@@ -27,7 +27,7 @@ pub(crate) struct SystemOneRequest {
 
 /// Describes one typed decision with instructions and criteria.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub(crate) enum Question {
     /// Asks for the probability that the stated condition is true.
     Noul {

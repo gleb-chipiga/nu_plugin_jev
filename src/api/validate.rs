@@ -22,7 +22,13 @@ pub(crate) fn parse_questions(value: &Value) -> Result<BTreeMap<String, Question
     }
     questions
         .iter()
-        .map(|(name, body)| {
+        .try_fold(BTreeMap::new(), |mut parsed, (name, body)| {
+            if parsed.contains_key(name) {
+                return Err(question_error(
+                    format!("duplicate question name {name:?}"),
+                    body.span(),
+                ));
+            }
             let body = to_json_at(body, format!("$.{name}"))?;
             let question: Question = serde_json::from_value(body).map_err(|error| {
                 question_error(
@@ -31,9 +37,9 @@ pub(crate) fn parse_questions(value: &Value) -> Result<BTreeMap<String, Question
                 )
             })?;
             validate_question(name, &question, value.span())?;
-            Ok((name.clone(), question))
+            parsed.insert(name.clone(), question);
+            Ok(parsed)
         })
-        .collect()
 }
 
 /// Checks the root shapes and cardinality defined by the raw API schema.
@@ -246,12 +252,43 @@ mod tests {
         for fixture in [
             json!({}),
             json!({"q": {"type": "noul", "instructions": 2}}),
+            json!({"q": {"type": "noul", "instrucitons": "typo"}}),
+            json!({"q": {"type": "choice", "criteria": {"x": null}, "instrucitons": "typo"}}),
+            json!({"q": {"type": "score", "criteria": ["low"], "instrucitons": "typo"}}),
             json!({"q": {"type": "choice", "criteria": {"x": true}}}),
             json!({"q": {"type": "score", "criteria": []}}),
             json!({"q": {"type": "score", "criteria": [null]}}),
         ] {
             assert!(parse_questions(&nu(fixture)).is_err());
         }
+    }
+
+    /// Rejects repeated question names instead of discarding an earlier decision.
+    #[test]
+    fn rejects_duplicate_question_names() {
+        let mut questions = Record::new();
+        let question = || nu(json!({"type": "noul"}));
+        questions.push("same", question());
+        questions.push("same", question());
+        let error = parse_questions(&Value::test_record(questions)).unwrap_err();
+        assert!(error.msg.contains("duplicate question name"));
+    }
+
+    /// Rejects repeated nested keys before deserializing a raw question.
+    #[test]
+    fn rejects_duplicate_nested_question_keys() {
+        let mut instructions = Record::new();
+        instructions.push("same", Value::test_string("first"));
+        instructions.push("same", Value::test_string("second"));
+        let mut body = Record::new();
+        body.push("type", Value::test_string("noul"));
+        body.push("instructions", Value::test_record(instructions));
+        let mut questions = Record::new();
+        questions.push("q", Value::test_record(body));
+
+        let error = parse_questions(&Value::test_record(questions)).unwrap_err();
+        assert!(error.msg.contains("duplicate record key"));
+        assert!(error.msg.contains("$.q.instructions.same"));
     }
 
     /// Retains the complete question path when converting one invalid field.

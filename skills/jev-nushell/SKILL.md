@@ -7,19 +7,24 @@ description: Compose Nushell pipelines with nu_plugin_jev for structured Jev dec
 
 Nushell shapes the input and processes the result; the plugin evaluates named
 questions. Prefer native Nu commands over inventing extra Jev operations.
+Run bare `jev` without pipeline input for offline guidance.
 
 ## Choose the operation
 
 - Build a string, record, or list with Nu and pass it as pipeline state. Do not
   stringify structured values. `--context` wraps state as `{input, context}`;
-  it does not merge fields.
+  it does not merge fields. Duplicate outbound record keys are rejected.
 - Build named Noul, Choice, and Score questions with the offline
-  `jev question noul|choice|score` constructors. Use `jev ask` to evaluate
+  `jev question noul|choice|score` constructors; pass arguments, not pipeline
+  input. Raw questions reject unknown fields and duplicate names or nested
+  record keys before HTTP. Use `jev ask` to evaluate
   related questions about one state in one request. A list or finite stream
   passed to `jev ask` is one array state, not a batch of independent requests.
 - Use `jev annotate` for independent table rows. `--state <cell-path>` and
   `--fields <list>` restrict outbound data without removing source columns;
-  they cannot be combined. Shared context is sent with each row.
+  they cannot be combined. Duplicate keys in selected values fail, while
+  unselected row fields are not inspected or sent. Shared context is sent with
+  each row.
 - Use native Nu commands for filtering, sorting, and projecting answers. There
   are no scalar `jev noul|choice|score` or `jev where` commands.
 - Use `jev models` to fetch the current model catalog. It accepts no pipeline
@@ -71,7 +76,8 @@ jev models | get models | sort-by name | select name release_date
   `jev_metrics` on `annotate`. Reused rows share `jev_metrics.request_id`;
   count usage and body bytes once per distinct ID.
 - With `--on-error keep` or `record`, some rows lack answers. Check for an
-  annotation before accessing nested answer fields.
+  annotation before accessing nested answer fields. Nu declares `annotate`
+  output as `list<any>` because `keep` can pass through non-record rows.
 - `NU_PLUGIN_JEV_LOG=info|debug` enables plugin-only text diagnostics.
   Third-party logs may contain secrets and are not automatically redacted.
   To enable them, select targets explicitly, for example

@@ -29,10 +29,21 @@ pub(crate) fn to_json_at(value: &Value, path: String) -> Result<JsonValue, Label
             .map(JsonValue::Array),
         Value::Record { val, .. } => val
             .iter()
-            .map(|(key, item)| {
-                to_json_at(item, format!("{path}.{key}")).map(|json| (key.clone(), json))
-            })
-            .collect::<Result<JsonMap<_, _>, _>>()
+            .try_fold(
+                JsonMap::with_capacity(val.len()),
+                |mut object, (key, item)| {
+                    let item_path = format!("{path}.{key}");
+                    if object.contains_key(key) {
+                        return Err(conversion_error(
+                            &item_path,
+                            "duplicate record key",
+                            item.span(),
+                        ));
+                    }
+                    object.insert(key.clone(), to_json_at(item, item_path)?);
+                    Ok(object)
+                },
+            )
             .map(JsonValue::Object),
         Value::Error { error, .. } => Err(LabeledError::from((**error).clone())),
         Value::Binary { .. } => Err(conversion_error(&path, "binary", value.span())),
@@ -156,6 +167,19 @@ mod tests {
         assert!(error.msg.contains("$.bad[0]"));
         assert!(to_json(&Value::test_float(f64::NAN)).is_err());
         assert!(to_json(&Value::test_float(f64::INFINITY)).is_err());
+    }
+
+    /// Rejects repeated Nu record keys instead of silently overwriting JSON fields.
+    #[test]
+    fn rejects_duplicate_record_keys() {
+        let mut nested = Record::new();
+        nested.push("same", Value::test_int(1));
+        nested.push("same", Value::test_int(2));
+        let mut outer = Record::new();
+        outer.push("nested", Value::test_record(nested));
+        let error = to_json(&Value::test_record(outer)).unwrap_err();
+        assert!(error.msg.contains("duplicate record key"));
+        assert!(error.msg.contains("$.nested.same"));
     }
 
     /// Preserves upstream Nu errors instead of formatting them as state text.
