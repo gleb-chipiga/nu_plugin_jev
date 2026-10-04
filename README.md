@@ -233,6 +233,10 @@ is honored when valid. Other client errors and invalid responses are not
 retried. Retries can repeat remote work, so `request_id` is not an idempotency
 or billing guarantee.
 
+Successful API response bodies are limited to 16 MiB per request. Larger bodies
+fail with a nonretryable response error before JSON decoding, including when
+sent without a `Content-Length` header. No partial response is returned.
+
 For exact question validation, value conversion, retry, cache, and proxy
 contracts, see the [OpenSpec requirements](openspec/changes/add-jev-plugin/specs/).
 The repository [usage skill](skills/jev-nushell/SKILL.md) contains additional

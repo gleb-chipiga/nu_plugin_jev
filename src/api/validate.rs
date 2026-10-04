@@ -5,32 +5,33 @@ use std::collections::BTreeMap;
 use nu_protocol::{LabeledError, Span, Value};
 use serde_json::Value as JsonValue;
 
-use crate::nu::value::to_json;
+use crate::nu::value::to_json_at;
 
 use super::types::{Answer, NoulCriteria, Question, SystemOneResponse};
 
 /// Parses and validates a nonempty named Nu question record before dispatch.
 pub(crate) fn parse_questions(value: &Value) -> Result<BTreeMap<String, Question>, LabeledError> {
-    let json = to_json(value)?;
-    let JsonValue::Object(map) = json else {
+    let Value::Record { val: questions, .. } = value else {
         return Err(question_error("questions must be a record", value.span()));
     };
-    if map.is_empty() {
+    if questions.is_empty() {
         return Err(question_error(
             "questions record must not be empty",
             value.span(),
         ));
     }
-    map.into_iter()
+    questions
+        .iter()
         .map(|(name, body)| {
+            let body = to_json_at(body, format!("$.{name}"))?;
             let question: Question = serde_json::from_value(body).map_err(|error| {
                 question_error(
                     format!("question {name:?} has invalid fields: {error}"),
                     value.span(),
                 )
             })?;
-            validate_question(&name, &question, value.span())?;
-            Ok((name, question))
+            validate_question(name, &question, value.span())?;
+            Ok((name.clone(), question))
         })
         .collect()
 }
@@ -215,7 +216,7 @@ fn response_error(message: impl Into<String>) -> LabeledError {
 
 #[cfg(test)]
 mod tests {
-    use nu_protocol::Span;
+    use nu_protocol::{Record, Span, Value};
     use serde_json::json;
 
     use crate::nu::value::from_json;
@@ -251,6 +252,21 @@ mod tests {
         ] {
             assert!(parse_questions(&nu(fixture)).is_err());
         }
+    }
+
+    /// Retains the complete question path when converting one invalid field.
+    #[test]
+    fn reports_nested_question_conversion_path() {
+        let mut body = Record::new();
+        body.push("type", Value::test_string("noul"));
+        body.push(
+            "instructions",
+            Value::test_list(vec![Value::binary(vec![1], Span::test_data())]),
+        );
+        let mut questions = Record::new();
+        questions.push("q", Value::test_record(body));
+        let error = parse_questions(&Value::test_record(questions)).unwrap_err();
+        assert!(error.msg.contains("$.q.instructions[0]"));
     }
 
     /// Rejects absent and mistyped answers, invalid domains, and unknown choices or levels.

@@ -180,13 +180,13 @@ mod tests {
         SystemOneRequest {
             state,
             model: "jev-latest".into(),
-            questions: BTreeMap::from([(
+            questions: Arc::new(BTreeMap::from([(
                 "q".into(),
                 Question::Noul {
                     instructions: None,
                     criteria: None,
                 },
-            )]),
+            )])),
         }
     }
 
@@ -247,7 +247,7 @@ mod tests {
         changed.model = "jev-fixed".into();
         assert_ne!(first, RequestKey::new(&root, &changed));
         changed.model = "jev-latest".into();
-        changed.questions.insert(
+        Arc::make_mut(&mut changed.questions).insert(
             "q".into(),
             Question::Noul {
                 instructions: Some(json!("different")),
@@ -255,7 +255,7 @@ mod tests {
             },
         );
         assert_ne!(first, RequestKey::new(&root, &changed));
-        changed.questions.insert(
+        Arc::make_mut(&mut changed.questions).insert(
             "q".into(),
             Question::Noul {
                 instructions: Some(json!(null)),

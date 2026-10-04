@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::future::{Either, select};
 use lru::LruCache;
 use reqwest::{
@@ -27,6 +27,9 @@ use super::{
     types::{ModelMetadataList, SystemOneRequest, SystemOneResponse},
     validate::validate_response,
 };
+
+/// Caps one successful JSON response before decoding or retaining it.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Reuses one HTTP connection pool for every request using the same policy.
 #[derive(Clone)]
@@ -425,9 +428,7 @@ impl JevClient {
                 }
                 if status.is_success() {
                     let http_version = response.version();
-                    let body = response.bytes().await.map_err(|_| {
-                        JevError::new(ErrorKind::Response, "Jev returned an unreadable response")
-                    })?;
+                    let body = read_success_body(response, MAX_RESPONSE_BYTES).await?;
                     let response_bytes = body.len();
                     let decoded = if response_bytes > 64 * 1024 {
                         tokio::task::spawn_blocking(move || serde_json::from_slice::<T>(&body))
@@ -495,6 +496,50 @@ impl JevClient {
             }),
         }
     }
+}
+
+/// Reads a successful body in chunks, rejecting declared or observed oversize data.
+async fn read_success_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Bytes, JevError> {
+    let too_large = || {
+        JevError::new(
+            ErrorKind::Response,
+            format!("Jev response exceeds {limit} byte limit"),
+        )
+    };
+    let unreadable = || JevError::new(ErrorKind::Response, "Jev returned an unreadable response");
+    if response
+        .content_length()
+        .is_some_and(|size| size > limit as u64)
+    {
+        return Err(too_large());
+    }
+    let first = response.chunk().await.map_err(|_| unreadable())?;
+    let Some(first) = first else {
+        return Ok(Bytes::new());
+    };
+    if first.len() > limit {
+        return Err(too_large());
+    }
+    let second = response.chunk().await.map_err(|_| unreadable())?;
+    let Some(second) = second else {
+        return Ok(first);
+    };
+    if second.len() > limit - first.len() {
+        return Err(too_large());
+    }
+    let mut body = BytesMut::with_capacity(first.len() + second.len());
+    body.extend_from_slice(&first);
+    body.extend_from_slice(&second);
+    while let Some(chunk) = response.chunk().await.map_err(|_| unreadable())? {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
 }
 
 /// Appends the fixed System One endpoint below the configured service root.
@@ -615,9 +660,9 @@ mod tests {
     };
 
     use super::{
-        Bytes, JevClient, JevClientPool, jittered_backoff, jittered_backoff_with_entropy,
-        models_url, request_body_bytes, retry_after, retry_after_ms, retry_delay, retryable,
-        server_request_id, system_one_url,
+        Bytes, JevClient, JevClientPool, MAX_RESPONSE_BYTES, jittered_backoff,
+        jittered_backoff_with_entropy, models_url, read_success_body, request_body_bytes,
+        retry_after, retry_after_ms, retry_delay, retryable, server_request_id, system_one_url,
     };
 
     /// Captures only fields needed to verify outgoing mock requests.
@@ -724,17 +769,33 @@ mod tests {
                     let mut body = vec![0; content_length];
                     reader.read_exact(&mut body).unwrap();
                     thread::sleep(response.delay);
+                    let chunked = response.headers.iter().any(|(name, value)| {
+                        name.eq_ignore_ascii_case("transfer-encoding")
+                            && value.eq_ignore_ascii_case("chunked")
+                    });
                     let mut headers = format!(
-                        "HTTP/1.1 {} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-                        response.status,
-                        response.body.len()
+                        "HTTP/1.1 {} Mock\r\nContent-Type: application/json\r\nConnection: close\r\n",
+                        response.status
                     );
+                    if !chunked
+                        && !response.headers.iter().any(|(name, _)| {
+                            name.eq_ignore_ascii_case("content-length")
+                        })
+                    {
+                        headers.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
+                    }
                     for (name, value) in response.headers {
                         headers.push_str(&format!("{name}: {value}\r\n"));
                     }
                     headers.push_str("\r\n");
                     let _ = stream.write_all(headers.as_bytes());
-                    let _ = stream.write_all(response.body.as_bytes());
+                    if chunked {
+                        let _ = stream.write_all(format!("{:X}\r\n", response.body.len()).as_bytes());
+                        let _ = stream.write_all(response.body.as_bytes());
+                        let _ = stream.write_all(b"\r\n0\r\n\r\n");
+                    } else {
+                        let _ = stream.write_all(response.body.as_bytes());
+                    }
                     CapturedRequest { method, path, authorization, content_type, body }
                 })
                 .collect()
@@ -778,13 +839,13 @@ mod tests {
         SystemOneRequest {
             state: json!({"message": "hello"}),
             model: "jev-latest".to_owned(),
-            questions: BTreeMap::from([(
+            questions: Arc::new(BTreeMap::from([(
                 "spam".to_owned(),
                 Question::Noul {
                     instructions: Some(json!("Is this spam?")),
                     criteria: None,
                 },
-            )]),
+            )])),
         }
     }
 
@@ -794,12 +855,155 @@ mod tests {
             "usage": {"input_tokens": 10, "output_tokens": 2}})
     }
 
+    /// Bounds both declared lengths and chunked bodies without parsing their payloads.
+    #[test]
+    fn successful_body_reader_enforces_byte_limit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for chunked in [false, true] {
+            let response = MockResponse::json(200, json!({"payload": "x".repeat(80)}));
+            let response = if chunked {
+                response.header("Transfer-Encoding", "chunked")
+            } else {
+                response
+            };
+            let (url, server) = serve(vec![response]);
+            runtime.block_on(async {
+                let response = Client::new().get(url).send().await.unwrap();
+                let error = read_success_body(response, 64).await.unwrap_err();
+                assert_eq!(error.kind, ErrorKind::Response);
+                assert!(error.message.contains("64 byte limit"));
+            });
+            server.join().unwrap();
+        }
+        let (url, server) = serve(vec![MockResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: "x".repeat(64),
+            delay: Duration::ZERO,
+        }]);
+        runtime.block_on(async {
+            let response = Client::new().get(url).send().await.unwrap();
+            assert_eq!(read_success_body(response, 64).await.unwrap().len(), 64);
+        });
+        server.join().unwrap();
+    }
+
+    /// Rejects declared oversized responses for both endpoints without reading or retrying.
+    #[test]
+    fn declared_oversized_success_is_nonretryable() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for models in [false, true] {
+            let response = MockResponse {
+                status: 200,
+                headers: vec![(
+                    "Content-Length".to_owned(),
+                    (MAX_RESPONSE_BYTES + 1).to_string(),
+                )],
+                body: String::new(),
+                delay: Duration::ZERO,
+            };
+            let (url, server) = serve(vec![response]);
+            let error = runtime.block_on(async {
+                let client = JevClient::new().unwrap();
+                let (_handle, signal) = CancelHandle::new();
+                if models {
+                    let mut settings = models_config(url);
+                    settings.retries = 1;
+                    client
+                        .models(&settings, &ApiKey::for_test("test"), signal)
+                        .await
+                        .unwrap_err()
+                } else {
+                    let mut settings = config(url);
+                    settings.retries = 1;
+                    client
+                        .system_one(&request(), &settings, &ApiKey::for_test("test"), signal)
+                        .await
+                        .unwrap_err()
+                }
+            });
+            assert_eq!(error.kind, ErrorKind::Response);
+            assert_eq!(
+                error.message,
+                format!("Jev response exceeds {MAX_RESPONSE_BYTES} byte limit")
+            );
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+
+    /// Stops a lengthless chunked model response at the production limit.
+    #[test]
+    fn chunked_oversized_success_is_nonretryable() {
+        let response = MockResponse {
+            status: 200,
+            headers: vec![("Transfer-Encoding".to_owned(), "chunked".to_owned())],
+            body: "x".repeat(MAX_RESPONSE_BYTES + 1),
+            delay: Duration::ZERO,
+        };
+        let (url, server) = serve(vec![response]);
+        let mut settings = models_config(url);
+        settings.timeout = Duration::from_secs(30);
+        settings.retries = 1;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime.block_on(async {
+            let client = JevClient::new().unwrap();
+            let (_handle, signal) = CancelHandle::new();
+            client
+                .models(&settings, &ApiKey::for_test("test"), signal)
+                .await
+                .unwrap_err()
+        });
+        assert_eq!(error.kind, ErrorKind::Response);
+        assert_eq!(
+            error.message,
+            format!("Jev response exceeds {MAX_RESPONSE_BYTES} byte limit")
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    /// Accepts a valid System One body at the exact production size ceiling.
+    #[test]
+    fn valid_response_at_exact_size_limit() {
+        let mut body = answer();
+        body["padding"] = json!("");
+        let padding = MAX_RESPONSE_BYTES - body.to_string().len();
+        body["padding"] = json!("x".repeat(padding));
+        assert_eq!(body.to_string().len(), MAX_RESPONSE_BYTES);
+        let (url, server) = serve(vec![MockResponse::json(200, body)]);
+        let mut settings = config(url);
+        settings.timeout = Duration::from_secs(30);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let success = runtime.block_on(async {
+            let client = JevClient::new().unwrap();
+            let (_handle, signal) = CancelHandle::new();
+            client
+                .system_one_measured(&request(), &settings, &ApiKey::for_test("test"), signal)
+                .await
+                .unwrap()
+        });
+        assert_eq!(success.response.model, "jev-2026-09");
+        assert_eq!(success.measurement.response_bytes, MAX_RESPONSE_BYTES);
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
     /// Matches the live compact encoder for nested Unicode and mixed questions.
     #[test]
     fn counts_exact_compact_request_body_bytes() {
         let mut request = request();
         request.state = json!({"thread": ["Привет", "quote: \"hello\"", {"nested": true}]});
-        request.questions.insert(
+        Arc::make_mut(&mut request.questions).insert(
             "kind".into(),
             Question::Choice {
                 instructions: Some(json!({"task": "classify"})),
@@ -809,7 +1013,7 @@ mod tests {
                 ]),
             },
         );
-        request.questions.insert(
+        Arc::make_mut(&mut request.questions).insert(
             "urgency".into(),
             Question::Score {
                 instructions: Some(json!(["priority", "review"])),

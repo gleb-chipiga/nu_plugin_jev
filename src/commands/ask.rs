@@ -3,11 +3,9 @@
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{Example, LabeledError, PipelineData, Record, Signature, SyntaxShape, Value};
 
-use crate::{api::validate::parse_questions, plugin::JevPlugin};
+use crate::{api::validate::parse_questions, nu::typed::answers_to_nu, plugin::JevPlugin};
 
-use super::evaluate::{
-    Evaluation, evaluate, evaluation_meta, measurement_value, preview_value, to_nu,
-};
+use super::evaluate::{Evaluation, evaluate, evaluation_meta, measurement_value, preview_value};
 
 /// Sends one structured state and a nonempty question record to System One.
 pub(crate) struct JevAsk;
@@ -118,7 +116,10 @@ impl PluginCommand for JevAsk {
             Evaluation::Preview(request) => preview_value(request, call.head)?,
             Evaluation::Response(success) => {
                 let mut result = Record::with_capacity(if metrics { 3 } else { 2 });
-                result.push("answers", to_nu(&success.response.answers, call.head)?);
+                result.push(
+                    "answers",
+                    answers_to_nu(&success.response.answers, call.head)?,
+                );
                 result.push(
                     "meta",
                     evaluation_meta(&success.base_url, &success.response, call.head)?,

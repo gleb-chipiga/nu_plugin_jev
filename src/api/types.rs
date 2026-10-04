@@ -1,6 +1,6 @@
 //! Types the JSON bodies exchanged with the TypeSafe API.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
@@ -22,7 +22,7 @@ pub(crate) struct SystemOneRequest {
     /// The requested model name or alias.
     pub(crate) model: String,
     /// Named questions whose keys also identify returned answers.
-    pub(crate) questions: BTreeMap<String, Question>,
+    pub(crate) questions: Arc<BTreeMap<String, Question>>,
 }
 
 /// Describes one typed decision with instructions and criteria.

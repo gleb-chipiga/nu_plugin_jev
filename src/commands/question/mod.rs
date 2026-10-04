@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use nu_protocol::{LabeledError, Span, Value};
+use nu_protocol::{LabeledError, Value};
 use serde_json::Value as JsonValue;
 
 use crate::{
@@ -10,7 +10,7 @@ use crate::{
         types::{NoulCriteria, NoulDescriptions, Question},
         validate::validate_question,
     },
-    nu::value::{from_json, to_json},
+    nu::{typed::question_to_nu, value::to_json},
 };
 
 /// Constructs Choice questions from lists or named descriptions.
@@ -19,13 +19,6 @@ pub(crate) mod choice;
 pub(crate) mod noul;
 /// Constructs Score questions from ordered level descriptions.
 pub(crate) mod score;
-
-/// Converts one typed question to its ordinary Nu record representation.
-fn question_to_nu(question: Question, span: Span) -> Result<Value, LabeledError> {
-    let json = serde_json::to_value(question)
-        .map_err(|_| LabeledError::new("cannot encode Jev question"))?;
-    from_json(json, span)
-}
 
 /// Converts a description while leaving its root-shape validation to the contract layer.
 fn description(value: &Value) -> Result<JsonValue, LabeledError> {

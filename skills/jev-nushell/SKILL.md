@@ -58,6 +58,8 @@ jev models | get models | sort-by name | select name release_date
   network access. The listing accepts `--base-url`, `--timeout`, and `--config`
   but no evaluation model or table options. If a sandbox
   blocks access, report the call as unverified, not as an API failure.
+  A successful API response body larger than 16 MiB fails with a nonretryable
+  response error before JSON decoding; no partial answers are exposed.
 - `jev ask` returns `{answers, meta: {base_url, model, usage}}`;
   `jev annotate` adds answers under `answers` by default and always adds
   `jev_meta: {base_url, model, usage}` on success. Read `noul`, `choice`, or

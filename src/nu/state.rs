@@ -1,6 +1,6 @@
 //! Composes a selected pipeline value and optional explicit context into one Jev state.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use nu_protocol::{LabeledError, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -19,6 +19,20 @@ pub(crate) fn build_request(
     Ok(SystemOneRequest {
         state: compose_state(input, context)?,
         model,
+        questions: Arc::new(questions),
+    })
+}
+
+/// Builds a row request while sharing questions and a preconverted context.
+pub(crate) fn build_shared_request(
+    input: &Value,
+    context: Option<&JsonValue>,
+    model: &str,
+    questions: Arc<BTreeMap<String, Question>>,
+) -> Result<SystemOneRequest, LabeledError> {
+    Ok(SystemOneRequest {
+        state: compose_state_with_json_context(input, context)?,
+        model: model.to_owned(),
         questions,
     })
 }
@@ -29,15 +43,34 @@ pub(crate) fn compose_state(
     context: Option<&Value>,
 ) -> Result<JsonValue, LabeledError> {
     let input_json = to_json(input)?;
+    let context_json = context.map(to_json).transpose()?;
+    finalize_state(input_json, context_json, input.span())
+}
+
+/// Converts one row while cloning already-converted static context only.
+fn compose_state_with_json_context(
+    input: &Value,
+    context: Option<&JsonValue>,
+) -> Result<JsonValue, LabeledError> {
+    let input_json = to_json(input)?;
+    finalize_state(input_json, context.cloned(), input.span())
+}
+
+/// Wraps optional context after the selected input has passed conversion.
+fn finalize_state(
+    input_json: JsonValue,
+    context: Option<JsonValue>,
+    span: nu_protocol::Span,
+) -> Result<JsonValue, LabeledError> {
     let state = if let Some(context) = context {
         let mut wrapper = JsonMap::with_capacity(2);
         wrapper.insert("input".to_owned(), input_json);
-        wrapper.insert("context".to_owned(), to_json(context)?);
+        wrapper.insert("context".to_owned(), context);
         JsonValue::Object(wrapper)
     } else {
         input_json
     };
-    validate_state(&state, input.span())?;
+    validate_state(&state, span)?;
     Ok(state)
 }
 

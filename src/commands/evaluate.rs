@@ -13,7 +13,11 @@ use crate::{
     },
     config::{ConfigScope, capture_sources, require_api_key, resolve},
     error::JevError,
-    nu::{cache::next_request_id, state::build_request, value::from_json},
+    nu::{
+        cache::next_request_id,
+        state::build_request,
+        typed::{request_to_nu, usage_to_nu},
+    },
     plugin::JevPlugin,
     tracing::trace_evaluation,
 };
@@ -72,21 +76,11 @@ pub(crate) fn evaluate(
     Ok(Evaluation::Response(response))
 }
 
-/// Projects any serializable typed API value back into an ordinary Nu value.
-pub(crate) fn to_nu<T: serde::Serialize>(
-    value: T,
-    span: nu_protocol::Span,
-) -> Result<Value, LabeledError> {
-    let json =
-        serde_json::to_value(value).map_err(|_| LabeledError::new("cannot encode Jev result"))?;
-    from_json(json, span)
-}
-
 /// Wraps the exact outbound body with its compact UTF-8 JSON byte length.
 pub(crate) fn preview_value(request: SystemOneRequest, span: Span) -> Result<Value, LabeledError> {
     let request_bytes = request_body_bytes(&request).map_err(JevError::into_labeled)?;
     let mut preview = Record::with_capacity(2);
-    preview.push("request", to_nu(request, span)?);
+    preview.push("request", request_to_nu(request, span)?);
     preview.push("request_bytes", Value::int(request_bytes, span));
     Ok(Value::record(preview, span))
 }
@@ -100,7 +94,7 @@ pub(crate) fn evaluation_meta(
     let mut meta = Record::with_capacity(3);
     meta.push("base_url", Value::string(base_url, span));
     meta.push("model", Value::string(response.model.clone(), span));
-    meta.push("usage", to_nu(&response.usage, span)?);
+    meta.push("usage", usage_to_nu(&response.usage, span)?);
     Ok(Value::record(meta, span))
 }
 

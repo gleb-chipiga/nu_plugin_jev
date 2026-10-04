@@ -17,13 +17,15 @@ use crate::{
     config::{ConfigScope, capture_sources, require_api_key, resolve},
     error::{ErrorKind, JevError},
     nu::{
-        state::build_request,
+        state::{build_request, build_shared_request},
         stream::{RowBuilder, RowOutcome, StreamSetup, start},
+        typed::answers_to_nu,
+        value::to_json,
     },
     plugin::JevPlugin,
 };
 
-use super::evaluate::{evaluation_meta, measurement_value, preview_value, to_nu};
+use super::evaluate::{evaluation_meta, measurement_value, preview_value};
 
 /// Annotates each record row with answers from one named multi-question request.
 pub(crate) struct JevAnnotate;
@@ -370,6 +372,8 @@ fn request_builder(
 ) -> RowBuilder {
     let selector = options.selector.clone();
     let context = options.context.clone();
+    let prepared_context = context.as_ref().map(to_json).transpose().ok();
+    let questions = Arc::new(questions);
     let into = options.into.clone();
     let metrics = options.metrics;
     let on_error = options.on_error;
@@ -418,13 +422,23 @@ fn request_builder(
                 Value::record(projected, source.span())
             }
         };
-        build_request(
-            &selected,
-            context.as_ref(),
-            model.clone(),
-            questions.clone(),
-        )
-        .map_err(|error| JevError::new(ErrorKind::State, error.msg))
+        let request = if let Some(context_json) = &prepared_context {
+            build_shared_request(
+                &selected,
+                context_json.as_ref(),
+                &model,
+                Arc::clone(&questions),
+            )
+        } else {
+            // Keep the original per-row error order for invalid static context.
+            build_request(
+                &selected,
+                context.as_ref(),
+                model.clone(),
+                questions.as_ref().clone(),
+            )
+        };
+        request.map_err(|error| JevError::new(ErrorKind::State, error.msg))
     })
 }
 
@@ -439,7 +453,7 @@ fn annotate_outcome(outcome: RowOutcome, options: &TableOptions, span: Span) -> 
                 unreachable!("source row validated before HTTP")
             };
             let mut record = val.into_owned();
-            let answers = match to_nu(&shared.response.answers, span) {
+            let answers = match answers_to_nu(&shared.response.answers, span) {
                 Ok(value) => value,
                 Err(error) => return Value::error(ShellError::from(error), span),
             };
@@ -513,10 +527,12 @@ fn option_error(message: impl Into<String>) -> LabeledError {
 mod tests {
     use std::{
         collections::BTreeMap,
+        hint::black_box,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Instant,
     };
 
     use nu_plugin::PluginCommand;
@@ -525,7 +541,10 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        api::types::Question, commands::tests::serve, error::ErrorKind, nu::value::to_json,
+        api::{client::PreparedRequest, types::Question},
+        commands::tests::serve,
+        error::ErrorKind,
+        nu::value::to_json,
         plugin::JevPlugin,
     };
 
@@ -536,6 +555,193 @@ mod tests {
             .build()
             .expect("build test runtime");
         PluginTest::new("jev", JevPlugin::new(runtime).into()).map_err(Box::new)
+    }
+
+    /// Keeps exact bodies while reusing questions across independent rows.
+    #[test]
+    fn shared_row_builder_matches_legacy_bytes() {
+        let mut context = Record::new();
+        context.push(
+            "policy",
+            Value::test_list(vec![
+                Value::test_string("отвечай точно"),
+                Value::test_int(7),
+            ]),
+        );
+        let options = super::TableOptions {
+            selector: super::StateSelector::Whole,
+            context: Some(Value::test_record(context)),
+            into: "answers".into(),
+            metrics: false,
+            on_error: super::ErrorPolicy::Fail,
+            unordered: false,
+            dry_run: false,
+        };
+        let questions = BTreeMap::from([
+            (
+                "spam".into(),
+                Question::Noul {
+                    instructions: Some(json!({"task": "classify", "language": "ru"})),
+                    criteria: None,
+                },
+            ),
+            (
+                "kind".into(),
+                Question::Choice {
+                    instructions: Some(json!("Выбери тип")),
+                    criteria: BTreeMap::from([
+                        ("normal".into(), json!(null)),
+                        ("spam".into(), json!("Нежелательная рассылка")),
+                    ]),
+                },
+            ),
+        ]);
+        let build = super::request_builder(&options, "jev-latest".into(), questions.clone());
+        let rows = ["Привет", "Buy now"].map(|message| {
+            Value::test_record({
+                let mut record = Record::new();
+                record.push("message", Value::test_string(message));
+                record
+            })
+        });
+        let built = rows.map(|row| {
+            let legacy = super::build_request(
+                &row,
+                options.context.as_ref(),
+                "jev-latest".into(),
+                questions.clone(),
+            )
+            .unwrap();
+            let shared = build(&row).unwrap();
+            assert_eq!(
+                PreparedRequest::new(legacy).unwrap().body,
+                PreparedRequest::new(shared.clone()).unwrap().body
+            );
+            shared
+        });
+        assert!(Arc::ptr_eq(&built[0].questions, &built[1].questions));
+    }
+
+    /// Retains the input-before-context error order when static context is invalid.
+    #[test]
+    fn invalid_static_context_preserves_row_error_precedence() {
+        let mut context = Record::new();
+        context.push("context_bad", Value::test_binary(vec![1]));
+        let options = super::TableOptions {
+            selector: super::StateSelector::Whole,
+            context: Some(Value::test_record(context)),
+            into: "answers".into(),
+            metrics: false,
+            on_error: super::ErrorPolicy::Fail,
+            unordered: false,
+            dry_run: false,
+        };
+        let questions = BTreeMap::from([(
+            "q".into(),
+            Question::Noul {
+                instructions: None,
+                criteria: None,
+            },
+        )]);
+        let build = super::request_builder(&options, "jev-latest".into(), questions);
+        let mut invalid = Record::new();
+        invalid.push("input_bad", Value::test_binary(vec![2]));
+        let error = build(&Value::test_record(invalid)).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::State);
+        assert!(error.message.contains("$.input_bad"));
+        let mut valid = Record::new();
+        valid.push("message", Value::test_string("hello"));
+        let error = build(&Value::test_record(valid)).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::State);
+        assert!(error.message.contains("$.context_bad"));
+    }
+
+    /// Measures per-row construction and preparation with shared policy data.
+    #[test]
+    #[ignore = "manual local performance comparison"]
+    fn benchmark_row_preparation() {
+        for (label, count, context_bytes) in [("small", 3, 1024), ("large", 24, 8192)] {
+            let criteria = (0..6)
+                .map(|index| (format!("option_{index}"), json!(format!("Meaning {index}"))))
+                .collect::<BTreeMap<_, _>>();
+            let questions = (0..count)
+                .map(|index| {
+                    (
+                        format!("question_{index}"),
+                        Question::Choice {
+                            instructions: Some(json!("Categorize this message")),
+                            criteria: criteria.clone(),
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mut context = Record::new();
+            context.push("policy", Value::test_string("p".repeat(context_bytes)));
+            let options = super::TableOptions {
+                selector: super::StateSelector::Whole,
+                context: Some(Value::test_record(context)),
+                into: "answers".into(),
+                metrics: false,
+                on_error: super::ErrorPolicy::Fail,
+                unordered: false,
+                dry_run: false,
+            };
+            let build = super::request_builder(&options, "jev-latest".into(), questions.clone());
+            let mut record = Record::new();
+            record.push("message", Value::test_string("message ".repeat(32)));
+            let row = Value::test_record(record);
+            let legacy = || {
+                super::build_request(
+                    &row,
+                    options.context.as_ref(),
+                    "jev-latest".into(),
+                    questions.clone(),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                PreparedRequest::new(legacy()).unwrap().body,
+                PreparedRequest::new(build(&row).unwrap()).unwrap().body
+            );
+            let mut baseline_build_times = Vec::new();
+            let mut build_times = Vec::new();
+            let mut baseline_prepared_times = Vec::new();
+            let mut prepared_times = Vec::new();
+            for _ in 0..5 {
+                let started = Instant::now();
+                for _ in 0..1000 {
+                    black_box(legacy());
+                }
+                baseline_build_times.push(started.elapsed().as_nanos());
+                let started = Instant::now();
+                for _ in 0..1000 {
+                    black_box(build(black_box(&row)).unwrap());
+                }
+                build_times.push(started.elapsed().as_nanos());
+                let started = Instant::now();
+                for _ in 0..1000 {
+                    black_box(PreparedRequest::new(legacy()).unwrap().body.len());
+                }
+                baseline_prepared_times.push(started.elapsed().as_nanos());
+                let started = Instant::now();
+                for _ in 0..1000 {
+                    let request = build(black_box(&row)).unwrap();
+                    black_box(PreparedRequest::new(request).unwrap().body.len());
+                }
+                prepared_times.push(started.elapsed().as_nanos());
+            }
+            baseline_build_times.sort_unstable();
+            build_times.sort_unstable();
+            baseline_prepared_times.sort_unstable();
+            prepared_times.sort_unstable();
+            println!(
+                "{label}: baseline_build_ms={:.3}, optimized_build_ms={:.3}, baseline_prepared_ms={:.3}, optimized_prepared_ms={:.3}",
+                baseline_build_times[2] as f64 / 1_000_000.0,
+                build_times[2] as f64 / 1_000_000.0,
+                baseline_prepared_times[2] as f64 / 1_000_000.0,
+                prepared_times[2] as f64 / 1_000_000.0
+            );
+        }
     }
 
     /// Sends only projected literal fields and explicit context in every preview.

@@ -15,6 +15,9 @@ Notable changes to `nu_plugin_jev` are documented here.
 
 ### Changed
 
+- Share table questions and preconvert valid static context across rows.
+- Reject successful API response bodies larger than 16 MiB with a nonretryable
+  response error before JSON decoding, including chunked bodies.
 - Default `jev annotate` answers to the `answers` field, aligning row paths
   with `jev ask`; use `--into jev` to retain the former default path.
 - Wrap successful dry-run bodies as `{request, request_bytes}`; access former

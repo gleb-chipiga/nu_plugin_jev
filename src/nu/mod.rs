@@ -6,5 +6,7 @@ pub(crate) mod cache;
 pub(crate) mod state;
 /// Schedules bounded row evaluations and streams outcomes back to Nushell.
 pub(crate) mod stream;
+/// Projects typed API requests and answers into ordinary Nushell values.
+pub(crate) mod typed;
 /// Converts supported Nu values without stringifying structured data.
 pub(crate) mod value;

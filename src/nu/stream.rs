@@ -592,14 +592,16 @@ mod tests {
         Ok(SystemOneRequest {
             state: to_json(value).unwrap(),
             model: "jev-latest".into(),
-            questions: [(
-                "q".into(),
-                Question::Noul {
-                    instructions: None,
-                    criteria: None,
-                },
-            )]
-            .into(),
+            questions: Arc::new(
+                [(
+                    "q".into(),
+                    Question::Noul {
+                        instructions: None,
+                        criteria: None,
+                    },
+                )]
+                .into(),
+            ),
         })
     }
 

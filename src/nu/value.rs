@@ -9,7 +9,7 @@ pub(crate) fn to_json(value: &Value) -> Result<JsonValue, LabeledError> {
 }
 
 /// Converts one value while retaining a precise path for nested failures.
-fn to_json_at(value: &Value, path: String) -> Result<JsonValue, LabeledError> {
+pub(crate) fn to_json_at(value: &Value, path: String) -> Result<JsonValue, LabeledError> {
     match value {
         Value::String { val, .. } => Ok(JsonValue::String(val.clone())),
         Value::Int { val, .. } => Ok(JsonValue::Number((*val).into())),
@@ -50,24 +50,7 @@ pub(crate) fn from_json(value: JsonValue, span: Span) -> Result<Value, LabeledEr
         JsonValue::Null => Ok(Value::nothing(span)),
         JsonValue::Bool(value) => Ok(Value::bool(value, span)),
         JsonValue::String(value) => Ok(Value::string(value, span)),
-        JsonValue::Number(number) => {
-            if let Some(value) = number.as_i64() {
-                Ok(Value::int(value, span))
-            } else if number.is_u64() {
-                Err(LabeledError::new(format!(
-                    "JSON integer {number} exceeds Nushell's signed 64-bit range"
-                ))
-                .with_label("out-of-range API number", span))
-            } else {
-                number
-                    .as_f64()
-                    .map(|value| Value::float(value, span))
-                    .ok_or_else(|| {
-                        LabeledError::new("JSON number cannot be represented as a Nushell float")
-                            .with_label("unsupported API number", span)
-                    })
-            }
-        }
+        JsonValue::Number(number) => number_to_nu(&number, span),
         JsonValue::Array(values) => values
             .into_iter()
             .map(|value| from_json(value, span))
@@ -80,6 +63,48 @@ pub(crate) fn from_json(value: JsonValue, span: Span) -> Result<Value, LabeledEr
             }
             Ok(Value::record(record, span))
         }
+    }
+}
+
+/// Converts a borrowed JSON value without cloning its intermediate containers.
+pub(crate) fn from_json_ref(value: &JsonValue, span: Span) -> Result<Value, LabeledError> {
+    match value {
+        JsonValue::Null => Ok(Value::nothing(span)),
+        JsonValue::Bool(value) => Ok(Value::bool(*value, span)),
+        JsonValue::String(value) => Ok(Value::string(value, span)),
+        JsonValue::Number(number) => number_to_nu(number, span),
+        JsonValue::Array(values) => values
+            .iter()
+            .map(|value| from_json_ref(value, span))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| Value::list(values, span)),
+        JsonValue::Object(values) => {
+            let mut record = Record::with_capacity(values.len());
+            for (key, value) in values {
+                record.push(key.clone(), from_json_ref(value, span)?);
+            }
+            Ok(Value::record(record, span))
+        }
+    }
+}
+
+/// Preserves JSON integer bounds when projecting a number to Nu.
+fn number_to_nu(number: &JsonNumber, span: Span) -> Result<Value, LabeledError> {
+    if let Some(value) = number.as_i64() {
+        Ok(Value::int(value, span))
+    } else if number.is_u64() {
+        Err(LabeledError::new(format!(
+            "JSON integer {number} exceeds Nushell's signed 64-bit range"
+        ))
+        .with_label("out-of-range API number", span))
+    } else {
+        number
+            .as_f64()
+            .map(|value| Value::float(value, span))
+            .ok_or_else(|| {
+                LabeledError::new("JSON number cannot be represented as a Nushell float")
+                    .with_label("unsupported API number", span)
+            })
     }
 }
 
