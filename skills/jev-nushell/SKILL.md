@@ -78,6 +78,9 @@ jev models | get models | sort-by name | select name release_date
 - With `--on-error keep` or `record`, some rows lack answers. Check for an
   annotation before accessing nested answer fields. Nu declares `annotate`
   output as `list<any>` because `keep` can pass through non-record rows.
+  `record` adds `jev_error: {kind, message, status}`; only HTTP failures have a
+  numeric status. State paths are escaped and bounded; nested upstream Nu
+  error text is not copied into row diagnostics.
 - `NU_PLUGIN_JEV_LOG=info|debug` enables plugin-only text diagnostics.
   Third-party logs may contain secrets and are not automatically redacted.
   To enable them, select targets explicitly, for example

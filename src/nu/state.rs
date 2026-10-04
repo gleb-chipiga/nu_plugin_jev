@@ -5,9 +5,49 @@ use std::{collections::BTreeMap, sync::Arc};
 use nu_protocol::{LabeledError, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::api::types::{Question, SystemOneRequest};
+use crate::{
+    api::types::{Question, SystemOneRequest},
+    error::JevError,
+};
 
-use super::value::to_json;
+use super::value::{ValueConversionError, to_json_checked};
+
+/// Keeps state-construction failures typed until their output policy is known.
+#[derive(Debug)]
+pub(crate) enum StateBuildError {
+    /// A selected value cannot be represented in JSON.
+    Conversion(ValueConversionError),
+    /// The final top-level state is not a string, object, or array.
+    UnsupportedTopLevel(nu_protocol::Span),
+}
+
+impl StateBuildError {
+    /// Preserves precise Nu diagnostics for a single-state command.
+    pub(crate) fn into_labeled(self) -> LabeledError {
+        match self {
+            Self::Conversion(error) => error.into_labeled(),
+            Self::UnsupportedTopLevel(span) => {
+                LabeledError::new("Jev state must be a string, record, or list")
+                    .with_label("unsupported top-level state", span)
+            }
+        }
+    }
+
+    /// Produces a bounded row error without copying upstream Nu error text.
+    pub(crate) fn into_jev(self) -> JevError {
+        match self {
+            Self::Conversion(ValueConversionError::Invalid { kind, path, .. }) => {
+                JevError::StateConversion { kind, path }
+            }
+            Self::Conversion(ValueConversionError::Upstream(_)) => {
+                JevError::State("upstream Nushell value error")
+            }
+            Self::UnsupportedTopLevel(_) => {
+                JevError::State("Jev state must be a string, record, or list")
+            }
+        }
+    }
+}
 
 /// Builds the exact shared System One body from a selected Nu input.
 pub(crate) fn build_request(
@@ -15,7 +55,7 @@ pub(crate) fn build_request(
     context: Option<&Value>,
     model: String,
     questions: BTreeMap<String, Question>,
-) -> Result<SystemOneRequest, LabeledError> {
+) -> Result<SystemOneRequest, StateBuildError> {
     Ok(SystemOneRequest {
         state: compose_state(input, context)?,
         model,
@@ -29,7 +69,7 @@ pub(crate) fn build_shared_request(
     context: Option<&JsonValue>,
     model: &str,
     questions: Arc<BTreeMap<String, Question>>,
-) -> Result<SystemOneRequest, LabeledError> {
+) -> Result<SystemOneRequest, StateBuildError> {
     Ok(SystemOneRequest {
         state: compose_state_with_json_context(input, context)?,
         model: model.to_owned(),
@@ -41,9 +81,12 @@ pub(crate) fn build_shared_request(
 pub(crate) fn compose_state(
     input: &Value,
     context: Option<&Value>,
-) -> Result<JsonValue, LabeledError> {
-    let input_json = to_json(input)?;
-    let context_json = context.map(to_json).transpose()?;
+) -> Result<JsonValue, StateBuildError> {
+    let input_json = to_json_checked(input).map_err(StateBuildError::Conversion)?;
+    let context_json = context
+        .map(to_json_checked)
+        .transpose()
+        .map_err(StateBuildError::Conversion)?;
     finalize_state(input_json, context_json, input.span())
 }
 
@@ -51,8 +94,8 @@ pub(crate) fn compose_state(
 fn compose_state_with_json_context(
     input: &Value,
     context: Option<&JsonValue>,
-) -> Result<JsonValue, LabeledError> {
-    let input_json = to_json(input)?;
+) -> Result<JsonValue, StateBuildError> {
+    let input_json = to_json_checked(input).map_err(StateBuildError::Conversion)?;
     finalize_state(input_json, context.cloned(), input.span())
 }
 
@@ -61,7 +104,7 @@ fn finalize_state(
     input_json: JsonValue,
     context: Option<JsonValue>,
     span: nu_protocol::Span,
-) -> Result<JsonValue, LabeledError> {
+) -> Result<JsonValue, StateBuildError> {
     let state = if let Some(context) = context {
         let mut wrapper = JsonMap::with_capacity(2);
         wrapper.insert("input".to_owned(), input_json);
@@ -78,23 +121,20 @@ fn finalize_state(
 pub(crate) fn validate_state(
     state: &JsonValue,
     span: nu_protocol::Span,
-) -> Result<(), LabeledError> {
+) -> Result<(), StateBuildError> {
     if matches!(
         state,
         JsonValue::String(_) | JsonValue::Object(_) | JsonValue::Array(_)
     ) {
         Ok(())
     } else {
-        Err(
-            LabeledError::new("Jev state must be a string, record, or list")
-                .with_label("unsupported top-level state", span),
-        )
+        Err(StateBuildError::UnsupportedTopLevel(span))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use nu_protocol::{Record, Value};
+    use nu_protocol::{Record, ShellError, Span, Value};
     use serde_json::json;
 
     use crate::api::validate::parse_questions;
@@ -125,14 +165,35 @@ mod tests {
         duplicate.push("same", Value::test_int(2));
         let duplicate = Value::test_record(duplicate);
 
-        let state_error = compose_state(&duplicate, None).unwrap_err();
+        let state_error = compose_state(&duplicate, None).unwrap_err().into_labeled();
         assert!(state_error.msg.contains("duplicate record key"));
         assert!(state_error.msg.contains("$.same"));
 
-        let context_error =
-            compose_state(&Value::test_string("hello"), Some(&duplicate)).unwrap_err();
+        let context_error = compose_state(&Value::test_string("hello"), Some(&duplicate))
+            .unwrap_err()
+            .into_labeled();
         assert!(context_error.msg.contains("duplicate record key"));
         assert!(context_error.msg.contains("$.same"));
+    }
+
+    /// Retains native upstream errors for ask without copying them into row records.
+    #[test]
+    fn nested_upstream_error_is_redacted_for_table_rows() {
+        let secret = "private upstream diagnostic";
+        let nested = Value::error(
+            ShellError::from(nu_protocol::LabeledError::new(secret)),
+            Span::test_data(),
+        );
+        let mut row = Record::new();
+        row.push("nested", Value::test_list(vec![nested]));
+        let row = Value::test_record(row);
+        let labeled = compose_state(&row, None).unwrap_err().into_labeled();
+        assert_eq!(labeled.msg, secret);
+        let classified = compose_state(&row, None).unwrap_err().into_jev();
+        assert_eq!(classified.kind_name(), "state");
+        assert_eq!(classified.status(), None);
+        assert_eq!(classified.to_string(), "upstream Nushell value error");
+        assert!(!classified.to_labeled().msg.contains(secret));
     }
 
     /// Allows nested JSON scalars while excluding bare scalar states.

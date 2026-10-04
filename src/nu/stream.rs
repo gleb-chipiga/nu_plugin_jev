@@ -29,7 +29,7 @@ use crate::{
         types::{SystemOneRequest, SystemOneResponse},
     },
     config::{ApiKey, InvocationConfig},
-    error::{ErrorKind, JevError},
+    error::JevError,
 };
 
 use super::cache::{CompletedCache, RequestKey, SharedResponse, next_request_id};
@@ -158,7 +158,7 @@ pub(crate) fn start(
                 service_root,
             );
         })
-        .map_err(|_| JevError::new(ErrorKind::Transport, "cannot start Jev row producer"))?;
+        .map_err(|_| JevError::Transport("cannot start Jev row producer"))?;
     let supervisor_cancel = cancel.clone();
     runtime.spawn(async move {
         supervise(
@@ -446,11 +446,10 @@ async fn emit(
     fail_fast: bool,
     signal: &mut CancelSignal,
 ) -> bool {
-    let terminal = row
-        .result
-        .as_ref()
-        .err()
-        .is_some_and(|error| fail_fast || error.kind == ErrorKind::FieldCollision);
+    let terminal =
+        row.result.as_ref().err().is_some_and(|error| {
+            fail_fast || matches!(error.as_ref(), JevError::FieldCollision(_))
+        });
     if unordered || terminal {
         return send_or_cancel(output, row, signal).await && !terminal;
     }
@@ -514,10 +513,7 @@ mod tests {
         runtime().block_on(async {
             let (output, _receiver) = tokio::sync::mpsc::channel(1);
             let admission = Arc::new(tokio::sync::Semaphore::new(2));
-            let result = Err(Arc::new(crate::error::JevError::new(
-                crate::error::ErrorKind::State,
-                "test row failure",
-            )));
+            let result = Err(Arc::new(crate::error::JevError::State("test row failure")));
             let first = InputRow {
                 sequence: 0,
                 source: Value::test_int(0),
@@ -1060,10 +1056,7 @@ mod tests {
         let (base_url, server) = serve_delayed_one();
         let build = Box::new(|value: &Value| {
             if value.as_int().unwrap() == 1 {
-                Err(crate::error::JevError::new(
-                    crate::error::ErrorKind::State,
-                    "bad row",
-                ))
+                Err(crate::error::JevError::State("bad row"))
             } else {
                 build(value)
             }
@@ -1091,8 +1084,7 @@ mod tests {
         let (base_url, server) = serve_delayed_one();
         let build = Box::new(|value: &Value| {
             if value.as_int().unwrap() == 1 {
-                Err(crate::error::JevError::new(
-                    crate::error::ErrorKind::FieldCollision,
+                Err(crate::error::JevError::FieldCollision(
                     "Jev destination field already exists",
                 ))
             } else {
@@ -1112,10 +1104,10 @@ mod tests {
         .unwrap();
         let first = output.next().unwrap();
         assert_eq!(first.sequence, 1);
-        assert_eq!(
-            first.result.unwrap_err().kind,
-            crate::error::ErrorKind::FieldCollision
-        );
+        assert!(matches!(
+            first.result.unwrap_err().as_ref(),
+            crate::error::JevError::FieldCollision(_)
+        ));
         assert!(output.next().is_none());
         server.join().unwrap();
     }
@@ -1127,10 +1119,7 @@ mod tests {
         let (base_url, server) = serve(vec![good.clone(), good]);
         let build = Box::new(|value: &Value| {
             if value.as_int().unwrap() == 1 {
-                Err(crate::error::JevError::new(
-                    crate::error::ErrorKind::State,
-                    "bad row",
-                ))
+                Err(crate::error::JevError::State("bad row"))
             } else {
                 build(value)
             }

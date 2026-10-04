@@ -15,7 +15,7 @@ use crate::{
     error::JevError,
     nu::{
         cache::next_request_id,
-        state::build_request,
+        state::{StateBuildError, build_request},
         typed::{request_to_nu, usage_to_nu},
     },
     plugin::JevPlugin,
@@ -41,7 +41,8 @@ pub(crate) fn evaluate(
     let sources = capture_sources(engine, call, ConfigScope::Single)?;
     let config = resolve(&sources, ConfigScope::Single)?;
     let context = call.get_flag_value("context");
-    let request = build_request(state, context.as_ref(), config.model.clone(), questions)?;
+    let request = build_request(state, context.as_ref(), config.model.clone(), questions)
+        .map_err(StateBuildError::into_labeled)?;
     if call.has_flag("dry-run").map_err(LabeledError::from)? {
         return Ok(Evaluation::Preview(request));
     }

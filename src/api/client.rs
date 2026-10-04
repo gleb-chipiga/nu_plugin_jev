@@ -19,7 +19,7 @@ use tokio::time::Instant;
 
 use crate::{
     config::{ApiKey, InvocationConfig, ProxyPolicy, TransportConfig, TransportSettings},
-    error::{ErrorKind, JevError},
+    error::JevError,
 };
 
 use super::{
@@ -59,9 +59,10 @@ impl JevClientPool {
         if *policy == ProxyPolicy::Auto {
             return Ok(self.auto.clone());
         }
-        let mut alternate = self.alternate.lock().map_err(|_| {
-            JevError::new(ErrorKind::Transport, "Jev HTTP client pool is unavailable")
-        })?;
+        let mut alternate = self
+            .alternate
+            .lock()
+            .map_err(|_| JevError::Transport("Jev HTTP client pool is unavailable"))?;
         if let Some(client) = alternate.get(policy) {
             return Ok(client.clone());
         }
@@ -199,16 +200,15 @@ impl Write for CountingWriter {
 pub(crate) fn request_body_bytes(request: &SystemOneRequest) -> Result<i64, JevError> {
     let mut writer = CountingWriter { bytes: 0 };
     serde_json::to_writer(&mut writer, request)
-        .map_err(|_| JevError::new(ErrorKind::Validation, "cannot measure Jev request"))?;
-    i64::try_from(writer.bytes)
-        .map_err(|_| JevError::new(ErrorKind::Validation, "Jev request is too large"))
+        .map_err(|_| JevError::Validation("cannot measure Jev request"))?;
+    i64::try_from(writer.bytes).map_err(|_| JevError::Validation("Jev request is too large"))
 }
 
 /// Encodes a validated request without exposing its contents in errors.
 fn encode_request(request: &SystemOneRequest) -> Result<Bytes, JevError> {
     serde_json::to_vec(request)
         .map(Bytes::from)
-        .map_err(|_| JevError::new(ErrorKind::Validation, "cannot encode Jev request"))
+        .map_err(|_| JevError::Validation("cannot encode Jev request"))
 }
 
 impl JevClient {
@@ -226,15 +226,14 @@ impl JevClient {
             ProxyPolicy::Auto => builder,
             ProxyPolicy::Direct => builder.no_proxy(),
             ProxyPolicy::Explicit(url) => {
-                let proxy = reqwest::Proxy::all(url).map_err(|_| {
-                    JevError::new(ErrorKind::Validation, "cannot configure Jev proxy")
-                })?;
+                let proxy = reqwest::Proxy::all(url)
+                    .map_err(|_| JevError::Validation("cannot configure Jev proxy"))?;
                 builder.proxy(proxy)
             }
         };
-        let http = builder.build().map_err(|_| {
-            JevError::new(ErrorKind::Transport, "cannot initialize Jev HTTP client")
-        })?;
+        let http = builder
+            .build()
+            .map_err(|_| JevError::Transport("cannot initialize Jev HTTP client"))?;
         Ok(Self {
             http: Arc::new(http),
         })
@@ -308,19 +307,14 @@ impl JevClient {
     ) -> Result<MeasuredSuccess<SystemOneResponse>, JevError> {
         let pending: PendingSuccess<SystemOneResponse> =
             self.send_system_one(body, config, key, cancel).await?;
-        let invalid = || {
-            JevError::new(
-                ErrorKind::Response,
-                "Jev answer does not match the submitted questions",
-            )
-        };
+        let invalid = || JevError::Response("Jev answer does not match the submitted questions");
         let pending = if pending.response_bytes > 64 * 1024 || request.questions.len() > 64 {
             tokio::task::spawn_blocking(move || {
                 validate_response(&pending.response, &request.questions).map_err(|_| invalid())?;
                 Ok::<_, JevError>(pending)
             })
             .await
-            .map_err(|_| JevError::new(ErrorKind::Response, "cannot validate Jev response"))??
+            .map_err(|_| JevError::Response("cannot validate Jev response"))??
         } else {
             validate_response(&pending.response, &request.questions).map_err(|_| invalid())?;
             pending
@@ -374,10 +368,7 @@ impl JevClient {
         mut cancel: CancelSignal,
     ) -> Result<PendingSuccess<T>, JevError> {
         if cancel.is_cancelled() {
-            return Err(JevError::new(
-                ErrorKind::Cancelled,
-                "Jev invocation was cancelled",
-            ));
+            return Err(JevError::Cancelled);
         }
         let (root, timeout, retries) = config.transport();
         let url = match operation {
@@ -407,7 +398,7 @@ impl JevClient {
                 first_started.get_or_insert(attempt_started);
                 let response = request.send().await.map_err(|_| {
                     tracing::debug!(attempt = attempt_number, "Jev HTTP transport failed");
-                    JevError::new(ErrorKind::Transport, "Jev HTTP transport failed")
+                    JevError::Transport("Jev HTTP transport failed")
                 })?;
                 let status = response.status();
                 if let Some(server_request_id) =
@@ -433,17 +424,12 @@ impl JevClient {
                     let decoded = if response_bytes > 64 * 1024 {
                         tokio::task::spawn_blocking(move || serde_json::from_slice::<T>(&body))
                             .await
-                            .map_err(|_| {
-                                JevError::new(ErrorKind::Response, "cannot decode Jev response")
-                            })?
+                            .map_err(|_| JevError::Response("cannot decode Jev response"))?
                     } else {
                         serde_json::from_slice::<T>(&body)
                     }
                     .map_err(|_| {
-                        JevError::new(
-                            ErrorKind::Response,
-                            "Jev returned malformed JSON or missing fields",
-                        )
+                        JevError::Response("Jev returned malformed JSON or missing fields")
                     })?;
                     return Ok(PendingSuccess {
                         response: decoded,
@@ -461,8 +447,7 @@ impl JevClient {
                         .checked_add(delay)
                         .is_none_or(|next| next >= deadline)
                     {
-                        return Err(JevError::new(
-                            ErrorKind::Timeout,
+                        return Err(JevError::Timeout(
                             "Jev retry delay exceeds the evaluation deadline",
                         ));
                     }
@@ -476,7 +461,9 @@ impl JevClient {
                     tokio::time::sleep(delay).await;
                     continue;
                 }
-                return Err(JevError::http(status.as_u16()));
+                return Err(JevError::Http {
+                    status: status.as_u16(),
+                });
             }
             unreachable!("retry loop returns on success or terminal failure")
         };
@@ -484,16 +471,10 @@ impl JevClient {
         let timed_operation = tokio::time::timeout_at(deadline, task);
         futures::pin_mut!(cancelled, timed_operation);
         match select(cancelled, timed_operation).await {
-            Either::Left(((), _)) => Err(JevError::new(
-                ErrorKind::Cancelled,
-                "Jev invocation was cancelled",
-            )),
-            Either::Right((result, _)) => result.unwrap_or_else(|_| {
-                Err(JevError::new(
-                    ErrorKind::Timeout,
-                    "Jev evaluation deadline expired",
-                ))
-            }),
+            Either::Left(((), _)) => Err(JevError::Cancelled),
+            Either::Right((result, _)) => {
+                result.unwrap_or_else(|_| Err(JevError::Timeout("Jev evaluation deadline expired")))
+            }
         }
     }
 }
@@ -503,13 +484,8 @@ async fn read_success_body(
     mut response: reqwest::Response,
     limit: usize,
 ) -> Result<Bytes, JevError> {
-    let too_large = || {
-        JevError::new(
-            ErrorKind::Response,
-            format!("Jev response exceeds {limit} byte limit"),
-        )
-    };
-    let unreadable = || JevError::new(ErrorKind::Response, "Jev returned an unreadable response");
+    let too_large = || JevError::ResponseTooLarge { limit };
+    let unreadable = || JevError::Response("Jev returned an unreadable response");
     if response
         .content_length()
         .is_some_and(|size| size > limit as u64)
@@ -555,12 +531,9 @@ fn models_url(root: &Url) -> Result<Url, JevError> {
 /// Joins a fixed v1 endpoint without changing the caller-selected root.
 fn endpoint_url(root: &Url, endpoint: &str) -> Result<Url, JevError> {
     let mut url = root.clone();
-    let mut segments = url.path_segments_mut().map_err(|_| {
-        JevError::new(
-            ErrorKind::Validation,
-            "Jev service root cannot contain path segments",
-        )
-    })?;
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|_| JevError::Validation("Jev service root cannot contain path segments"))?;
     segments.pop_if_empty().push("v1").push(endpoint);
     drop(segments);
     Ok(url)
@@ -655,7 +628,7 @@ mod tests {
             types::{Question, SystemOneRequest},
         },
         config::{ApiKey, InvocationConfig, ProxyPolicy, TransportConfig},
-        error::{ErrorKind, JevError},
+        error::JevError,
         tracing::trace_evaluation,
     };
 
@@ -873,8 +846,8 @@ mod tests {
             runtime.block_on(async {
                 let response = Client::new().get(url).send().await.unwrap();
                 let error = read_success_body(response, 64).await.unwrap_err();
-                assert_eq!(error.kind, ErrorKind::Response);
-                assert!(error.message.contains("64 byte limit"));
+                assert_eq!(error.kind_name(), "response");
+                assert!(error.to_string().contains("64 byte limit"));
             });
             server.join().unwrap();
         }
@@ -928,9 +901,9 @@ mod tests {
                         .unwrap_err()
                 }
             });
-            assert_eq!(error.kind, ErrorKind::Response);
+            assert_eq!(error.kind_name(), "response");
             assert_eq!(
-                error.message,
+                error.to_string(),
                 format!("Jev response exceeds {MAX_RESPONSE_BYTES} byte limit")
             );
             assert_eq!(server.join().unwrap().len(), 1);
@@ -962,9 +935,9 @@ mod tests {
                 .await
                 .unwrap_err()
         });
-        assert_eq!(error.kind, ErrorKind::Response);
+        assert_eq!(error.kind_name(), "response");
         assert_eq!(
-            error.message,
+            error.to_string(),
             format!("Jev response exceeds {MAX_RESPONSE_BYTES} byte limit")
         );
         assert_eq!(server.join().unwrap().len(), 1);
@@ -1297,7 +1270,7 @@ mod tests {
                 .models(&config, &ApiKey::for_test("secret"), signal)
                 .await
                 .unwrap_err();
-            assert_eq!(error.kind, ErrorKind::Timeout);
+            assert_eq!(error.kind_name(), "timeout");
         });
         server.join().unwrap();
         let (url, server) = serve(vec![MockResponse {
@@ -1321,7 +1294,7 @@ mod tests {
                 }
                 futures::future::Either::Right(((), _)) => handle.cancel(),
             }
-            assert_eq!(request.await.unwrap_err().kind, ErrorKind::Cancelled);
+            assert!(matches!(request.await.unwrap_err(), JevError::Cancelled));
         });
         server.join().unwrap();
     }
@@ -1478,8 +1451,8 @@ mod tests {
                     .system_one(&request(), &config, &ApiKey::for_test("test"), signal)
                     .await
                     .unwrap_err();
-                assert_eq!(error.kind, ErrorKind::Http);
-                assert_eq!(error.status, Some(status));
+                assert_eq!(error.kind_name(), "http");
+                assert_eq!(error.status(), Some(status));
             });
             assert_eq!(server.join().unwrap().len(), 1);
         }
@@ -1551,7 +1524,7 @@ mod tests {
                 .system_one(&request(), &config(url), &ApiKey::for_test("test"), signal)
                 .await
                 .unwrap_err();
-            assert_eq!(error.status, Some(302));
+            assert_eq!(error.status(), Some(302));
         });
         assert_eq!(server.join().unwrap().len(), 1);
     }
@@ -1578,7 +1551,7 @@ mod tests {
                 .system_one(&request(), &config, &ApiKey::for_test("test"), signal)
                 .await
                 .unwrap_err();
-            assert_eq!(error.kind, ErrorKind::Timeout);
+            assert_eq!(error.kind_name(), "timeout");
         });
         assert_eq!(server.join().unwrap().len(), 1);
     }
@@ -1605,7 +1578,7 @@ mod tests {
                 .system_one(&request(), &config, &ApiKey::for_test("test"), signal)
                 .await
                 .unwrap_err();
-            assert_eq!(error.kind, ErrorKind::Timeout);
+            assert_eq!(error.kind_name(), "timeout");
         });
         assert_eq!(server.join().unwrap().len(), 1);
     }
@@ -1632,7 +1605,7 @@ mod tests {
                 .system_one(&request(), &config(url), &ApiKey::for_test("test"), signal)
                 .await
                 .unwrap_err();
-            assert_eq!(error.kind, ErrorKind::Cancelled);
+            assert_eq!(error.kind_name(), "cancelled");
         });
         assert!(started.elapsed() < Duration::from_millis(250));
         assert_eq!(server.join().unwrap().len(), 1);
@@ -1658,7 +1631,7 @@ mod tests {
                 .system_one(&request(), &config, &ApiKey::for_test("test"), signal)
                 .await
                 .unwrap_err();
-            assert_eq!(error.status, Some(503));
+            assert_eq!(error.status(), Some(503));
         });
         assert_eq!(server.join().unwrap().len(), 4);
 
@@ -1670,7 +1643,7 @@ mod tests {
                 .system_one(&request(), &config(url), &ApiKey::for_test("test"), signal)
                 .await
                 .unwrap_err();
-            assert_eq!(error.status, Some(503));
+            assert_eq!(error.status(), Some(503));
         });
         assert_eq!(server.join().unwrap().len(), 1);
     }
@@ -1731,8 +1704,8 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            assert_eq!(error.kind, ErrorKind::Response);
-            assert_eq!(error.status, None);
+            assert_eq!(error.kind_name(), "response");
+            assert_eq!(error.status(), None);
             assert!(!error.to_string().contains("caller-secret"));
             assert!(!error.to_string().contains("message"));
         });
@@ -1748,7 +1721,7 @@ mod tests {
                 .system_one(&request(), &config(url), &ApiKey::for_test("test"), signal)
                 .await
                 .unwrap_err();
-            assert_eq!(error.kind, ErrorKind::Response);
+            assert_eq!(error.kind_name(), "response");
         });
         assert_eq!(server.join().unwrap().len(), 1);
 
@@ -1764,7 +1737,7 @@ mod tests {
                 .system_one(&request(), &config(url), &ApiKey::for_test("test"), signal)
                 .await
                 .unwrap_err();
-            assert_eq!(error.kind, ErrorKind::Response);
+            assert_eq!(error.kind_name(), "response");
         });
         assert_eq!(server.join().unwrap().len(), 1);
     }
@@ -1796,7 +1769,7 @@ mod tests {
                 .system_one(&request(), &config, &ApiKey::for_test("test"), signal)
                 .await
                 .unwrap_err();
-            assert_eq!(error.kind, ErrorKind::Cancelled);
+            assert_eq!(error.kind_name(), "cancelled");
         });
         assert!(started.elapsed() < Duration::from_millis(250));
         assert_eq!(server.join().unwrap().len(), 1);
@@ -1846,9 +1819,14 @@ mod tests {
                     .await
                     .is_ok()
                 );
-                let failure =
-                    trace_evaluation("ask", "jev-failed", async { Err(JevError::http(401)) }).await;
-                assert_eq!(failure.err().expect("failed evaluation").status, Some(401));
+                let failure = trace_evaluation("ask", "jev-failed", async {
+                    Err(JevError::Http { status: 401 })
+                })
+                .await;
+                assert_eq!(
+                    failure.err().expect("failed evaluation").status(),
+                    Some(401)
+                );
             });
         });
         drop(guard);
@@ -2254,7 +2232,7 @@ mod tests {
                 .system_one(&request(), &config(url), &ApiKey::for_test("test"), signal)
                 .await
                 .unwrap_err();
-            assert_eq!(error.kind, ErrorKind::Transport);
+            assert_eq!(error.kind_name(), "transport");
         });
         let (alpn, count) = server.join().unwrap();
         assert_eq!(alpn, b"h2");
@@ -2283,7 +2261,7 @@ mod tests {
                 .system_one(&request(), &settings, &ApiKey::for_test("test"), signal)
                 .await
                 .unwrap_err();
-            assert_eq!(error.kind, ErrorKind::Transport);
+            assert_eq!(error.kind_name(), "transport");
             assert!(!error.to_string().contains("proxy-secret"));
             assert!(!format!("{settings:?}").contains("proxy-secret"));
         });

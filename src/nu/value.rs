@@ -3,13 +3,51 @@
 use nu_protocol::{LabeledError, Record, Span, Value};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
+use crate::error::DiagnosticPath;
+
+/// Distinguishes known conversion failures from arbitrary upstream Nu errors.
+#[derive(Debug)]
+pub(crate) enum ValueConversionError {
+    /// A value or record key cannot be represented as JSON.
+    Invalid {
+        kind: &'static str,
+        path: DiagnosticPath,
+        span: Span,
+    },
+    /// A nested Nu error is propagated unchanged outside table row records.
+    Upstream(LabeledError),
+}
+
+impl ValueConversionError {
+    /// Produces the existing labeled Nu conversion diagnostic.
+    pub(crate) fn into_labeled(self) -> LabeledError {
+        match self {
+            Self::Invalid { kind, path, span } => {
+                LabeledError::new(format!("cannot convert {kind} at {path} to Jev JSON"))
+                    .with_label("unsupported Jev state value", span)
+            }
+            Self::Upstream(error) => error,
+        }
+    }
+}
+
 /// Converts one Nu value recursively, reporting the path of unsupported values.
 pub(crate) fn to_json(value: &Value) -> Result<JsonValue, LabeledError> {
-    to_json_at(value, "$".to_owned())
+    to_json_checked(value).map_err(ValueConversionError::into_labeled)
+}
+
+/// Converts a value while retaining a typed failure for safe table diagnostics.
+pub(crate) fn to_json_checked(value: &Value) -> Result<JsonValue, ValueConversionError> {
+    to_json_at_checked(value, "$".to_owned())
 }
 
 /// Converts one value while retaining a precise path for nested failures.
 pub(crate) fn to_json_at(value: &Value, path: String) -> Result<JsonValue, LabeledError> {
+    to_json_at_checked(value, path).map_err(ValueConversionError::into_labeled)
+}
+
+/// Recurses with structured failures that can be safely classified by callers.
+fn to_json_at_checked(value: &Value, path: String) -> Result<JsonValue, ValueConversionError> {
     match value {
         Value::String { val, .. } => Ok(JsonValue::String(val.clone())),
         Value::Int { val, .. } => Ok(JsonValue::Number((*val).into())),
@@ -24,7 +62,7 @@ pub(crate) fn to_json_at(value: &Value, path: String) -> Result<JsonValue, Label
         Value::List { vals, .. } => vals
             .iter()
             .enumerate()
-            .map(|(index, item)| to_json_at(item, format!("{path}[{index}]")))
+            .map(|(index, item)| to_json_at_checked(item, format!("{path}[{index}]")))
             .collect::<Result<Vec<_>, _>>()
             .map(JsonValue::Array),
         Value::Record { val, .. } => val
@@ -40,12 +78,14 @@ pub(crate) fn to_json_at(value: &Value, path: String) -> Result<JsonValue, Label
                             item.span(),
                         ));
                     }
-                    object.insert(key.clone(), to_json_at(item, item_path)?);
+                    object.insert(key.clone(), to_json_at_checked(item, item_path)?);
                     Ok(object)
                 },
             )
             .map(JsonValue::Object),
-        Value::Error { error, .. } => Err(LabeledError::from((**error).clone())),
+        Value::Error { error, .. } => Err(ValueConversionError::Upstream(LabeledError::from(
+            (**error).clone(),
+        ))),
         Value::Binary { .. } => Err(conversion_error(&path, "binary", value.span())),
         Value::Closure { .. } => Err(conversion_error(&path, "closure", value.span())),
         Value::Range { .. } => Err(conversion_error(&path, "range", value.span())),
@@ -120,9 +160,12 @@ fn number_to_nu(number: &JsonNumber, span: Span) -> Result<Value, LabeledError> 
 }
 
 /// Produces a labeled conversion error without leaking the unsupported value.
-fn conversion_error(path: &str, kind: &str, span: Span) -> LabeledError {
-    LabeledError::new(format!("cannot convert {kind} at {path} to Jev JSON"))
-        .with_label("unsupported Jev state value", span)
+fn conversion_error(path: &str, kind: &'static str, span: Span) -> ValueConversionError {
+    ValueConversionError::Invalid {
+        kind,
+        path: DiagnosticPath::new(path),
+        span,
+    }
 }
 
 #[cfg(test)]

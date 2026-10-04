@@ -24,7 +24,7 @@ use crate::{
         client::MeasuredSuccess,
         types::{ModelMetadataList, SystemOneResponse},
     },
-    error::{ErrorKind, JevError},
+    error::JevError,
 };
 
 /// Holds an explicit process-wide target filter and the log-bridge ceiling.
@@ -219,13 +219,13 @@ where
                 http_version = success.measurement.http_version_name(),
                 "model listing completed"
             ),
-            Err(error) if error.kind == ErrorKind::Cancelled => {
+            Err(JevError::Cancelled) => {
                 ::tracing::debug!(duration_ms, "model listing cancelled");
             }
             Err(error) => ::tracing::warn!(
                 duration_ms,
-                kind = error.kind.as_str(),
-                status = ?error.status,
+                kind = error.kind_name(),
+                status = ?error.status(),
                 "model listing failed"
             ),
         }
@@ -265,13 +265,13 @@ where
                 http_version = success.measurement.http_version_name(),
                 "evaluation completed"
             ),
-            Err(error) if error.kind == ErrorKind::Cancelled => {
+            Err(JevError::Cancelled) => {
                 ::tracing::debug!(duration_ms, "evaluation cancelled");
             }
             Err(error) => ::tracing::warn!(
                 duration_ms,
-                kind = error.kind.as_str(),
-                status = ?error.status,
+                kind = error.kind_name(),
+                status = ?error.status(),
                 "evaluation failed"
             ),
         }

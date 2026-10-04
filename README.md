@@ -137,8 +137,11 @@ Useful options:
 | `--jobs 32` | Limit concurrent distinct evaluations; default is 16. |
 | `--unordered` | Emit ready rows without waiting for earlier slow rows. |
 | `--on-error keep` | Pass a failed row through without an annotation. |
-| `--on-error record` | Add a `jev_error` record to a failed row. |
+| `--on-error record` | Add `jev_error: {kind, message, status}` to a failed row; only HTTP errors have a numeric status. |
 | `--dry-run` | Stream `{request, request_bytes}` previews without a key or network call. |
+
+State-error paths in `jev_error` are escaped and limited in length. Nested
+upstream Nu error text is not copied into a row diagnostic.
 
 The default error mode is `fail`. Successful duplicates can share an
 in-progress request or a bounded, per-invocation cache. Eviction permits a

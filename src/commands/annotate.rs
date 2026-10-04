@@ -15,7 +15,7 @@ use nu_protocol::{
 use crate::{
     api::{cancel::CancelHandle, types::Question},
     config::{ConfigScope, capture_sources, require_api_key, resolve},
-    error::{ErrorKind, JevError},
+    error::JevError,
     nu::{
         state::{build_request, build_shared_request},
         stream::{RowBuilder, RowOutcome, StreamSetup, start},
@@ -252,7 +252,7 @@ fn preview_rows(
         Some(match build(&row) {
             Ok(request) => preview_value(request, span)
                 .unwrap_or_else(|error| Value::error(ShellError::from(error), span)),
-            Err(error) if error.kind == ErrorKind::FieldCollision => {
+            Err(error) if matches!(&error, JevError::FieldCollision(_)) => {
                 stopped = true;
                 error_value(&error, span)
             }
@@ -380,24 +380,17 @@ fn request_builder(
     let on_error = options.on_error;
     Box::new(move |source| {
         if matches!(source, Value::Error { .. }) {
-            return Err(JevError::new(
-                ErrorKind::State,
-                "upstream Nushell row error",
-            ));
+            return Err(JevError::State("upstream Nushell row error"));
         }
         let Value::Record { val, .. } = source else {
-            return Err(JevError::new(
-                ErrorKind::State,
-                "jev annotate requires record rows",
-            ));
+            return Err(JevError::State("jev annotate requires record rows"));
         };
         if val.contains(&into)
             || val.contains("jev_meta")
             || (metrics && val.contains("jev_metrics"))
             || (on_error == ErrorPolicy::Record && val.contains("jev_error"))
         {
-            return Err(JevError::new(
-                ErrorKind::FieldCollision,
+            return Err(JevError::FieldCollision(
                 "Jev destination field already exists",
             ));
         }
@@ -405,19 +398,12 @@ fn request_builder(
             StateSelector::Whole => source.clone(),
             StateSelector::Cell(path) => source
                 .follow_cell_path(&path.members)
-                .map_err(|_| {
-                    JevError::new(ErrorKind::State, "selected Jev state cell path is missing")
-                })?
+                .map_err(|_| JevError::State("selected Jev state cell path is missing"))?
                 .into_owned(),
             StateSelector::Fields(names) => {
                 let mut projected = Record::with_capacity(names.len());
                 for name in names {
-                    let value = val.get(name).ok_or_else(|| {
-                        JevError::new(
-                            ErrorKind::State,
-                            format!("selected Jev field {name:?} is missing"),
-                        )
-                    })?;
+                    let value = val.get(name).ok_or_else(|| JevError::missing_field(name))?;
                     projected.push(name.clone(), value.clone());
                 }
                 Value::record(projected, source.span())
@@ -439,7 +425,7 @@ fn request_builder(
                 questions.as_ref().clone(),
             )
         };
-        request.map_err(|error| JevError::new(ErrorKind::State, error.msg))
+        request.map_err(crate::nu::state::StateBuildError::into_jev)
     })
 }
 
@@ -474,7 +460,7 @@ fn annotate_outcome(outcome: RowOutcome, options: &TableOptions, span: Span) -> 
             }
             Value::record(record, internal_span)
         }
-        Err(error) if error.kind == ErrorKind::FieldCollision => error_value(&error, span),
+        Err(error) if matches!(&*error, JevError::FieldCollision(_)) => error_value(&error, span),
         Err(error) => match options.on_error {
             ErrorPolicy::Fail => error_value(&error, span),
             ErrorPolicy::Keep => outcome.source,
@@ -485,9 +471,7 @@ fn annotate_outcome(outcome: RowOutcome, options: &TableOptions, span: Span) -> 
 
 /// Converts one classified failure to a native pipeline error value.
 fn error_value(error: &JevError, span: Span) -> Value {
-    let labeled =
-        LabeledError::new(error.message.clone()).with_code(format!("jev::{}", error.kind.as_str()));
-    Value::error(ShellError::from(labeled), span)
+    Value::error(ShellError::from(error.to_labeled()), span)
 }
 
 /// Preserves the source row and appends a structured classified failure.
@@ -500,17 +484,17 @@ fn add_error(row: Value, error: &JevError, span: Span) -> Value {
     };
     if val.contains("jev_error") {
         return error_value(
-            &JevError::new(ErrorKind::FieldCollision, "Jev error field already exists"),
+            &JevError::FieldCollision("Jev error field already exists"),
             span,
         );
     }
     let mut source = val.into_owned();
     let mut details = Record::with_capacity(3);
-    details.push("kind", Value::string(error.kind.as_str(), span));
-    details.push("message", Value::string(error.message.clone(), span));
+    details.push("kind", Value::string(error.kind_name(), span));
+    details.push("message", Value::string(error.to_string(), span));
     details.push(
         "status",
-        error.status.map_or_else(
+        error.status().map_or_else(
             || Value::nothing(span),
             |status| Value::int(i64::from(status), span),
         ),
@@ -544,7 +528,7 @@ mod tests {
     use crate::{
         api::{client::PreparedRequest, types::Question},
         commands::tests::serve,
-        error::ErrorKind,
+        error::JevError,
         nu::value::to_json,
         plugin::JevPlugin,
     };
@@ -648,13 +632,13 @@ mod tests {
         let mut invalid = Record::new();
         invalid.push("input_bad", Value::test_binary(vec![2]));
         let error = build(&Value::test_record(invalid)).unwrap_err();
-        assert_eq!(error.kind, ErrorKind::State);
-        assert!(error.message.contains("$.input_bad"));
+        assert_eq!(error.kind_name(), "state");
+        assert!(error.to_string().contains("$.input_bad"));
         let mut valid = Record::new();
         valid.push("message", Value::test_string("hello"));
         let error = build(&Value::test_record(valid)).unwrap_err();
-        assert_eq!(error.kind, ErrorKind::State);
-        assert!(error.message.contains("$.context_bad"));
+        assert_eq!(error.kind_name(), "state");
+        assert!(error.to_string().contains("$.context_bad"));
     }
 
     /// Measures per-row construction and preparation with shared policy data.
@@ -974,7 +958,7 @@ mod tests {
             &Value::record(source, span),
         )
         .unwrap_err();
-        assert_eq!(error.kind, ErrorKind::FieldCollision);
+        assert!(matches!(error, JevError::FieldCollision(_)));
     }
 
     /// Preserves failed source rows or adds a classified record without sending HTTP.
@@ -1306,7 +1290,7 @@ mod tests {
         });
         let wire = to_json(&super::add_error(
             row,
-            &crate::error::JevError::http(422),
+            &JevError::Http { status: 422 },
             Span::test_data(),
         ))
         .unwrap();
@@ -1336,14 +1320,14 @@ mod tests {
         .unwrap();
         let builder = super::request_builder(&options, "jev-latest".into(), questions);
         let nonrecord = builder(&Value::test_int(3)).unwrap_err();
-        assert_eq!(nonrecord.kind, crate::error::ErrorKind::State);
+        assert_eq!(nonrecord.kind_name(), "state");
         let upstream = Value::error(
             ShellError::from(nu_protocol::LabeledError::new("upstream")),
             Span::test_data(),
         );
         let error = builder(&upstream).unwrap_err();
-        assert_eq!(error.kind, crate::error::ErrorKind::State);
-        assert_eq!(error.message, "upstream Nushell row error");
+        assert_eq!(error.kind_name(), "state");
+        assert_eq!(error.to_string(), "upstream Nushell row error");
     }
 
     /// Keeps every documented help example executable without a credential.
