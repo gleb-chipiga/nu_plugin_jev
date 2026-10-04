@@ -74,13 +74,24 @@ impl PluginCommand for JevAsk {
 
     /// Explains that a stream is intentionally collected as one array state.
     fn extra_description(&self) -> &str {
-        "A finite input stream becomes one JSON array state and one API request. Live success returns {answers, meta: {base_url, model, usage}}; --metrics adds HTTP-only metrics. --context wraps the state as {input, context}; --dry-run returns {request, request_bytes} without an API key. The byte count covers only the compact JSON body. Defaults are resolved per call from flags, Nu config, caller environment, selected local TOML (--config or NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.toml), user TOML, then built-ins."
+        concat!(
+            "A finite input stream becomes one JSON array state and one API request. ",
+            "Live success returns {answers, meta: {base_url, model, usage}}; ",
+            "--metrics adds HTTP-only metrics. --context wraps the state as {input, context}; ",
+            "--dry-run returns {request, request_bytes} without an API key. ",
+            "The byte count covers only the compact JSON body. Defaults are resolved per call ",
+            "from flags, Nu config, caller environment, selected local TOML (--config or ",
+            "NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.toml), user TOML, then built-ins."
+        )
     }
 
     /// Shows the ordinary one-state usage.
     fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
-            example: "'hello' | jev ask {greeting: (jev question noul 'Is this a greeting?')} -c {policy: 'greetings'} -m jev-latest --dry-run",
+            example: concat!(
+                "'hello' | jev ask {greeting: (jev question noul 'Is this a greeting?')} ",
+                "-c {policy: 'greetings'} -m jev-latest --dry-run"
+            ),
             description: "Preview a named Noul question without sending data",
             result: None,
         }]
@@ -174,14 +185,24 @@ mod tests {
     fn preview_mixed_questions_and_context() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
         let result = test
-            .eval("{message: 'hello'} | jev ask {spam: {type: noul, instructions: {task: 'spam'}, criteria: {'true': null}}, kind: {type: choice, criteria: {normal: null, spam: 'bulk'}}, urgency: {type: score, criteria: ['later' 'now']}} --context null --dry-run")?
+            .eval(concat!(
+                "{message: 'hello'} | jev ask {spam: {type: noul, ",
+                "instructions: {task: 'spam'}, criteria: {'true': null}}, ",
+                "kind: {type: choice, criteria: {normal: null, spam: 'bulk'}}, ",
+                "urgency: {type: score, criteria: ['later' 'now']}} ",
+                "--context null --dry-run"
+            ))?
             .into_value(Span::test_data())?;
         let preview = to_json(&result).unwrap();
         assert_eq!(
             preview["request"],
             json!({"model": "jev-latest", "state": {"input": {"message": "hello"}, "context": null},
             "questions": {
-                "spam": {"type": "noul", "instructions": {"task": "spam"}, "criteria": {"true": null}},
+                "spam": {
+                    "type": "noul",
+                    "instructions": {"task": "spam"},
+                    "criteria": {"true": null}
+                },
                 "kind": {"type": "choice", "criteria": {"normal": null, "spam": "bulk"}},
                 "urgency": {"type": "score", "criteria": ["later", "now"]}
             }})
@@ -213,7 +234,10 @@ mod tests {
             "usage": {"input_tokens": 8, "output_tokens": 1}});
         let (base_url, server) = serve(vec![response]);
         let mut test = plugin_test()?;
-        let setup = "$env.NU_PLUGIN_JEV_MODEL = 'env-model'; $env.config.plugins.jev = {model: 'config-model'};";
+        let setup = concat!(
+            "$env.NU_PLUGIN_JEV_MODEL = 'env-model'; ",
+            "$env.config.plugins.jev = {model: 'config-model'};"
+        );
         let common = format!("'hello' | jev ask {{q: {{type: noul}}}} --base-url '{base_url}'");
         let long = test
             .eval(&format!(
@@ -230,7 +254,12 @@ mod tests {
 
         let live = test
             .eval(&format!(
-                "{setup} $env.TYPESAFE_API_KEY = 'local'; {common} -c {{policy: 'greetings'}} -m flag-model"
+                concat!(
+                    "{setup} $env.TYPESAFE_API_KEY = 'local'; {common} ",
+                    "-c {{policy: 'greetings'}} -m flag-model"
+                ),
+                setup = setup,
+                common = common
             ))?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&live).unwrap()["answers"]["q"]["noul"], 0.75);
@@ -325,7 +354,11 @@ $result
     /// Keeps provenance always visible and reports HTTP-only metrics on request.
     #[test]
     fn live_metrics_match_preview_bytes_and_use_nu_durations() -> Result<(), Box<ShellError>> {
-        let response = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 4, "output_tokens": 1}});
+        let response = json!({
+            "model": "jev-fixed",
+            "answers": {"q": {"type": "noul", "noul": 0.75}},
+            "usage": {"input_tokens": 4, "output_tokens": 1}
+        });
         let response_bytes = response.to_string().len();
         let (base_url, server) = serve(vec![response]);
         let mut test = plugin_test()?;
@@ -333,7 +366,15 @@ $result
         let preview = test
             .eval(&format!("'hello' | jev ask {question} --dry-run"))?
             .into_value(Span::test_data())?;
-        let live = test.eval(&format!("$env.TYPESAFE_API_KEY = 'local-key'; 'hello' | jev ask {question} --metrics --base-url '{base_url}'"))?
+        let live = test
+            .eval(&format!(
+                concat!(
+                    "$env.TYPESAFE_API_KEY = 'local-key'; 'hello' | jev ask {question} ",
+                    "--metrics --base-url '{base_url}'"
+                ),
+                question = question,
+                base_url = base_url
+            ))?
             .into_value(Span::test_data())?;
         let Value::Record { val, .. } = &live else {
             panic!("ask result is a record");
@@ -380,7 +421,12 @@ $result
             "usage": {"input_tokens": 8, "output_tokens": 1}})]);
         let mut test = plugin_test()?;
         let common = format!(
-            "{{message: 'hello'}} | jev ask {{match: {{type: noul, instructions: {{task: 'judge'}}, criteria: {{'true': null}}}}}} --context {{policy: ['first' 'second']}} --base-url '{base_url}'"
+            concat!(
+                "{{message: 'hello'}} | jev ask {{match: {{type: noul, ",
+                "instructions: {{task: 'judge'}}, criteria: {{'true': null}}}}}} ",
+                "--context {{policy: ['first' 'second']}} --base-url '{base_url}'"
+            ),
+            base_url = base_url
         );
         let preview = test
             .eval(&format!("{common} --dry-run"))?
@@ -443,9 +489,19 @@ $result
             "http://localhost:1/v1/systemone"
         );
 
-        let preview = test.eval("$env.NU_PLUGIN_JEV_PROXY = 'http://user:secret@127.0.0.1:1'; 'hello' | jev ask {match: {type: noul}} --dry-run")?.into_value(Span::test_data())?;
+        let preview = test
+            .eval(concat!(
+                "$env.NU_PLUGIN_JEV_PROXY = 'http://user:secret@127.0.0.1:1'; ",
+                "'hello' | jev ask {match: {type: noul}} --dry-run"
+            ))?
+            .into_value(Span::test_data())?;
         assert!(!to_json(&preview).unwrap().to_string().contains("secret"));
-        let failure = test.eval("$env.NU_PLUGIN_JEV_PROXY = 'http://user:secret@127.0.0.1:1/path'; 'hello' | jev ask {match: {type: noul}} --dry-run").unwrap_err();
+        let failure = test
+            .eval(concat!(
+                "$env.NU_PLUGIN_JEV_PROXY = 'http://user:secret@127.0.0.1:1/path'; ",
+                "'hello' | jev ask {match: {type: noul}} --dry-run"
+            ))
+            .unwrap_err();
         assert!(!failure.to_string().contains("secret"));
         Ok(())
     }

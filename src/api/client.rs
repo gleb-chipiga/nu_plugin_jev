@@ -705,12 +705,18 @@ mod tests {
                     let mut stream = loop {
                         match listener.accept() {
                             Ok((stream, _)) => break stream,
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-                                && StdInstant::now() < deadline => thread::sleep(Duration::from_millis(2)),
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::WouldBlock
+                                    && StdInstant::now() < deadline =>
+                            {
+                                thread::sleep(Duration::from_millis(2));
+                            }
                             Err(error) => panic!("mock server did not receive request: {error}"),
                         }
                     };
-                    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut line = String::new();
                     reader.read_line(&mut line).unwrap();
@@ -747,13 +753,17 @@ mod tests {
                             && value.eq_ignore_ascii_case("chunked")
                     });
                     let mut headers = format!(
-                        "HTTP/1.1 {} Mock\r\nContent-Type: application/json\r\nConnection: close\r\n",
+                        concat!(
+                            "HTTP/1.1 {} Mock\r\n",
+                            "Content-Type: application/json\r\nConnection: close\r\n"
+                        ),
                         response.status
                     );
                     if !chunked
-                        && !response.headers.iter().any(|(name, _)| {
-                            name.eq_ignore_ascii_case("content-length")
-                        })
+                        && !response
+                            .headers
+                            .iter()
+                            .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
                     {
                         headers.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
                     }
@@ -763,13 +773,20 @@ mod tests {
                     headers.push_str("\r\n");
                     let _ = stream.write_all(headers.as_bytes());
                     if chunked {
-                        let _ = stream.write_all(format!("{:X}\r\n", response.body.len()).as_bytes());
+                        let chunk_size = format!("{:X}\r\n", response.body.len());
+                        let _ = stream.write_all(chunk_size.as_bytes());
                         let _ = stream.write_all(response.body.as_bytes());
                         let _ = stream.write_all(b"\r\n0\r\n\r\n");
                     } else {
                         let _ = stream.write_all(response.body.as_bytes());
                     }
-                    CapturedRequest { method, path, authorization, content_type, body }
+                    CapturedRequest {
+                        method,
+                        path,
+                        authorization,
+                        content_type,
+                        body,
+                    }
                 })
                 .collect()
         });
@@ -1940,8 +1957,12 @@ mod tests {
             }
             let body = answer().to_string();
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
+                concat!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                    "Content-Length: {}\r\nConnection: close\r\n\r\n{body}"
+                ),
+                body.len(),
+                body = body
             );
             stream.write_all(response.as_bytes()).unwrap();
             domain
@@ -2110,9 +2131,15 @@ mod tests {
                     let mut connection = h2::server::handshake(tls).await.unwrap();
                     let mut count = 0;
                     while let Ok(Some(Ok((request, mut respond)))) = tokio::time::timeout(
-                        if count == 0 { Duration::from_secs(3) } else { Duration::from_millis(350) },
+                        if count == 0 {
+                            Duration::from_secs(3)
+                        } else {
+                            Duration::from_millis(350)
+                        },
                         connection.accept(),
-                    ).await {
+                    )
+                    .await
+                    {
                         count += 1;
                         if reset_stream {
                             respond.send_reset(h2::Reason::REFUSED_STREAM);
@@ -2125,8 +2152,11 @@ mod tests {
                             .header("content-type", "application/json")
                             .body(())
                             .unwrap();
-                        respond.send_response(response, false).unwrap()
-                            .send_data(Bytes::from(data), true).unwrap();
+                        respond
+                            .send_response(response, false)
+                            .unwrap()
+                            .send_data(Bytes::from(data), true)
+                            .unwrap();
                     }
                     (alpn, count)
                 } else {
@@ -2138,15 +2168,26 @@ mod tests {
                     loop {
                         line.clear();
                         reader.read_line(&mut line).await.unwrap();
-                        if line == "\r\n" { break; }
-                        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
                             content_length = value.trim().parse().unwrap();
                         }
                     }
                     let mut body = vec![0; content_length];
                     reader.read_exact(&mut body).await.unwrap();
                     let data = answer().to_string();
-                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}", data.len());
+                    let response = format!(
+                        concat!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                            "Content-Length: {}\r\nConnection: close\r\n\r\n{data}"
+                        ),
+                        data.len(),
+                        data = data
+                    );
                     tls.write_all(response.as_bytes()).await.unwrap();
                     (alpn, 1)
                 }

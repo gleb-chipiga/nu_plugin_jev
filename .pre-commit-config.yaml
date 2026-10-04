@@ -41,3 +41,11 @@ repos:
         language_version: 24.21.0
         additional_dependencies: ["@fission-ai/openspec@1.14.0"]
         pass_filenames: false
+
+  - repo: builtin
+    hooks:
+      - id: deny-pattern
+        name: Rust line length
+        description: Reject Rust source lines longer than 100 characters
+        args: ['^.{101}']
+        types: [rust]

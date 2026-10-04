@@ -241,8 +241,10 @@ mod tests {
         let questions = parse_questions(&nu(json!({
             "n": {"type": "noul", "instructions": null, "criteria": {"true": {"weight": 2}}},
             "c": {"type": "choice", "criteria": {"a": null, "b": ["text", 2]}},
-            "s": {"type": "score", "criteria": (0..11).map(|n| json!({"level": n})).collect::<Vec<_>>()}
-        }))).unwrap();
+            "s": {"type": "score", "criteria":
+                (0..11).map(|n| json!({"level": n})).collect::<Vec<_>>()}
+        })))
+        .unwrap();
         assert_eq!(questions.len(), 3);
     }
 

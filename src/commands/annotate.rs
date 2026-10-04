@@ -150,19 +150,36 @@ impl PluginCommand for JevAnnotate {
 
     /// Clarifies that each row is one state and native Nu handles filtering.
     fn extra_description(&self) -> &str {
-        "Each row is an independent System One state; matching requests may share one evaluation. Answers go under answers by default; --into jev preserves the former answer path. Successful rows always add jev_meta with base_url, model, and usage; --metrics adds jev_metrics with one shared request_id and HTTP measurements. --fields selects literal top-level names, while --state follows a Nu cell path. Use native where and sort-by on answers. Settings are snapshotted per call from flags, Nu config, caller environment, local TOML (--config or NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.toml), user TOML, then defaults."
+        concat!(
+            "Each row is an independent System One state; matching requests may share one ",
+            "evaluation. Answers go under answers by default; --into jev preserves the former ",
+            "answer path. Successful rows always add jev_meta with base_url, model, and usage; ",
+            "--metrics adds jev_metrics with one shared request_id and HTTP measurements. ",
+            "--fields selects literal top-level names, while --state follows a Nu cell path. ",
+            "Use native where and sort-by on answers. Settings are snapshotted per call from ",
+            "flags, Nu config, caller environment, local TOML (--config or ",
+            "NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.toml), user TOML, then defaults."
+        )
     }
 
     /// Shows a credential-free structured preview.
     fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                example: "[{id: 1, message: 'hello'}] | jev annotate {greeting: (jev question noul 'Is this a greeting?')} -f [message] --dry-run",
+                example: concat!(
+                    "[{id: 1, message: 'hello'}] | jev annotate ",
+                    "{greeting: (jev question noul 'Is this a greeting?')} ",
+                    "-f [message] --dry-run"
+                ),
                 description: "Preview the per-row outbound state without sending data",
                 result: None,
             },
             Example {
-                example: "[{id: 1, document: {text: 'hello'}}] | jev annotate {greeting: {type: noul}} -s document.text -c {policy: 'greetings'} --dry-run",
+                example: concat!(
+                    "[{id: 1, document: {text: 'hello'}}] | jev annotate ",
+                    "{greeting: {type: noul}} -s document.text ",
+                    "-c {policy: 'greetings'} --dry-run"
+                ),
                 description: "Preview a nested cell-path state with explicit context",
                 result: None,
             },
@@ -542,6 +559,15 @@ mod tests {
         PluginTest::new("jev", JevPlugin::new(runtime).into()).map_err(Box::new)
     }
 
+    /// Builds a stable Noul answer for annotation tests.
+    fn mock_noul_response() -> serde_json::Value {
+        json!({
+            "model": "jev-fixed",
+            "answers": {"q": {"type": "noul", "noul": 0.875}},
+            "usage": {"input_tokens": 10, "output_tokens": 1}
+        })
+    }
+
     /// Keeps exact bodies while reusing questions across independent rows.
     #[test]
     fn shared_row_builder_matches_legacy_bytes() {
@@ -720,11 +746,15 @@ mod tests {
             baseline_prepared_times.sort_unstable();
             prepared_times.sort_unstable();
             println!(
-                "{label}: baseline_build_ms={:.3}, optimized_build_ms={:.3}, baseline_prepared_ms={:.3}, optimized_prepared_ms={:.3}",
+                concat!(
+                    "{label}: baseline_build_ms={:.3}, optimized_build_ms={:.3}, ",
+                    "baseline_prepared_ms={:.3}, optimized_prepared_ms={:.3}"
+                ),
                 baseline_build_times[2] as f64 / 1_000_000.0,
                 build_times[2] as f64 / 1_000_000.0,
                 baseline_prepared_times[2] as f64 / 1_000_000.0,
-                prepared_times[2] as f64 / 1_000_000.0
+                prepared_times[2] as f64 / 1_000_000.0,
+                label = label
             );
         }
     }
@@ -733,7 +763,13 @@ mod tests {
     #[test]
     fn dry_run_projects_fields_without_credentials() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
-        let result = test.eval("[{id: 1, message: 'hello', secret: 'local'} {id: 2, message: 'bye', secret: 'local'}] | jev annotate {q: {type: noul}} --fields [message] --context {policy: 'greetings'} --dry-run")?
+        let result = test
+            .eval(concat!(
+                "[{id: 1, message: 'hello', secret: 'local'} ",
+                "{id: 2, message: 'bye', secret: 'local'}] | jev annotate ",
+                "{q: {type: noul}} --fields [message] ",
+                "--context {policy: 'greetings'} --dry-run"
+            ))?
             .into_value(Span::test_data())?;
         let wire = to_json(&result).unwrap();
         assert_eq!(wire.as_array().unwrap().len(), 2);
@@ -758,23 +794,40 @@ mod tests {
     #[test]
     fn short_options_match_long_projection_preview_and_live_output() -> Result<(), Box<ShellError>>
     {
-        let response = json!({"model": "jev-fixed", "answers": {
-            "q": {"type": "noul", "noul": 0.875}},
-            "usage": {"input_tokens": 10, "output_tokens": 1}});
+        let response = mock_noul_response();
         let (base_url, server) = serve(vec![response]);
         let mut test = plugin_test()?;
-        let setup = "$env.NU_PLUGIN_JEV_MODEL = 'env-model'; $env.NU_PLUGIN_JEV_JOBS = '0'; $env.config.plugins.jev = {model: 'config-model', jobs: 0};";
+        let setup = concat!(
+            "$env.NU_PLUGIN_JEV_MODEL = 'env-model'; ",
+            "$env.NU_PLUGIN_JEV_JOBS = '0'; ",
+            "$env.config.plugins.jev = {model: 'config-model', jobs: 0};"
+        );
         let common = format!(
-            "[{{id: 1, message: 'hello'}}] | jev annotate {{q: {{type: noul}}}} --base-url '{base_url}'"
+            concat!(
+                "[{{id: 1, message: 'hello'}}] | jev annotate ",
+                "{{q: {{type: noul}}}} --base-url '{base_url}'"
+            ),
+            base_url = base_url
         );
         let long = test
             .eval(&format!(
-                "{setup} {common} --fields [message] --context {{policy: 'greetings'}} --model flag-model --jobs 1 --into ai --dry-run"
+                concat!(
+                    "{setup} {common} --fields [message] ",
+                    "--context {{policy: 'greetings'}} --model flag-model ",
+                    "--jobs 1 --into ai --dry-run"
+                ),
+                setup = setup,
+                common = common
             ))?
             .into_value(Span::test_data())?;
         let short = test
             .eval(&format!(
-                "{setup} {common} -f [message] -c {{policy: 'greetings'}} -m flag-model -j 1 -i ai --dry-run"
+                concat!(
+                    "{setup} {common} -f [message] ",
+                    "-c {{policy: 'greetings'}} -m flag-model -j 1 -i ai --dry-run"
+                ),
+                setup = setup,
+                common = common
             ))?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&short).unwrap(), to_json(&long).unwrap());
@@ -785,7 +838,12 @@ mod tests {
 
         let live = test
             .eval(&format!(
-                "{setup} $env.TYPESAFE_API_KEY = 'local'; {common} -f [message] -c {{policy: 'greetings'}} -m flag-model -j 1 -i ai"
+                concat!(
+                    "{setup} $env.TYPESAFE_API_KEY = 'local'; {common} ",
+                    "-f [message] -c {{policy: 'greetings'}} -m flag-model -j 1 -i ai"
+                ),
+                setup = setup,
+                common = common
             ))?
             .into_value(Span::test_data())?;
         let live = to_json(&live).unwrap();
@@ -818,10 +876,19 @@ mod tests {
     /// Preserves every source column while inserting typed answers and provenance.
     #[test]
     fn live_annotation_preserves_source_and_metadata() -> Result<(), Box<ShellError>> {
-        let response = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.875}}, "usage": {"input_tokens": 10, "output_tokens": 1}});
+        let response = mock_noul_response();
         let (base_url, server) = serve(vec![response]);
         let mut test = plugin_test()?;
-        let result = test.eval(&format!("$env.TYPESAFE_API_KEY = 'local-key'; [{{id: 7, payload: {{text: 'hello'}}, secret: 'local'}}] | jev annotate {{q: {{type: noul}}}} --state payload.text --into ai --metrics --base-url '{base_url}'"))?
+        let result = test
+            .eval(&format!(
+                concat!(
+                    "$env.TYPESAFE_API_KEY = 'local-key'; ",
+                    "[{{id: 7, payload: {{text: 'hello'}}, secret: 'local'}}] ",
+                    "| jev annotate {{q: {{type: noul}}}} --state payload.text ",
+                    "--into ai --metrics --base-url '{base_url}'"
+                ),
+                base_url = base_url
+            ))?
             .into_value(Span::test_data())?;
         let wire = to_json(&result).unwrap();
         assert_eq!(wire[0]["id"], 7);
@@ -850,7 +917,7 @@ mod tests {
     /// Defaults to answers while an explicit legacy destination changes only answer placement.
     #[test]
     fn default_answers_and_explicit_jev_keep_fixed_metadata() -> Result<(), Box<ShellError>> {
-        let response = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.875}}, "usage": {"input_tokens": 10, "output_tokens": 1}});
+        let response = mock_noul_response();
         let (base_url, server) = serve(vec![response.clone(), response]);
         let mut test = plugin_test()?;
         let setup = format!(
@@ -965,10 +1032,18 @@ mod tests {
     #[test]
     fn row_error_policies_keep_and_record() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
-        let keep = test.eval("[{id: 1}] | jev annotate {q: {type: noul}} --fields [message] --on-error keep --dry-run")?
+        let keep = test
+            .eval(concat!(
+                "[{id: 1}] | jev annotate {q: {type: noul}} ",
+                "--fields [message] --on-error keep --dry-run"
+            ))?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&keep).unwrap(), json!([{"id": 1}]));
-        let record = test.eval("[{id: 1}] | jev annotate {q: {type: noul}} --fields [message] --on-error record --dry-run")?
+        let record = test
+            .eval(concat!(
+                "[{id: 1}] | jev annotate {q: {type: noul}} ",
+                "--fields [message] --on-error record --dry-run"
+            ))?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&record).unwrap()[0]["jev_error"]["kind"], "state");
         assert_eq!(
@@ -982,13 +1057,21 @@ mod tests {
     #[test]
     fn literal_fields_and_indexed_state_paths() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
-        let literal = test.eval("[{'a.b': 'value', id: 1}] | jev annotate {q: {type: noul}} --fields ['a.b'] --dry-run")?
+        let literal = test
+            .eval(concat!(
+                "[{'a.b': 'value', id: 1}] | jev annotate {q: {type: noul}} ",
+                "--fields ['a.b'] --dry-run"
+            ))?
             .into_value(Span::test_data())?;
         assert_eq!(
             to_json(&literal).unwrap()[0]["request"]["state"],
             json!({"a.b": "value"})
         );
-        let indexed = test.eval("[{payload: [{text: 'first'} {text: 'second'}]}] | jev annotate {q: {type: noul}} --state payload.1.text --dry-run")?
+        let indexed = test
+            .eval(concat!(
+                "[{payload: [{text: 'first'} {text: 'second'}]}] ",
+                "| jev annotate {q: {type: noul}} --state payload.1.text --dry-run"
+            ))?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&indexed).unwrap()[0]["request"]["state"], "second");
         Ok(())
@@ -997,11 +1080,17 @@ mod tests {
     /// Equivalent projected states reuse one result while retaining different source IDs.
     #[test]
     fn projected_duplicates_share_usage_and_request_identity() -> Result<(), Box<ShellError>> {
-        let response = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.875}}, "usage": {"input_tokens": 10, "output_tokens": 1}});
+        let response = mock_noul_response();
         let (base_url, server) = serve(vec![response]);
         let mut test = plugin_test()?;
         let source = format!(
-            "$env.TYPESAFE_API_KEY = 'local-key'; [{{id: 1, message: 'same'}} {{id: 2, message: 'same'}}] | jev annotate {{q: {{type: noul}}}} --fields [message] --metrics --base-url '{base_url}'"
+            concat!(
+                "$env.TYPESAFE_API_KEY = 'local-key'; ",
+                "[{{id: 1, message: 'same'}} {{id: 2, message: 'same'}}] ",
+                "| jev annotate {{q: {{type: noul}}}} --fields [message] ",
+                "--metrics --base-url '{base_url}'"
+            ),
+            base_url = base_url
         );
         let result = test.eval(&source)?.into_value(Span::test_data())?;
         let wire = to_json(&result).unwrap();
@@ -1036,13 +1125,20 @@ mod tests {
     /// Reads fresh caller credentials and service configuration on each invocation.
     #[test]
     fn later_invocation_uses_changed_caller_snapshot() -> Result<(), Box<ShellError>> {
-        let response = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.875}}, "usage": {"input_tokens": 10, "output_tokens": 1}});
+        let response = mock_noul_response();
         let (first_url, first_server) = serve(vec![response.clone()]);
         let (second_url, second_server) = serve(vec![response]);
         let mut test = plugin_test()?;
         for (key, url) in [("first-key", &first_url), ("second-key", &second_url)] {
             let source = format!(
-                "$env.TYPESAFE_API_KEY = '{key}'; $env.NU_PLUGIN_JEV_BASE_URL = '{url}'; [{{message: 'same'}}] | jev annotate {{q: {{type: noul}}}} --fields [message]"
+                concat!(
+                    "$env.TYPESAFE_API_KEY = '{key}'; ",
+                    "$env.NU_PLUGIN_JEV_BASE_URL = '{url}'; ",
+                    "[{{message: 'same'}}] | jev annotate ",
+                    "{{q: {{type: noul}}}} --fields [message]"
+                ),
+                key = key,
+                url = url
             );
             let result = test.eval(&source)?.into_value(Span::test_data())?;
             let wire = to_json(&result).unwrap();
@@ -1140,11 +1236,17 @@ mod tests {
     /// Reuses one body builder for previews and live requests with the same context.
     #[test]
     fn streaming_preview_matches_live_request_body() -> Result<(), Box<ShellError>> {
-        let response = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.875}}, "usage": {"input_tokens": 10, "output_tokens": 1}});
+        let response = mock_noul_response();
         let (base_url, server) = serve(vec![response]);
         let mut test = plugin_test()?;
         let common = format!(
-            "[{{id: 7, message: 'hello', secret: 'local'}}] | jev annotate {{q: {{type: noul, instructions: {{task: 'greet'}}}}}} --fields [message] --context {{policy: ['first' 'second']}} --base-url '{base_url}'"
+            concat!(
+                "[{{id: 7, message: 'hello', secret: 'local'}}] | jev annotate ",
+                "{{q: {{type: noul, instructions: {{task: 'greet'}}}}}} ",
+                "--fields [message] --context {{policy: ['first' 'second']}} ",
+                "--base-url '{base_url}'"
+            ),
+            base_url = base_url
         );
         let preview = test
             .eval(&format!("{common} --dry-run"))?
@@ -1167,7 +1269,14 @@ mod tests {
             let (base_url, server) = serve(vec![json!({"malformed": true})]);
             let mut test = plugin_test()?;
             let source = format!(
-                "$env.TYPESAFE_API_KEY = 'local-key'; [{{id: 1, message: 'hello'}}] | jev annotate {{q: {{type: noul}}}} --on-error {policy} --metrics --base-url '{base_url}'"
+                concat!(
+                    "$env.TYPESAFE_API_KEY = 'local-key'; ",
+                    "[{{id: 1, message: 'hello'}}] | jev annotate ",
+                    "{{q: {{type: noul}}}} --on-error {policy} ",
+                    "--metrics --base-url '{base_url}'"
+                ),
+                policy = policy,
+                base_url = base_url
             );
             let result = test.eval(&source)?.into_value(Span::test_data())?;
             let wire = to_json(&result).unwrap();
@@ -1207,7 +1316,11 @@ mod tests {
     #[test]
     fn dry_run_preserves_duplicate_rows_in_input_order() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
-        let result = test.eval("[{id: 1, message: 'same'} {id: 2, message: 'same'}] | jev annotate {q: {type: noul}} --fields [message] --dry-run")?
+        let result = test
+            .eval(concat!(
+                "[{id: 1, message: 'same'} {id: 2, message: 'same'}] ",
+                "| jev annotate {q: {type: noul}} --fields [message] --dry-run"
+            ))?
             .into_value(Span::test_data())?;
         let wire = to_json(&result).unwrap();
         assert_eq!(wire.as_array().unwrap().len(), 2);
@@ -1220,22 +1333,45 @@ mod tests {
     #[test]
     fn selector_misses_and_collisions_do_not_issue_requests() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
-        let missing = test.eval("[{id: 1}] | jev annotate {q: {type: noul}} --state payload.text --on-error record --dry-run")?
+        let missing = test
+            .eval(concat!(
+                "[{id: 1}] | jev annotate {q: {type: noul}} ",
+                "--state payload.text --on-error record --dry-run"
+            ))?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&missing).unwrap()[0]["jev_error"]["kind"], "state");
         for policy in ["keep", "record"] {
-            let collision = test.eval(&format!("[{{id: 1, message: 'hello', answers: 'existing'}}] | jev annotate {{q: {{type: noul}}}} --fields [message] --on-error {policy} --dry-run"))?;
+            let collision = test.eval(&format!(
+                concat!(
+                    "[{{id: 1, message: 'hello', answers: 'existing'}}] ",
+                    "| jev annotate {{q: {{type: noul}}}} --fields [message] ",
+                    "--on-error {policy} --dry-run"
+                ),
+                policy = policy
+            ))?;
             assert!(collision.into_value(Span::test_data()).is_err());
         }
-        let legacy = test.eval("[{id: 1, message: 'hello', jev: 'existing'}] | jev annotate {q: {type: noul}} --fields [message] --dry-run")?
+        let legacy = test
+            .eval(concat!(
+                "[{id: 1, message: 'hello', jev: 'existing'}] ",
+                "| jev annotate {q: {type: noul}} --fields [message] --dry-run"
+            ))?
             .into_value(Span::test_data())?;
         assert_eq!(
             to_json(&legacy).unwrap()[0]["request"]["state"],
             json!({"message": "hello"})
         );
-        let meta_collision = test.eval("[{id: 1, message: 'hello', jev_meta: 'existing'}] | jev annotate {q: {type: noul}} --fields [message] --on-error keep --dry-run")?;
+        let meta_collision = test.eval(concat!(
+            "[{id: 1, message: 'hello', jev_meta: 'existing'}] ",
+            "| jev annotate {q: {type: noul}} --fields [message] ",
+            "--on-error keep --dry-run"
+        ))?;
         assert!(meta_collision.into_value(Span::test_data()).is_err());
-        let missing_field = test.eval("[{id: 1}] | jev annotate {q: {type: noul}} --fields [message] --on-error record --dry-run")?
+        let missing_field = test
+            .eval(concat!(
+                "[{id: 1}] | jev annotate {q: {type: noul}} ",
+                "--fields [message] --on-error record --dry-run"
+            ))?
             .into_value(Span::test_data())?;
         assert_eq!(
             to_json(&missing_field).unwrap()[0]["jev_error"]["kind"],

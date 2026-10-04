@@ -28,7 +28,17 @@ impl SimplePluginCommand for Jev {
 
     /// Explains the main command workflows in Nu help.
     fn extra_description(&self) -> &str {
-        "This guidance command accepts no pipeline input. Build questions with `jev question`, evaluate one state with `jev ask`, annotate rows with `jev annotate`, or list current models with `jev models`; use native Nu commands for filtering and sorting. Settings resolve per call from flags, Nu config, caller environment, local TOML, user TOML, then defaults. Use --config or NU_PLUGIN_JEV_CONFIG to select a local file. Automatic proxy discovery is captured at plugin startup; restart with `plugin stop jev` after ordinary proxy changes. Explicit HTTP/SOCKS5h proxies ignore global NO_PROXY and never fall back to direct routing."
+        concat!(
+            "This guidance command accepts no pipeline input. ",
+            "Build questions with `jev question`, evaluate one state with `jev ask`, ",
+            "annotate rows with `jev annotate`, or list current models with `jev models`; ",
+            "use native Nu commands for filtering and sorting. Settings resolve per call ",
+            "from flags, Nu config, caller environment, local TOML, user TOML, then defaults. ",
+            "Use --config or NU_PLUGIN_JEV_CONFIG to select a local file. ",
+            "Automatic proxy discovery is captured at plugin startup; restart with ",
+            "`plugin stop jev` after ordinary proxy changes. Explicit HTTP/SOCKS5h proxies ",
+            "ignore global NO_PROXY and never fall back to direct routing."
+        )
     }
 
     /// Returns usage guidance without reading credentials or sending HTTP.
@@ -44,7 +54,11 @@ impl SimplePluginCommand for Jev {
                 .with_label("invoke jev without an input state", call.head));
         }
         Ok(Value::string(
-            "Use `jev ask` for one state, `jev question` to build questions, `jev annotate` for tables, or `jev models` to list current models. Filter and sort with native Nu commands. See `help jev`.",
+            concat!(
+                "Use `jev ask` for one state, `jev question` to build questions, ",
+                "`jev annotate` for tables, or `jev models` to list current models. ",
+                "Filter and sort with native Nu commands. See `help jev`."
+            ),
             call.head,
         ))
     }

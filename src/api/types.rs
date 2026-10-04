@@ -183,9 +183,11 @@ mod tests {
     #[test]
     fn parses_model_metadata_contract() {
         let list: ModelMetadataList = serde_json::from_value(json!({"models": [
-            {"name": "jev-latest", "description": "General", "release_date": "unknown", "new_field": 1},
+            {"name": "jev-latest", "description": "General", "release_date": "unknown",
+                "new_field": 1},
             {"name": "jev-fixed", "description": "Pinned", "release_date": "2026-09-15"}
-        ], "extra": true})).unwrap();
+        ], "extra": true}))
+        .unwrap();
         assert_eq!(list.models.len(), 2);
         assert_eq!(list.models[0].release_date, "unknown");
         assert_eq!(list.models[1].name, "jev-fixed");
@@ -228,7 +230,8 @@ mod tests {
                 "missing": {"type": "noul"},
                 "nulls": {"type": "noul", "instructions": null, "criteria": null},
                 "one_sided": {"type": "noul", "criteria": {"true": null}},
-                "two_sided": {"type": "noul", "criteria": {"true": {"weight": 2}, "false": ["ordinary", false]}},
+                "two_sided": {"type": "noul", "criteria": {
+                    "true": {"weight": 2}, "false": ["ordinary", false]}},
                 "choice": {"type": "choice", "instructions": ["sort", {"priority": 1}],
                     "criteria": {"yes": null, "no": {"reason": false}}},
                 "score": {"type": "score", "criteria": ["low", {"weight": 2}]}

@@ -507,6 +507,15 @@ mod tests {
 
     use super::{InputRow, StreamSetup, emit, start};
 
+    /// Builds a stable successful response for scheduler tests.
+    fn answer(input_tokens: u64) -> serde_json::Value {
+        json!({
+            "model": "jev-fixed",
+            "answers": {"q": {"type": "noul", "noul": 0.75}},
+            "usage": {"input_tokens": input_tokens, "output_tokens": 1}
+        })
+    }
+
     /// Cancels a full output send even while the receiver remains alive.
     #[test]
     fn blocked_output_send_observes_cancellation() {
@@ -557,7 +566,7 @@ mod tests {
     /// Tears down a backpressured supervisor without dropping its live receiver.
     #[test]
     fn interrupt_closes_full_output_without_receiver_drop() {
-        let answer = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 1, "output_tokens": 1}});
+        let answer = answer(1);
         let (base_url, server) = serve(vec![answer.clone(), answer]);
         let (cancel, signal) = CancelHandle::new();
         let output = start(
@@ -628,7 +637,7 @@ mod tests {
     /// Shares one logical evaluation and provenance across equal admitted rows.
     #[test]
     fn duplicate_rows_share_a_single_request() {
-        let response = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 4, "output_tokens": 1}});
+        let response = answer(4);
         let (base_url, server) = serve(vec![response]);
         let output = start(
             runtime(),
@@ -657,7 +666,7 @@ mod tests {
     /// Acquires admission credit before reading another source item.
     #[test]
     fn stopped_consumer_bounds_input_reads_to_twice_jobs() {
-        let response = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 4, "output_tokens": 1}});
+        let response = answer(4);
         let (base_url, server) = serve(vec![response.clone(), response]);
         let reads = Arc::new(AtomicUsize::new(0));
         let input_reads = Arc::clone(&reads);
@@ -713,38 +722,52 @@ mod tests {
         let peak = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(Barrier::new(2));
         let handle = thread::spawn(move || {
-            let workers: Vec<_> = (0..2).map(|_| {
-                let (mut stream, _) = listener.accept().unwrap();
-                let active = Arc::clone(&active);
-                let peak = Arc::clone(&peak);
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    let mut length = 0;
-                    loop {
-                        line.clear();
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let active = Arc::clone(&active);
+                    let peak = Arc::clone(&peak);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut line = String::new();
                         reader.read_line(&mut line).unwrap();
-                        if line == "\r\n" { break; }
-                        if let Some((name, value)) = line.split_once(':')
-                            && name.eq_ignore_ascii_case("content-length")
-                        {
-                            length = value.trim().parse().unwrap();
+                        let mut length = 0;
+                        loop {
+                            line.clear();
+                            reader.read_line(&mut line).unwrap();
+                            if line == "\r\n" {
+                                break;
+                            }
+                            if let Some((name, value)) = line.split_once(':')
+                                && name.eq_ignore_ascii_case("content-length")
+                            {
+                                length = value.trim().parse().unwrap();
+                            }
                         }
-                    }
-                    let mut body = vec![0; length];
-                    reader.read_exact(&mut body).unwrap();
-                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(count, Ordering::SeqCst);
-                    barrier.wait();
-                    if request["state"] == 0 { thread::sleep(Duration::from_millis(120)); }
-                    let response = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 1, "output_tokens": 1}}).to_string();
-                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len());
-                    active.fetch_sub(1, Ordering::SeqCst);
+                        let mut body = vec![0; length];
+                        reader.read_exact(&mut body).unwrap();
+                        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(count, Ordering::SeqCst);
+                        barrier.wait();
+                        if request["state"] == 0 {
+                            thread::sleep(Duration::from_millis(120));
+                        }
+                        let response = answer(1).to_string();
+                        let _ = write!(
+                            stream,
+                            concat!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                                "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
+                            ),
+                            response.len(),
+                            response = response
+                        );
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    })
                 })
-            }).collect();
+                .collect();
             workers
                 .into_iter()
                 .for_each(|worker| worker.join().unwrap());
@@ -797,11 +820,15 @@ mod tests {
                 return;
             }
             thread::sleep(Duration::from_millis(120));
-            let response = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 1, "output_tokens": 1}}).to_string();
+            let response = answer(1).to_string();
             let _ = write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
-                response.len()
+                concat!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                    "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
+                ),
+                response.len(),
+                response = response
             );
         });
         (root, handle)
@@ -812,33 +839,51 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let root = format!("http://{}", listener.local_addr().unwrap());
         let handle = thread::spawn(move || {
-            (0..2).map(|attempt| {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let mut length = 0;
-                loop {
-                    line.clear();
+            (0..2)
+                .map(|attempt| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
                     reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" { break; }
-                    if let Some((name, value)) = line.split_once(':')
-                        && name.eq_ignore_ascii_case("content-length")
-                    {
-                        length = value.trim().parse().unwrap();
+                    let mut length = 0;
+                    loop {
+                        line.clear();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
                     }
-                }
-                let mut body = vec![0; length];
-                reader.read_exact(&mut body).unwrap();
-                if attempt == 0 {
-                    let _ = write!(stream, "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                    thread::sleep(Duration::from_millis(40));
-                } else {
-                    let response = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 1, "output_tokens": 1}}).to_string();
-                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len());
-                }
-                1_usize
-            }).sum()
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    if attempt == 0 {
+                        let _ = write!(
+                            stream,
+                            concat!(
+                                "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\n",
+                                "Content-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                        );
+                        thread::sleep(Duration::from_millis(40));
+                    } else {
+                        let response = answer(1).to_string();
+                        let _ = write!(
+                            stream,
+                            concat!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                                "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
+                            ),
+                            response.len(),
+                            response = response
+                        );
+                    }
+                    1_usize
+                })
+                .sum()
         });
         (root, handle)
     }
@@ -882,7 +927,10 @@ mod tests {
                         server_calls.fetch_add(1, Ordering::SeqCst);
                         let _ = write!(
                             stream,
-                            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            concat!(
+                                "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\n",
+                                "Content-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
                         );
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -936,7 +984,7 @@ mod tests {
     /// Re-evaluates identical state after an error because failures never enter the cache.
     #[test]
     fn failed_result_is_not_cached() {
-        let good = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 1, "output_tokens": 1}});
+        let good = answer(1);
         let (base_url, server) = serve(vec![json!({"bad": true}), good]);
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut setup = setup(&base_url, 1);
@@ -962,7 +1010,7 @@ mod tests {
     /// A small cache must permit a new identity after the previous success is evicted.
     #[test]
     fn eviction_allows_a_fresh_logical_request() {
-        let good = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 1, "output_tokens": 1}});
+        let good = answer(1);
         let (base_url, server) = serve(vec![good.clone(), good.clone(), good]);
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut setup = setup(&base_url, 1);
@@ -1115,7 +1163,7 @@ mod tests {
     /// Nonterminal failed rows still advance the ordered sequence for keep/record policies.
     #[test]
     fn nonterminal_error_advances_ordered_output() {
-        let good = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 1, "output_tokens": 1}});
+        let good = answer(1);
         let (base_url, server) = serve(vec![good.clone(), good]);
         let build = Box::new(|value: &Value| {
             if value.as_int().unwrap() == 1 {
@@ -1149,7 +1197,7 @@ mod tests {
     /// An outcome stays reusable after its first source row is consumed downstream.
     #[test]
     fn completed_success_survives_downstream_discard() {
-        let good = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 1, "output_tokens": 1}});
+        let good = answer(1);
         let (base_url, server) = serve(vec![good]);
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut output = start(
@@ -1178,7 +1226,7 @@ mod tests {
     /// A result too large for the cache is re-evaluated with new provenance.
     #[test]
     fn oversized_bypass_gets_new_request_identity() {
-        let good = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 1, "output_tokens": 1}});
+        let good = answer(1);
         let (base_url, server) = serve(vec![good.clone(), good]);
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut setup = setup(&base_url, 1);
@@ -1207,7 +1255,7 @@ mod tests {
     /// Reusing the process client does not reuse an earlier invocation's cached result.
     #[test]
     fn cache_does_not_cross_invocation_boundary() {
-        let good = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 1, "output_tokens": 1}});
+        let good = answer(1);
         let (base_url, server) = serve(vec![good.clone(), good]);
         let runtime = runtime();
         let client = JevClient::new().unwrap();
@@ -1267,7 +1315,7 @@ mod tests {
     #[test]
     fn output_drop_cancels_retry_without_affecting_another_invocation() {
         let (stalled_url, stalled_calls, stalled_server) = serve_long_retry();
-        let good = json!({"model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": 1, "output_tokens": 1}});
+        let good = answer(1);
         let (healthy_url, healthy_server) = serve(vec![good]);
         let runtime = runtime();
         let client = JevClient::new().unwrap();

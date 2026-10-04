@@ -37,7 +37,11 @@ impl SimplePluginCommand for JevQuestionScore {
 
     /// Clarifies ordinal positions and limits in Nu help.
     fn extra_description(&self) -> &str {
-        "One to ten levels are allowed; positions correspond to 0..N-1. At least two levels are usually useful. No HTTP request is made and pipeline input is not accepted."
+        concat!(
+            "One to ten levels are allowed; positions correspond to 0..N-1. ",
+            "At least two levels are usually useful. No HTTP request is made and ",
+            "pipeline input is not accepted."
+        )
     }
 
     /// Shows an offline rubric example.

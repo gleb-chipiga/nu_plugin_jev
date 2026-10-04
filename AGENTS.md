@@ -3,6 +3,8 @@
 - Docstring style: brief but precise; 1-3 lines describing what the module/type/function does, key guarantees, and expected side effects.
 - Prefer stack types and minimize allocations (use heap only when necessary).
 - Comments and docstrings must be in English only (requirement for code).
+- Keep every Rust source line, including tests and comments, at most 100 characters long.
+  Split long string literals with `concat!` while preserving their exact contents.
 - In the tokio runtime, avoid blocking or potentially blocking calls (if needed, move to a dedicated thread or `tokio::task::spawn_blocking`).
 - Configure `tracing` with a non-blocking subscriber/writer; do not use a blocking default logger for runtime I/O paths.
 - Keep tracing initialization in a dedicated module rather than in `main.rs`.

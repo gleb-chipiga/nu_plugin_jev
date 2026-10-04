@@ -33,7 +33,11 @@ impl SimplePluginCommand for JevQuestionChoice {
 
     /// Explains shorthand and limits in Nu help.
     fn extra_description(&self) -> &str {
-        "A list of 1 to 255 distinct strings becomes option names with null descriptions. A record supplies explicit descriptions. No HTTP request is made and pipeline input is not accepted."
+        concat!(
+            "A list of 1 to 255 distinct strings becomes option names with null descriptions. ",
+            "A record supplies explicit descriptions. No HTTP request is made and pipeline ",
+            "input is not accepted."
+        )
     }
 
     /// Shows an offline list-shorthand example.

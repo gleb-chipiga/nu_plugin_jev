@@ -868,7 +868,13 @@ mod tests {
     #[test]
     fn resolves_file_overlays_and_key_priority() {
         let fixture = Fixture::new();
-        let user_path = fixture.write("user.toml", "api_key = 'user-secret'\nmodel = 'user-model'\ntimeout_ms = 4000\n[cache]\nmax_entries = 9");
+        let user_path = fixture.write(
+            "user.toml",
+            concat!(
+                "api_key = 'user-secret'\nmodel = 'user-model'\n",
+                "timeout_ms = 4000\n[cache]\nmax_entries = 9",
+            ),
+        );
         let local_path = fixture.write(
             "local.toml",
             "jobs = 7\napi_key = 'local-secret'\n[cache]\nmax_approx_bytes = 12345",
@@ -1183,7 +1189,14 @@ mod tests {
     #[test]
     fn models_scope_uses_transport_precedence_only() {
         let fixture = Fixture::new();
-        let user_path = fixture.write("models-user.toml", "api_key = 'user-key'\nbase_url = 'https://user.example/'\ntimeout_ms = 5000\nmodel = 7\njobs = -1\n[cache]\nmax_entries = -1");
+        let user_path = fixture.write(
+            "models-user.toml",
+            concat!(
+                "api_key = 'user-key'\nbase_url = 'https://user.example/'\n",
+                "timeout_ms = 5000\nmodel = 7\njobs = -1\n",
+                "[cache]\nmax_entries = -1",
+            ),
+        );
         let local_path = fixture.write(
             "models-local.toml",
             "api_key = 'local-key'\nretries = 2\nmodel = 9",

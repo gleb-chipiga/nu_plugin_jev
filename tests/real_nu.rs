@@ -20,7 +20,11 @@ fn parse_nuon_diagnostics_in_nu(stderr: &[u8]) -> Vec<serde_json::Value> {
         .args([
             "--no-config-file",
             "--commands",
-            "use std/formats *; {single: ($env.JEV_TEST_DIAGNOSTICS | lines | first | from nuon), batch: ($env.JEV_TEST_DIAGNOSTICS | from ndnuon)} | to json --raw",
+            concat!(
+                "use std/formats *; ",
+                "{single: ($env.JEV_TEST_DIAGNOSTICS | lines | first | from nuon), ",
+                "batch: ($env.JEV_TEST_DIAGNOSTICS | from ndnuon)} | to json --raw"
+            ),
         ])
         .env("JEV_TEST_DIAGNOSTICS", &diagnostics)
         .output()
@@ -106,11 +110,20 @@ fn serve_until_stopped(
             let state: serde_json::Value = serde_json::from_slice(&body).expect("request body");
             let id = state["state"]["message"].as_i64().expect("selected row id");
             let probability = if !selective || id % 5 == 0 { 0.9 } else { 0.1 };
-            let response = serde_json::json!({"model": "jev-fixed", "answers": {"match": {"type": "noul", "noul": probability}}, "usage": {"input_tokens": 1, "output_tokens": 1}}).to_string();
+            let response = serde_json::json!({
+                "model": "jev-fixed",
+                "answers": {"match": {"type": "noul", "noul": probability}},
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })
+            .to_string();
             let _ = write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
-                response.len()
+                concat!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                    "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
+                ),
+                response.len(),
+                response = response
             );
         }
     });
@@ -124,9 +137,19 @@ fn run_pipeline(selective: bool) -> Option<(Vec<serde_json::Value>, usize)> {
     }
     let (base_url, stop, calls, server) = serve_until_stopped(selective);
     let source = if selective {
-        "let q = {match: (jev question noul 'Is this a match?')}; 1..1000 | each { |id| {id: $id, message: ($id mod 5)} } | jev annotate $q --fields [message] --jobs 4 | where answers.match.noul > 0.5 | first 10 | to json --raw"
+        concat!(
+            "let q = {match: (jev question noul 'Is this a match?')}; ",
+            "1..1000 | each { |id| {id: $id, message: ($id mod 5)} } ",
+            "| jev annotate $q --fields [message] --jobs 4 ",
+            "| where answers.match.noul > 0.5 | first 10 | to json --raw"
+        )
     } else {
-        "let q = {match: (jev question noul 'Is this a match?')}; 1..1000 | each { |id| {id: $id, message: $id} } | jev annotate $q --fields [message] -j 4 | where answers.match.noul > 0.5 | first 10 | to json --raw"
+        concat!(
+            "let q = {match: (jev question noul 'Is this a match?')}; ",
+            "1..1000 | each { |id| {id: $id, message: $id} } ",
+            "| jev annotate $q --fields [message] -j 4 ",
+            "| where answers.match.noul > 0.5 | first 10 | to json --raw"
+        )
     };
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut child = Command::new("nu")
@@ -237,7 +260,16 @@ fn serve_mixed_once() -> (String, thread::JoinHandle<serde_json::Value>) {
                 "probabilities": {"0": 0.1, "1": 0.4, "2": 0.5}}
         }, "usage": {"input_tokens": 42, "output_tokens": 6}})
         .to_string();
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).expect("mixed response");
+        write!(
+            stream,
+            concat!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
+            ),
+            response.len(),
+            response = response
+        )
+        .expect("mixed response");
         captured
     });
     (root, handle)
@@ -250,7 +282,20 @@ fn ask_native_get_keeps_mixed_answer_details() {
         return;
     }
     let (base_url, server) = serve_mixed_once();
-    let source = "let q = {spam: {type: noul}, kind: {type: choice, criteria: {normal: null, spam: null}}, urgency: {type: score, criteria: ['later' 'today' 'now']}}; let result = ('hello' | jev ask $q); {probability: ($result | get answers.spam.noul), passes: (($result | get answers.spam.noul) > 0.98), kind: ($result | get answers.kind.choice), confidence: ($result | get answers.kind.confidence), distribution: ($result | get answers.kind.probabilities), score: ($result | get answers.urgency.score), legend: ($result | get answers.urgency.legend), model: ($result | get meta.model)} | to json --raw";
+    let source = concat!(
+        "let q = {spam: {type: noul}, kind: {type: choice, ",
+        "criteria: {normal: null, spam: null}}, urgency: {type: score, ",
+        "criteria: ['later' 'today' 'now']}}; ",
+        "let result = ('hello' | jev ask $q); ",
+        "{probability: ($result | get answers.spam.noul), ",
+        "passes: (($result | get answers.spam.noul) > 0.98), ",
+        "kind: ($result | get answers.kind.choice), ",
+        "confidence: ($result | get answers.kind.confidence), ",
+        "distribution: ($result | get answers.kind.probabilities), ",
+        "score: ($result | get answers.urgency.score), ",
+        "legend: ($result | get answers.urgency.legend), ",
+        "model: ($result | get meta.model)} | to json --raw"
+    );
     let output = Command::new("nu")
         .args([
             "--no-config-file",
@@ -340,13 +385,32 @@ fn ask_nuon_correlates_retry_attempts() {
                 } else {
                     "req_local-key"
                 };
-                write!(stream, "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nX-TypeSafe-Request-Id: {request_id}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("retry response");
+                write!(
+                    stream,
+                    concat!(
+                        "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\n",
+                        "X-TypeSafe-Request-Id: {request_id}\r\n",
+                        "Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    ),
+                    request_id = request_id
+                )
+                .expect("retry response");
             } else {
                 let response = serde_json::json!({"model": "jev-fixed", "answers": {
                     "match": {"type": "noul", "noul": 0.9}}, "usage": {
                     "input_tokens": 2, "output_tokens": 1}})
                 .to_string();
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-TypeSafe-Request-Id: req_success_3\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).expect("success response");
+                write!(
+                    stream,
+                    concat!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                        "X-TypeSafe-Request-Id: req_success_3\r\nContent-Length: {}\r\n",
+                        "Connection: close\r\n\r\n{response}"
+                    ),
+                    response.len(),
+                    response = response
+                )
+                .expect("success response");
             }
         }
     });
@@ -356,7 +420,15 @@ fn ask_nuon_correlates_retry_attempts() {
             "--plugins",
             env!("CARGO_BIN_EXE_nu_plugin_jev"),
             "--commands",
-            "let result = ('hello' | jev ask {match: {type: noul}} --timeout 5sec --metrics); {answer: $result.answers.match.noul, meta: $result.meta, metrics: $result.metrics, elapsed_ns: ($result.metrics.elapsed | into int), attempt_elapsed_ns: ($result.metrics.attempt_elapsed | into int)} | to json --raw",
+            concat!(
+                "let result = ('hello' | jev ask {match: {type: noul}} ",
+                "--timeout 5sec --metrics); ",
+                "{answer: $result.answers.match.noul, meta: $result.meta, ",
+                "metrics: $result.metrics, ",
+                "elapsed_ns: ($result.metrics.elapsed | into int), ",
+                "attempt_elapsed_ns: ($result.metrics.attempt_elapsed | into int)} ",
+                "| to json --raw"
+            ),
         ])
         .env("TYPESAFE_API_KEY", "local-key")
         .env("NU_PLUGIN_JEV_BASE_URL", &base_url)
@@ -462,7 +534,12 @@ fn dry_run_has_no_success_measurement_event() {
     if Command::new("nu").arg("--version").output().is_err() {
         return;
     }
-    let source = "let ask = ('hello' | jev ask {q: {type: noul}} --dry-run); let annotate = ([{message: 'hello'}] | jev annotate {q: {type: noul}} --dry-run); {ask: $ask, annotate: $annotate} | to json --raw";
+    let source = concat!(
+        "let ask = ('hello' | jev ask {q: {type: noul}} --dry-run); ",
+        "let annotate = ([{message: 'hello'}] ",
+        "| jev annotate {q: {type: noul}} --dry-run); ",
+        "{ask: $ask, annotate: $annotate} | to json --raw"
+    );
     let output = Command::new("nu")
         .args([
             "--no-config-file",
@@ -494,44 +571,65 @@ fn serve_mixed_table() -> (String, thread::JoinHandle<Vec<serde_json::Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind table mock");
     let root = format!("http://{}", listener.local_addr().expect("local address"));
     let handle = thread::spawn(move || {
-        (0..3).map(|_| {
-            let (mut stream, _) = listener.accept().expect("accept table request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone socket"));
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("request line");
-            let mut length = 0;
-            loop {
-                line.clear();
-                reader.read_line(&mut line).expect("request header");
-                if line == "\r\n" { break; }
-                if let Some((name, value)) = line.split_once(':')
-                    && name.eq_ignore_ascii_case("content-length")
-                {
-                    length = value.trim().parse().expect("body length");
+        (0..3)
+            .map(|_| {
+                let (mut stream, _) = listener.accept().expect("accept table request");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone socket"));
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("request line");
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).expect("request header");
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().expect("body length");
+                    }
                 }
-            }
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).expect("request body");
-            let captured: serde_json::Value = serde_json::from_slice(&body).expect("request JSON");
-            let message = captured["state"]["input"]["message"].as_str().expect("projected message");
-            let (probability, choice, score, levels) = match message {
-                "urgent" => (0.99, "spam", 1.8, [0.0, 0.2, 0.8]),
-                "normal" => (0.1, "normal", 0.1, [0.9, 0.1, 0.0]),
-                "later" => (0.95, "spam", 1.4, [0.1, 0.4, 0.5]),
-                _ => panic!("unexpected mock state"),
-            };
-            let (normal, spam) = if choice == "spam" { (0.05, 0.95) } else { (0.95, 0.05) };
-            let response = serde_json::json!({"model": "jev-fixed", "answers": {
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).expect("request body");
+                let captured: serde_json::Value =
+                    serde_json::from_slice(&body).expect("request JSON");
+                let message = captured["state"]["input"]["message"]
+                    .as_str()
+                    .expect("projected message");
+                let (probability, choice, score, levels) = match message {
+                    "urgent" => (0.99, "spam", 1.8, [0.0, 0.2, 0.8]),
+                    "normal" => (0.1, "normal", 0.1, [0.9, 0.1, 0.0]),
+                    "later" => (0.95, "spam", 1.4, [0.1, 0.4, 0.5]),
+                    _ => panic!("unexpected mock state"),
+                };
+                let (normal, spam) = if choice == "spam" {
+                    (0.05, 0.95)
+                } else {
+                    (0.95, 0.05)
+                };
+                let response = serde_json::json!({"model": "jev-fixed", "answers": {
                 "spam": {"type": "noul", "noul": probability},
                 "kind": {"type": "choice", "choice": choice, "confidence": 0.95,
                     "probabilities": {"normal": normal, "spam": spam}},
                 "urgency": {"type": "score", "score": score, "confidence": 0.8,
                     "legend": {"0": "later", "1": "today", "2": "now"},
                     "probabilities": {"0": levels[0], "1": levels[1], "2": levels[2]}}
-            }, "usage": {"input_tokens": 10, "output_tokens": 3}}).to_string();
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).expect("table response");
-            captured
-        }).collect()
+            }, "usage": {"input_tokens": 10, "output_tokens": 3}})
+                .to_string();
+                write!(
+                    stream,
+                    concat!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                        "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
+                    ),
+                    response.len(),
+                    response = response
+                )
+                .expect("table response");
+                captured
+            })
+            .collect()
     });
     (root, handle)
 }
@@ -550,10 +648,21 @@ let q = {
     urgency: {type: score, criteria: ['later' 'today' 'now']}
 }
 
-let rows = ([{id: 1, message: 'urgent', sender: 'a', secret: 'local-1'} {id: 2, message: 'normal', sender: 'b', secret: 'local-2'} {id: 3, message: 'later', sender: 'c', secret: 'local-3'}]
+let rows = ([
+    {id: 1, message: 'urgent', sender: 'a', secret: 'local-1'}
+    {id: 2, message: 'normal', sender: 'b', secret: 'local-2'}
+    {id: 3, message: 'later', sender: 'c', secret: 'local-3'}
+]
     | jev annotate $q --fields [message sender] --context {policy: 'rules'} --metrics --jobs 2
     | select id message sender secret answers jev_meta jev_metrics)
-{all: $rows, filtered: ($rows | where answers.spam.noul > 0.9 | sort-by answers.urgency.score --reverse | reject jev_meta jev_metrics)} | to json --raw
+{
+    all: $rows
+    filtered: (
+        $rows | where answers.spam.noul > 0.9
+        | sort-by answers.urgency.score --reverse
+        | reject jev_meta jev_metrics
+    )
+} | to json --raw
 "#;
     let output = Command::new("nu")
         .args([
@@ -629,14 +738,27 @@ fn annotate_default_answers_and_explicit_legacy_path_in_real_nu() {
     let source = r#"
 let q = {match: {type: noul}}
 let default = ([{id: 1, message: 7}] | jev annotate $q --fields [message] --metrics | first)
-let legacy = ([{id: 2, message: 7}] | jev annotate $q --fields [message] --into jev --metrics | first)
-let shared = ([{id: 3, message: 7} {id: 4, message: 7}] | jev annotate $q --fields [message] --metrics --jobs 1)
+let legacy = ([{id: 2, message: 7}]
+    | jev annotate $q --fields [message] --into jev --metrics | first)
+let shared = ([{id: 3, message: 7} {id: 4, message: 7}]
+    | jev annotate $q --fields [message] --metrics --jobs 1)
 let kept = ([{id: 5}] | jev annotate $q --fields [message] --on-error keep | first)
 let recorded = ([{id: 6}] | jev annotate $q --fields [message] --on-error record | first)
 let empty = ([] | jev annotate $q --fields [message] | length)
-let ordered = ([{id: 7, message: 1} {id: 8, message: 2}] | jev annotate $q --fields [message] --jobs 2 | get id)
-let unordered = ([{id: 9, message: 3} {id: 10, message: 4}] | jev annotate $q --fields [message] --jobs 2 --unordered | get id)
-{default: $default, legacy: $legacy, shared: $shared, kept: $kept, recorded: $recorded, empty: $empty, ordered: $ordered, unordered: $unordered} | to json --raw
+let ordered = ([{id: 7, message: 1} {id: 8, message: 2}]
+    | jev annotate $q --fields [message] --jobs 2 | get id)
+let unordered = ([{id: 9, message: 3} {id: 10, message: 4}]
+    | jev annotate $q --fields [message] --jobs 2 --unordered | get id)
+{
+    default: $default
+    legacy: $legacy
+    shared: $shared
+    kept: $kept
+    recorded: $recorded
+    empty: $empty
+    ordered: $ordered
+    unordered: $unordered
+} | to json --raw
 "#;
     let output = Command::new("nu")
         .args([
@@ -700,8 +822,16 @@ fn annotate_default_destination_collisions_are_terminal_in_real_nu() {
     }
     let (base_url, stop, calls, server) = serve_until_stopped(false);
     for source in [
-        "[{id: 1, message: 7, answers: 'existing'}] | jev annotate {match: {type: noul}} --fields [message] --on-error keep | to json --raw",
-        "[{id: 1, message: 7, answers: 'existing'}] | jev annotate {match: {type: noul}} --fields [message] --on-error record | to json --raw",
+        concat!(
+            "[{id: 1, message: 7, answers: 'existing'}] ",
+            "| jev annotate {match: {type: noul}} --fields [message] ",
+            "--on-error keep | to json --raw"
+        ),
+        concat!(
+            "[{id: 1, message: 7, answers: 'existing'}] ",
+            "| jev annotate {match: {type: noul}} --fields [message] ",
+            "--on-error record | to json --raw"
+        ),
         "[] | jev annotate {match: {type: noul}} --meta-into ai | to json --raw",
         "[] | jev annotate {match: {type: noul}} --metrics-into ai | to json --raw",
     ] {
@@ -736,7 +866,14 @@ fn annotate_nuon_correlates_cached_rows() {
         return;
     }
     let (base_url, stop, calls, server) = serve_until_stopped(false);
-    let source = "let rows = ([{id: 1, message: 7} {id: 2, message: 7} {id: 3, message: 7}] | jev annotate {match: {type: noul}} --fields [message] --jobs 1 --metrics | select id jev_meta jev_metrics); {rows: $rows, elapsed_ns: ($rows | get 0.jev_metrics.elapsed | into int), attempt_elapsed_ns: ($rows | get 0.jev_metrics.attempt_elapsed | into int)} | to json --raw";
+    let source = concat!(
+        "let rows = ([{id: 1, message: 7} {id: 2, message: 7} {id: 3, message: 7}] ",
+        "| jev annotate {match: {type: noul}} --fields [message] ",
+        "--jobs 1 --metrics | select id jev_meta jev_metrics); ",
+        "{rows: $rows, elapsed_ns: ($rows | get 0.jev_metrics.elapsed | into int), ",
+        "attempt_elapsed_ns: ($rows | get 0.jev_metrics.attempt_elapsed | into int)} ",
+        "| to json --raw"
+    );
     let output = Command::new("nu")
         .args([
             "--no-config-file",
@@ -907,7 +1044,10 @@ fn real_nu_help_lists_focused_short_options() {
             "--plugins",
             env!("CARGO_BIN_EXE_nu_plugin_jev"),
             "--commands",
-            "{ask: (help jev ask), annotate: (help jev annotate), models: (help jev models)} | to json --raw",
+            concat!(
+                "{ask: (help jev ask), annotate: (help jev annotate), ",
+                "models: (help jev models)} | to json --raw"
+            ),
         ])
         .output()
         .expect("run isolated Nu");
@@ -954,25 +1094,44 @@ fn serve_model_catalogs(names: &[&str]) -> (String, thread::JoinHandle<Vec<(Stri
         .map(|name| (*name).to_owned())
         .collect::<Vec<_>>();
     let handle = thread::spawn(move || {
-        names.into_iter().map(|name| {
-            let (mut stream, _) = listener.accept().expect("accept model request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone model socket"));
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("read model request line");
-            let parts: Vec<_> = line.split_whitespace().collect();
-            let method = parts[0].to_owned();
-            let path = parts[1].to_owned();
-            loop {
-                line.clear();
-                reader.read_line(&mut line).expect("read model request header");
-                if line == "\r\n" { break; }
-            }
-            let response = serde_json::json!({"models": [{
-                "name": name, "description": "Mock model", "release_date": "opaque"
-            }]}).to_string();
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).expect("write model response");
-            (method, path)
-        }).collect()
+        names
+            .into_iter()
+            .map(|name| {
+                let (mut stream, _) = listener.accept().expect("accept model request");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone model socket"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read model request line");
+                let parts: Vec<_> = line.split_whitespace().collect();
+                let method = parts[0].to_owned();
+                let path = parts[1].to_owned();
+                loop {
+                    line.clear();
+                    reader
+                        .read_line(&mut line)
+                        .expect("read model request header");
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let response = serde_json::json!({"models": [{
+                    "name": name, "description": "Mock model", "release_date": "opaque"
+                }]})
+                .to_string();
+                write!(
+                    stream,
+                    concat!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                        "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
+                    ),
+                    response.len(),
+                    response = response
+                )
+                .expect("write model response");
+                (method, path)
+            })
+            .collect()
     });
     (root, handle)
 }
@@ -984,7 +1143,12 @@ fn real_nu_models_are_fresh_native_records() {
         return;
     }
     let (url, server) = serve_model_catalogs(&["first", "second"]);
-    let source = "{first: (jev models | get models | sort-by name | select name description release_date), second: (jev models | get models | where name == 'second' | select name release_date)} | to json --raw";
+    let source = concat!(
+        "{first: (jev models | get models | sort-by name ",
+        "| select name description release_date), ",
+        "second: (jev models | get models | where name == 'second' ",
+        "| select name release_date)} | to json --raw"
+    );
     let output = Command::new("nu")
         .args([
             "--no-config-file",
@@ -1027,7 +1191,13 @@ fn models_nuon_completion_matches_optional_metrics() {
         return;
     }
     let (base_url, server) = serve_model_catalogs(&["first", "second"]);
-    let source = "let first = (jev models); let second = (jev models --metrics); {first: $first, second: $second, elapsed_ns: ($second.metrics.elapsed | into int), attempt_elapsed_ns: ($second.metrics.attempt_elapsed | into int)} | to json --raw";
+    let source = concat!(
+        "let first = (jev models); let second = (jev models --metrics); ",
+        "{first: $first, second: $second, ",
+        "elapsed_ns: ($second.metrics.elapsed | into int), ",
+        "attempt_elapsed_ns: ($second.metrics.attempt_elapsed | into int)} ",
+        "| to json --raw"
+    );
     let output = Command::new("nu")
         .args([
             "--no-config-file",
@@ -1234,7 +1404,12 @@ fn interrupt_stalled_annotation_stops_local_work() {
         return;
     }
     let (base_url, stop, calls, server) = serve_stalled();
-    let source = "let q = {match: (jev question noul 'Match?')}; 1..1000 | each { |id| {id: $id, message: $id} } | jev annotate $q --fields [message] --jobs 4 | first 10 | to json --raw";
+    let source = concat!(
+        "let q = {match: (jev question noul 'Match?')}; ",
+        "1..1000 | each { |id| {id: $id, message: $id} } ",
+        "| jev annotate $q --fields [message] --jobs 4 ",
+        "| first 10 | to json --raw"
+    );
     let mut child = Command::new("nu")
         .args([
             "--no-config-file",
@@ -1349,7 +1524,10 @@ $env.NU_PLUGIN_JEV_CONFIG = '{FIRST}/.nu_plugin_jev.toml';
 let d = ('hello' | jev ask $q --dry-run | get request.model);
 let e = ('hello' | jev ask $q --config '{EXPLICIT}' --dry-run | get request.model);
 hide-env NU_PLUGIN_JEV_CONFIG;
-let parallel = (['{FIRST}' '{SECOND}'] | par-each { |dir| cd $dir; 'hello' | jev ask $q --dry-run | get request.model } | sort);
+let parallel = (['{FIRST}' '{SECOND}'] | par-each { |dir|
+    cd $dir
+    'hello' | jev ask $q --dry-run | get request.model
+} | sort);
 cd '{SECOND}';
 $env.XDG_CONFIG_HOME = '{LEGACY_USER}';
 let ignored_legacy_files = ('hello' | jev ask $q --dry-run | get request.model);
@@ -1357,7 +1535,10 @@ let explicit_legacy = ('hello' | jev ask $q --config .jev.toml --dry-run | get r
 cd '{BROKEN}';
 let offline = ((jev question noul 'Still offline?') | get type);
 let guidance = (jev | str contains 'jev ask');
-[$a $frozen $b $c $changed_user $changed_env $d $e $parallel $ignored_legacy_files $explicit_legacy $offline $guidance] | to json --raw
+[
+    $a $frozen $b $c $changed_user $changed_env $d $e
+    $parallel $ignored_legacy_files $explicit_legacy $offline $guidance
+] | to json --raw
 "#
     .replace("{FIRST}", &first.to_string_lossy())
     .replace("{SECOND}", &second.to_string_lossy())
@@ -1411,7 +1592,12 @@ fn replaced_environment_names_are_not_selected() {
     }
     let root = std::env::temp_dir().join(format!("jev-old-env-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("isolated config directory");
-    let source = "let q = {match: {type: noul}}; let a = ('hello' | jev ask $q --dry-run | get request.model); let b = ([{message: 'hello'}] | jev annotate $q --dry-run | get 0.request.model); [$a $b] | to json --raw";
+    let source = concat!(
+        "let q = {match: {type: noul}}; ",
+        "let a = ('hello' | jev ask $q --dry-run | get request.model); ",
+        "let b = ([{message: 'hello'}] | jev annotate $q --dry-run ",
+        "| get 0.request.model); [$a $b] | to json --raw"
+    );
     let output = Command::new("nu")
         .args([
             "--no-config-file",
@@ -1549,8 +1735,21 @@ fn live_nu_reuses_compatible_http_connection() {
                 if reader.read_exact(&mut body).is_err() {
                     break;
                 }
-                let response = "{\"model\":\"jev-fixed\",\"answers\":{\"match\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}";
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{response}", response.len()).expect("write response");
+                let response = concat!(
+                    "{\"model\":\"jev-fixed\",\"answers\":{\"match\":",
+                    "{\"type\":\"noul\",\"noul\":0.9}},\"usage\":",
+                    "{\"input_tokens\":1,\"output_tokens\":1}}"
+                );
+                write!(
+                    stream,
+                    concat!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                        "Content-Length: {}\r\nConnection: keep-alive\r\n\r\n{response}"
+                    ),
+                    response.len(),
+                    response = response
+                )
+                .expect("write response");
                 stream.flush().expect("flush response");
                 requests += 1;
                 if requests == 2 {
@@ -1560,7 +1759,12 @@ fn live_nu_reuses_compatible_http_connection() {
         }
         requests
     });
-    let source = "let q = {match: (jev question noul 'Match?')}; let a = ({message: 1} | jev ask $q | get answers.match.noul); let b = ({message: 2} | jev ask $q | get answers.match.noul); [$a $b] | to json --raw";
+    let source = concat!(
+        "let q = {match: (jev question noul 'Match?')}; ",
+        "let a = ({message: 1} | jev ask $q | get answers.match.noul); ",
+        "let b = ({message: 2} | jev ask $q | get answers.match.noul); ",
+        "[$a $b] | to json --raw"
+    );
     let output = Command::new("nu")
         .args([
             "--no-config-file",

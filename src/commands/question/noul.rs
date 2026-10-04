@@ -48,7 +48,10 @@ impl SimplePluginCommand for JevQuestionNoul {
 
     /// Clarifies optional-field behavior in Nu help.
     fn extra_description(&self) -> &str {
-        "No network request is made and pipeline input is not accepted. Missing --yes/--no fields are omitted; an explicitly supplied null remains null."
+        concat!(
+            "No network request is made and pipeline input is not accepted. ",
+            "Missing --yes/--no fields are omitted; an explicitly supplied null remains null."
+        )
     }
 
     /// Shows an offline policy-building example.

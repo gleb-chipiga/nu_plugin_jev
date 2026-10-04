@@ -58,7 +58,14 @@ impl PluginCommand for JevModels {
 
     /// Explains authentication, output, and the absence of implicit evaluation.
     fn extra_description(&self) -> &str {
-        "Requires TYPESAFE_API_KEY or a private configured API key. Sends one authenticated GET /v1/models (plus configured retries), returning {models, meta: {base_url}}; --metrics adds HTTP measurements with request_bytes = 0. Model records preserve name, description, and release_date strings. Results are not cached and do not validate models used by jev ask or jev annotate."
+        concat!(
+            "Requires TYPESAFE_API_KEY or a private configured API key. ",
+            "Sends one authenticated GET /v1/models (plus configured retries), returning ",
+            "{models, meta: {base_url}}; --metrics adds HTTP measurements with ",
+            "request_bytes = 0. Model records preserve name, description, and ",
+            "release_date strings. Results are not cached and do not validate models used ",
+            "by jev ask or jev annotate."
+        )
     }
 
     /// Shows native Nushell filtering of model metadata.
@@ -244,7 +251,13 @@ mod tests {
         assert!(test.eval("$env.TYPESAFE_API_KEY = ''; jev models").is_err());
         let (url, server) = serve(vec![json!({"models": []})]);
         let command = format!(
-            "$env.TYPESAFE_API_KEY = 'test'; $env.NU_PLUGIN_JEV_MODEL = 7; $env.NU_PLUGIN_JEV_JOBS = 'bad'; $env.config.plugins.jev = {{cache: 1}}; jev models --base-url '{url}'"
+            concat!(
+                "$env.TYPESAFE_API_KEY = 'test'; $env.NU_PLUGIN_JEV_MODEL = 7; ",
+                "$env.NU_PLUGIN_JEV_JOBS = 'bad'; ",
+                "$env.config.plugins.jev = {{cache: 1}}; ",
+                "jev models --base-url '{url}'"
+            ),
+            url = url
         );
         assert_eq!(
             to_json(&test.eval(&command)?.into_value(Span::test_data())?).unwrap(),

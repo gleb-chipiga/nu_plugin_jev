@@ -78,7 +78,10 @@ pub(crate) fn serve(
                 reader.read_exact(&mut body).expect("read complete body");
                 let response = response.to_string();
                 let headers = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    concat!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                        "Content-Length: {}\r\nConnection: close\r\n\r\n"
+                    ),
                     response.len()
                 );
                 stream

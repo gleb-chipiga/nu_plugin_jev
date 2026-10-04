@@ -207,18 +207,26 @@ where
         let result = operation.await;
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match &result {
-            Ok(success) => ::tracing::info!(
+            Ok(success) => {
+                let measurement = &success.measurement;
+                let request_bytes = u64::try_from(measurement.request_bytes).unwrap_or(u64::MAX);
+                let response_bytes = u64::try_from(measurement.response_bytes).unwrap_or(u64::MAX);
+                let elapsed_ns = u64::try_from(measurement.elapsed.as_nanos()).unwrap_or(u64::MAX);
+                let attempt_elapsed_ns =
+                    u64::try_from(measurement.attempt_elapsed.as_nanos()).unwrap_or(u64::MAX);
+                ::tracing::info!(
                 duration_ms,
                 count = success.response.models.len(),
                 base_url = %success.base_url,
-                request_bytes = u64::try_from(success.measurement.request_bytes).unwrap_or(u64::MAX),
-                response_bytes = u64::try_from(success.measurement.response_bytes).unwrap_or(u64::MAX),
-                elapsed_ns = u64::try_from(success.measurement.elapsed.as_nanos()).unwrap_or(u64::MAX),
-                attempt_elapsed_ns = u64::try_from(success.measurement.attempt_elapsed.as_nanos()).unwrap_or(u64::MAX),
+                request_bytes,
+                response_bytes,
+                elapsed_ns,
+                attempt_elapsed_ns,
                 attempts = u64::try_from(success.measurement.attempts).unwrap_or(u64::MAX),
                 http_version = success.measurement.http_version_name(),
                 "model listing completed"
-            ),
+                );
+            }
             Err(JevError::Cancelled) => {
                 ::tracing::debug!(duration_ms, "model listing cancelled");
             }
@@ -251,20 +259,28 @@ where
         let result = operation.await;
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match &result {
-            Ok(success) => ::tracing::info!(
+            Ok(success) => {
+                let measurement = &success.measurement;
+                let request_bytes = u64::try_from(measurement.request_bytes).unwrap_or(u64::MAX);
+                let response_bytes = u64::try_from(measurement.response_bytes).unwrap_or(u64::MAX);
+                let elapsed_ns = u64::try_from(measurement.elapsed.as_nanos()).unwrap_or(u64::MAX);
+                let attempt_elapsed_ns =
+                    u64::try_from(measurement.attempt_elapsed.as_nanos()).unwrap_or(u64::MAX);
+                ::tracing::info!(
                 duration_ms,
                 model = %success.response.model,
                 input_tokens = success.response.usage.input_tokens,
                 output_tokens = success.response.usage.output_tokens,
                 base_url = %success.base_url,
-                request_bytes = u64::try_from(success.measurement.request_bytes).unwrap_or(u64::MAX),
-                response_bytes = u64::try_from(success.measurement.response_bytes).unwrap_or(u64::MAX),
-                elapsed_ns = u64::try_from(success.measurement.elapsed.as_nanos()).unwrap_or(u64::MAX),
-                attempt_elapsed_ns = u64::try_from(success.measurement.attempt_elapsed.as_nanos()).unwrap_or(u64::MAX),
+                request_bytes,
+                response_bytes,
+                elapsed_ns,
+                attempt_elapsed_ns,
                 attempts = u64::try_from(success.measurement.attempts).unwrap_or(u64::MAX),
                 http_version = success.measurement.http_version_name(),
                 "evaluation completed"
-            ),
+                );
+            }
             Err(JevError::Cancelled) => {
                 ::tracing::debug!(duration_ms, "evaluation cancelled");
             }
@@ -315,12 +331,31 @@ mod tests {
             return;
         }
         let guard = super::init().expect("initialize isolated diagnostics");
-        let outer = ::tracing::info_span!(target: "nu_plugin_jev::diagnostic_fixture", "outer", command = "ask", request_id = "initial", updated = ::tracing::field::Empty);
+        let outer = ::tracing::info_span!(
+            target: "nu_plugin_jev::diagnostic_fixture",
+            "outer",
+            command = "ask",
+            request_id = "initial",
+            updated = ::tracing::field::Empty
+        );
         let _outer_guard = outer.enter();
         outer.record("updated", 42_i64);
-        let inner = ::tracing::info_span!(target: "nu_plugin_jev::diagnostic_fixture", "inner", kind = "nested");
+        let inner = ::tracing::info_span!(
+            target: "nu_plugin_jev::diagnostic_fixture",
+            "inner",
+            kind = "nested"
+        );
         let _inner_guard = inner.enter();
-        ::tracing::info!(target: "nu_plugin_jev::diagnostic_fixture", count = 7, finite = 1.5_f64, nan = f64::NAN, large = u64::MAX, "odd key" = true, text = "quote\"\n雪", "plugin fixture");
+        ::tracing::info!(
+            target: "nu_plugin_jev::diagnostic_fixture",
+            count = 7,
+            finite = 1.5_f64,
+            nan = f64::NAN,
+            large = u64::MAX,
+            "odd key" = true,
+            text = "quote\"\n雪",
+            "plugin fixture"
+        );
         log::debug!(target: "reqwest", "reqwest fixture");
         log::warn!(target: "unlisted_dependency", "unlisted fixture");
         drop(guard);
@@ -453,7 +488,11 @@ mod tests {
             .args([
                 "--no-config-file",
                 "--commands",
-                "use std/formats *; {single: ($env.JEV_TEST_DIAGNOSTICS | lines | first | from nuon), batch: ($env.JEV_TEST_DIAGNOSTICS | from ndnuon)} | to json --raw",
+                concat!(
+                    "use std/formats *; ",
+                    "{single: ($env.JEV_TEST_DIAGNOSTICS | lines | first | from nuon), ",
+                    "batch: ($env.JEV_TEST_DIAGNOSTICS | from ndnuon)} | to json --raw"
+                ),
             ])
             .env("JEV_TEST_DIAGNOSTICS", diagnostics)
             .output()
