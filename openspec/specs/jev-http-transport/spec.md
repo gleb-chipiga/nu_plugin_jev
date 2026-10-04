@@ -175,19 +175,6 @@ awaiting requests and waits without waiting for timeout expiry.
 - **WHEN** a complete JSON response arrives before the deadline but contract validation finishes after it
 - **THEN** the evaluation reports a timeout without returning that response or success metrics
 
-### Requirement: Bounded abandoned response work
-
-Response decoding and contract validation SHALL have a process-wide bound on
-concurrent blocking work. A timed-out or cancelled evaluation SHALL NOT return
-a late success or retain an unbounded number of newly dispatched blocking
-operations.
-
-#### Scenario: Repeated cancellation during response processing
-
-- **WHEN** several evaluations are cancelled while large responses are being decoded or validated
-- **THEN** their unfinished blocking work remains within a fixed process-wide limit
-- **AND** no cancelled evaluation emits a successful answer or success metrics
-
 ### Requirement: Stable actionable error information
 
 Errors SHALL identify validation, state, field collision, HTTP, transport, timeout, or response failure. HTTP failures SHALL retain status; non-HTTP failures SHALL have none.

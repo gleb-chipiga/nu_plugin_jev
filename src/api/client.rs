@@ -4,8 +4,14 @@ use std::{
     future::Future,
     io::{self, Write},
     num::NonZeroUsize,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(test)]
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -16,7 +22,7 @@ use reqwest::{
     header::{CONTENT_TYPE, HeaderMap, RETRY_AFTER},
 };
 use serde::de::DeserializeOwned;
-use tokio::{sync::Semaphore, task::JoinHandle, time::Instant};
+use tokio::{task::JoinHandle, time::Instant};
 
 use crate::{
     config::{ApiKey, InvocationConfig, ProxyPolicy, TransportConfig, TransportSettings},
@@ -32,24 +38,31 @@ use super::{
 /// Caps one successful JSON response before decoding or retaining it.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Bounds response CPU work retained across every HTTP client in this process.
-static RESPONSE_CPU_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
-
-/// Returns the process-wide capacity for large response decoding and validation.
-fn response_cpu_limiter() -> Arc<Semaphore> {
-    Arc::clone(RESPONSE_CPU_LIMITER.get_or_init(|| {
-        let parallelism = std::thread::available_parallelism().map_or(4, NonZeroUsize::get);
-        Arc::new(Semaphore::new(parallelism.clamp(1, 8)))
-    }))
-}
-
 /// Reuses one HTTP connection pool for every request using the same policy.
 #[derive(Clone)]
 pub(crate) struct JevClient {
     http: Arc<Client>,
-    response_cpu: Arc<Semaphore>,
     #[cfg(test)]
-    response_cpu_stage: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    response_cpu_pause: Option<ResponseCpuPause>,
+}
+
+/// Pauses test-only offloaded work after it starts on a blocking thread.
+#[cfg(test)]
+#[derive(Clone)]
+struct ResponseCpuPause {
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    release: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl ResponseCpuPause {
+    /// Announces entry and waits without blocking a Tokio worker.
+    fn wait(&self) {
+        let _ = self.entered.send(());
+        while !self.release.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 /// Aborts a queued blocking task when its awaiting evaluation is dropped.
@@ -62,20 +75,12 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-/// Runs large response CPU work under a process-wide permit held by the closure.
-async fn response_cpu<T: Send + 'static>(
-    limiter: Arc<Semaphore>,
+/// Runs large response CPU work outside Tokio workers and aborts queued work on drop.
+async fn offload_response_cpu<T: Send + 'static>(
     failure: &'static str,
     work: impl FnOnce() -> Result<T, JevError> + Send + 'static,
 ) -> Result<T, JevError> {
-    let permit = limiter
-        .acquire_owned()
-        .await
-        .map_err(|_| JevError::Response(failure))?;
-    let mut task = AbortOnDrop(tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        work()
-    }));
+    let mut task = AbortOnDrop(tokio::task::spawn_blocking(work));
     (&mut task.0)
         .await
         .map_err(|_| JevError::Response(failure))?
@@ -289,18 +294,9 @@ impl JevClient {
             .map_err(|_| JevError::Transport("cannot initialize Jev HTTP client"))?;
         Ok(Self {
             http: Arc::new(http),
-            response_cpu: response_cpu_limiter(),
             #[cfg(test)]
-            response_cpu_stage: None,
+            response_cpu_pause: None,
         })
-    }
-
-    /// Notifies a test when a decoded response reaches offloaded CPU work.
-    #[cfg(test)]
-    fn mark_response_cpu_stage(&self) {
-        if let Some(observer) = &self.response_cpu_stage {
-            let _ = observer.send(());
-        }
     }
 
     /// Evaluates one complete request and validates every returned typed answer.
@@ -377,16 +373,16 @@ impl JevClient {
                 || JevError::Response("Jev answer does not match the submitted questions");
             let pending = if pending.response_bytes > 64 * 1024 || request.questions.len() > 64 {
                 #[cfg(test)]
-                self.mark_response_cpu_stage();
-                response_cpu(
-                    Arc::clone(&self.response_cpu),
-                    "cannot validate Jev response",
-                    move || {
-                        validate_response(&pending.response, &request.questions)
-                            .map_err(|_| invalid())?;
-                        Ok(pending)
-                    },
-                )
+                let pause = self.response_cpu_pause.clone();
+                offload_response_cpu("cannot validate Jev response", move || {
+                    #[cfg(test)]
+                    if let Some(pause) = pause {
+                        pause.wait();
+                    }
+                    validate_response(&pending.response, &request.questions)
+                        .map_err(|_| invalid())?;
+                    Ok(pending)
+                })
                 .await?
             } else {
                 validate_response(&pending.response, &request.questions).map_err(|_| invalid())?;
@@ -497,16 +493,16 @@ impl JevClient {
                 let response_bytes = body.len();
                 let decoded = if response_bytes > 64 * 1024 {
                     #[cfg(test)]
-                    self.mark_response_cpu_stage();
-                    response_cpu(
-                        Arc::clone(&self.response_cpu),
-                        "cannot decode Jev response",
-                        move || {
-                            serde_json::from_slice::<T>(&body).map_err(|_| {
-                                JevError::Response("Jev returned malformed JSON or missing fields")
-                            })
-                        },
-                    )
+                    let pause = self.response_cpu_pause.clone();
+                    offload_response_cpu("cannot decode Jev response", move || {
+                        #[cfg(test)]
+                        if let Some(pause) = pause {
+                            pause.wait();
+                        }
+                        serde_json::from_slice::<T>(&body).map_err(|_| {
+                            JevError::Response("Jev returned malformed JSON or missing fields")
+                        })
+                    })
                     .await?
                 } else {
                     serde_json::from_slice::<T>(&body).map_err(|_| {
@@ -731,11 +727,21 @@ mod tests {
     };
 
     use super::{
-        Bytes, JevClient, JevClientPool, MAX_RESPONSE_BYTES, jittered_backoff,
-        jittered_backoff_with_entropy, models_url, read_success_body, request_body_bytes,
-        response_cpu, retry_after, retry_after_ms, retry_delay, retryable, server_request_id,
+        Bytes, JevClient, JevClientPool, MAX_RESPONSE_BYTES, ResponseCpuPause, jittered_backoff,
+        jittered_backoff_with_entropy, models_url, offload_response_cpu, read_success_body,
+        request_body_bytes, retry_after, retry_after_ms, retry_delay, retryable, server_request_id,
         system_one_url,
     };
+
+    /// Releases a paused blocking test closure even when its assertion panics.
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+
+    impl Drop for ReleaseOnDrop {
+        /// Lets the worker finish before the test runtime is torn down.
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 
     /// Captures only fields needed to verify outgoing mock requests.
     struct CapturedRequest {
@@ -1455,10 +1461,12 @@ mod tests {
             let (url, server) = serve(vec![MockResponse::json(200, answer)]);
             runtime.block_on(async {
                 let mut client = JevClient::new().unwrap();
-                let limiter = Arc::new(tokio::sync::Semaphore::new(0));
-                client.response_cpu = Arc::clone(&limiter);
-                let (stage_sender, mut stage_receiver) = tokio::sync::mpsc::unbounded_channel();
-                client.response_cpu_stage = Some(stage_sender);
+                let release = ReleaseOnDrop(Arc::new(AtomicBool::new(false)));
+                let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+                client.response_cpu_pause = Some(ResponseCpuPause {
+                    entered,
+                    release: Arc::clone(&release.0),
+                });
                 let mut settings = config(url);
                 settings.timeout = Duration::from_secs(2);
                 let (handle, signal) = CancelHandle::new();
@@ -1468,7 +1476,7 @@ mod tests {
                         .await
                 });
                 assert!(
-                    tokio::time::timeout(Duration::from_secs(1), stage_receiver.recv())
+                    tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
                         .await
                         .unwrap()
                         .is_some(),
@@ -1487,9 +1495,7 @@ mod tests {
                     error.kind_name(),
                     if cancel_early { "cancelled" } else { "timeout" }
                 );
-                limiter.add_permits(1);
-                tokio::task::yield_now().await;
-                assert_eq!(limiter.available_permits(), 1);
+                release.0.store(true, Ordering::Release);
             });
             assert_eq!(server.join().unwrap().len(), 1);
         }
@@ -1507,10 +1513,12 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let mut client = JevClient::new().unwrap();
-            let limiter = Arc::new(tokio::sync::Semaphore::new(0));
-            client.response_cpu = Arc::clone(&limiter);
-            let (stage_sender, mut stage_receiver) = tokio::sync::mpsc::unbounded_channel();
-            client.response_cpu_stage = Some(stage_sender);
+            let release = ReleaseOnDrop(Arc::new(AtomicBool::new(false)));
+            let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+            client.response_cpu_pause = Some(ResponseCpuPause {
+                entered,
+                release: Arc::clone(&release.0),
+            });
             let mut settings = models_config(url);
             settings.timeout = Duration::from_secs(2);
             let (_handle, signal) = CancelHandle::new();
@@ -1520,7 +1528,7 @@ mod tests {
                     .await
             });
             assert!(
-                tokio::time::timeout(Duration::from_secs(1), stage_receiver.recv())
+                tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
                     .await
                     .unwrap()
                     .is_some(),
@@ -1533,45 +1541,40 @@ mod tests {
                 .err()
                 .expect("model decoding wait must fail");
             assert_eq!(error.kind_name(), "timeout");
-            limiter.add_permits(1);
-            tokio::task::yield_now().await;
-            assert_eq!(limiter.available_permits(), 1);
+            release.0.store(true, Ordering::Release);
         });
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
-    /// Keeps a running blocking closure's permit after its async waiter is cancelled.
+    /// A cancelled waiter cannot stop a running closure or return its late result.
     #[test]
-    fn cancelled_running_response_cpu_retains_permit() {
+    fn cancelled_running_response_cpu_has_no_late_delivery() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
-            let limiter = Arc::new(tokio::sync::Semaphore::new(1));
-            let gate = Arc::new(AtomicBool::new(false));
-            let running_gate = Arc::clone(&gate);
+            let release = ReleaseOnDrop(Arc::new(AtomicBool::new(false)));
+            let running_gate = Arc::clone(&release.0);
+            let finished = Arc::new(AtomicBool::new(false));
+            let completed = Arc::clone(&finished);
             let (started, entered) = tokio::sync::oneshot::channel();
-            let operation = tokio::spawn(response_cpu(
-                Arc::clone(&limiter),
-                "test response work",
-                move || {
-                    let _ = started.send(());
-                    while !running_gate.load(Ordering::SeqCst) {
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                    Ok(())
-                },
-            ));
+            let operation = tokio::spawn(offload_response_cpu("test response work", move || {
+                let _ = started.send(());
+                while !running_gate.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                completed.store(true, Ordering::Release);
+                Ok(())
+            }));
             entered.await.unwrap();
             operation.abort();
             let cancellation = tokio::time::timeout(Duration::from_secs(1), operation).await;
-            let held_while_running = limiter.available_permits();
-            gate.store(true, Ordering::SeqCst);
             assert!(cancellation.unwrap().unwrap_err().is_cancelled());
-            assert_eq!(held_while_running, 0);
+            assert!(!finished.load(Ordering::Acquire));
+            release.0.store(true, Ordering::Release);
             tokio::time::timeout(Duration::from_secs(1), async {
-                while limiter.available_permits() != 1 {
+                while !finished.load(Ordering::Acquire) {
                     tokio::task::yield_now().await;
                 }
             })
@@ -1580,9 +1583,9 @@ mod tests {
         });
     }
 
-    /// Aborts queued work and repeated waiters without starting their closures.
+    /// Dropping an awaiting evaluation aborts its queued blocking closure.
     #[test]
-    fn response_cpu_work_is_bounded_after_waiter_drop() {
+    fn queued_response_cpu_work_is_aborted_after_waiter_drop() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .max_blocking_threads(1)
@@ -1590,74 +1593,28 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let limiter = Arc::new(tokio::sync::Semaphore::new(2));
-            let gate = Arc::new(AtomicBool::new(false));
-            let running_gate = Arc::clone(&gate);
+            let release = ReleaseOnDrop(Arc::new(AtomicBool::new(false)));
+            let running_gate = Arc::clone(&release.0);
             let (started, entered) = tokio::sync::oneshot::channel();
-            let first = tokio::spawn(response_cpu(
-                Arc::clone(&limiter),
-                "test response work",
-                move || {
-                    let _ = started.send(());
-                    while !running_gate.load(Ordering::SeqCst) {
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                    Ok(())
-                },
-            ));
+            let first = tokio::spawn(offload_response_cpu("test response work", move || {
+                let _ = started.send(());
+                while !running_gate.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok(())
+            }));
             entered.await.unwrap();
             let executions = Arc::new(AtomicUsize::new(0));
             let queued_executions = Arc::clone(&executions);
-            let queued = tokio::spawn(response_cpu(
-                Arc::clone(&limiter),
-                "test response work",
-                move || {
-                    queued_executions.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                },
-            ));
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while limiter.available_permits() != 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            let waiters: Vec<_> = (0..32)
-                .map(|_| {
-                    let limiter = Arc::clone(&limiter);
-                    let executions = Arc::clone(&executions);
-                    tokio::spawn(response_cpu(limiter, "test response work", move || {
-                        executions.fetch_add(1, Ordering::SeqCst);
-                        Ok(())
-                    }))
-                })
-                .collect();
-            tokio::task::yield_now().await;
-            waiters.iter().for_each(tokio::task::JoinHandle::abort);
-            queued.abort();
-            first.abort();
-            let cancelled = tokio::time::timeout(Duration::from_secs(1), async {
-                let queued = queued.await;
-                let first = first.await;
-                let waiters = futures::future::join_all(waiters).await;
-                (queued, first, waiters)
-            })
-            .await;
-            gate.store(true, Ordering::SeqCst);
-            let (queued, first, waiters) = cancelled.unwrap();
-            assert!(queued.unwrap_err().is_cancelled());
-            assert!(first.unwrap_err().is_cancelled());
-            for waiter in waiters {
-                assert!(waiter.unwrap_err().is_cancelled());
-            }
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while limiter.available_permits() != 2 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            let mut queued = Box::pin(offload_response_cpu("test response work", move || {
+                queued_executions.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }));
+            assert!(futures::poll!(queued.as_mut()).is_pending());
+            drop(queued);
+            release.0.store(true, Ordering::Release);
+            first.await.unwrap().unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
             assert_eq!(executions.load(Ordering::SeqCst), 0);
         });
     }
@@ -2264,11 +2221,6 @@ mod tests {
                 .iter()
                 .all(|client| Arc::ptr_eq(&client.http, &selected[0].http))
         );
-        assert!(
-            selected
-                .iter()
-                .all(|client| Arc::ptr_eq(&client.response_cpu, &pool.auto.response_cpu))
-        );
     }
 
     /// Routes through an explicit HTTP proxy even for a localhost target.
@@ -2599,8 +2551,7 @@ mod tests {
                         .build()
                         .unwrap(),
                 ),
-                response_cpu: super::response_cpu_limiter(),
-                response_cpu_stage: None,
+                response_cpu_pause: None,
             };
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2642,8 +2593,7 @@ mod tests {
                     .build()
                     .unwrap(),
             ),
-            response_cpu: super::response_cpu_limiter(),
-            response_cpu_stage: None,
+            response_cpu_pause: None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
