@@ -316,6 +316,20 @@ The repository SHALL include `skills/jev-nushell/SKILL.md` for agents composing 
 - **WHEN** the Jev-specific proxy policy is implemented and documented for users
 - **THEN** the repository skill is updated to describe the implemented policy and its distinction from ordinary process/OS proxy discovery
 
+### Requirement: Task-focused repository usage skill
+
+The repository-owned usage skill SHALL include implemented guidance only when it affects command or flag choice, outbound data, result or error interpretation, access configuration, or material disclosure risks, excluding internal mechanics with no such effect.
+
+#### Scenario: Internal cancellation mechanism
+
+- **WHEN** an engineering spec describes what happens to an external iterator blocked in `next()` during cancellation
+- **THEN** the usage skill omits that mechanism because it does not change how an agent composes or consumes a Jev pipeline
+
+#### Scenario: Actionable outbound-state selection
+
+- **WHEN** `jev annotate` offers options that change which source fields are sent to the API
+- **THEN** the usage skill explains those options because they change what data leaves Nushell
+
 ### Requirement: Opt-in newline-delimited NUON diagnostics
 
 `NU_PLUGIN_JEV_LOG_FORMAT` SHALL select `text` or `nuon` at plugin startup, defaulting to text. An invalid explicit value SHALL fail startup without writing diagnostics into the plugin protocol.

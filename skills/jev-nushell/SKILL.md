@@ -24,9 +24,7 @@ Run bare `jev` without pipeline input for offline guidance.
   `--fields <list>` restrict outbound data without removing source columns;
   they cannot be combined. Duplicate keys in selected values fail, while
   unselected row fields are not inspected or sent. Shared context is sent with
-  each row. Dropping the output or interrupting cancels local HTTP work and
-  stops new row dispatch; an external iterator already blocked in `next()`
-  cannot be forced to return, but its eventual row is discarded.
+  each row.
 - Use native Nu commands for filtering, sorting, and projecting answers. There
   are no scalar `jev noul|choice|score` or `jev where` commands.
 - Use `jev models` to fetch the current model catalog. It accepts no pipeline
@@ -80,11 +78,9 @@ jev models | get models | sort-by name | select name release_date
   `jev_metrics` on `annotate`. Reused rows share `jev_metrics.request_id`;
   count usage and body bytes once per distinct ID.
 - With `--on-error keep` or `record`, some rows lack answers. Check for an
-  annotation before accessing nested answer fields. Nu declares `annotate`
-  output as `list<any>` because `keep` can pass through non-record rows.
+  annotation before accessing nested answer fields.
   `record` adds `jev_error: {kind, message, status}`; only HTTP failures have a
-  numeric status. State paths are escaped and bounded; nested upstream Nu
-  error text is not copied into row diagnostics.
+  numeric status.
 - `NU_PLUGIN_JEV_LOG=info|debug` enables plugin-only text diagnostics.
   Third-party logs may contain secrets and are not automatically redacted.
   To enable them, select targets explicitly, for example

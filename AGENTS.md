@@ -23,6 +23,10 @@
   as command, flag, state, response, configuration, proxy, error, or safety
   behavior changes; update README examples and guidance alongside it. Do not
   describe planned OpenSpec behavior as already implemented.
+- Keep the usage skill focused on implemented guidance that changes command
+  or flag choice, outbound data, result or error interpretation, access
+  configuration, or material disclosure risks. Leave non-actionable
+  implementation mechanics in code and technical specs.
 - Read `skills/jev-nushell/SKILL.md` when preparing Jev/Nushell usage examples
   or workflows for this repository, even if the root-level skill directory is
   not included in an agent's automatic skill discovery paths.
