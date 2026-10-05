@@ -398,7 +398,12 @@ $result
         assert_eq!(live["metrics"]["request_bytes"], preview["request_bytes"]);
         assert_eq!(live["metrics"]["response_bytes"], response_bytes);
         assert_eq!(live["metrics"]["attempts"], 1);
-        assert_eq!(live["metrics"]["http_version"], "HTTP/1.1");
+        let expected_version = if cfg!(feature = "http2-prior-knowledge") {
+            "HTTP/2"
+        } else {
+            "HTTP/1.1"
+        };
+        assert_eq!(live["metrics"]["http_version"], expected_version);
         assert_eq!(
             live["metrics"]["elapsed"],
             live["metrics"]["attempt_elapsed"]
@@ -480,14 +485,12 @@ $result
         );
         let result = test.eval(&source)?.into_value(Span::test_data())?;
         assert_eq!(to_json(&result).unwrap().as_array().unwrap().len(), 2);
-        assert_eq!(
-            first_server.join().unwrap()[0].path,
-            "http://localhost:1/v1/systemone"
-        );
-        assert_eq!(
-            second_server.join().unwrap()[0].path,
-            "http://localhost:1/v1/systemone"
-        );
+        let first = first_server.join().unwrap();
+        let second = second_server.join().unwrap();
+        assert_eq!(first[0].path, "/v1/systemone");
+        assert_eq!(second[0].path, "/v1/systemone");
+        assert_eq!(first[0].authority.as_deref(), Some("localhost:1"));
+        assert_eq!(second[0].authority.as_deref(), Some("localhost:1"));
 
         let preview = test
             .eval(concat!(

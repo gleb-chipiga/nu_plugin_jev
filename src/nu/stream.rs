@@ -549,12 +549,10 @@ async fn send_or_cancel(
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc, Barrier,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
     use std::{
-        io::{BufRead, BufReader, Read, Write},
-        net::TcpListener,
         thread,
         time::{Duration, Instant},
     };
@@ -570,6 +568,7 @@ mod tests {
         },
         commands::tests::serve,
         config::{ApiKey, ConfigScope, ConfigSources, resolve},
+        h2_fixture,
         nu::value::to_json,
     };
 
@@ -646,7 +645,11 @@ mod tests {
             (cancel.clone(), signal),
         )
         .unwrap();
-        assert_eq!(server.join().unwrap().len(), 2);
+        server.wait_for_requests(2);
+        let ready = Instant::now() + Duration::from_secs(1);
+        while output.receiver.len() != 1 && Instant::now() < ready {
+            thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(output.receiver.len(), 1);
         assert!(!output.receiver.is_closed());
         cancel.cancel();
@@ -658,6 +661,7 @@ mod tests {
             output.receiver.is_closed(),
             "supervisor did not close a full output after cancellation"
         );
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     /// An external iterator may stall, but its returned row is discarded after cancellation.
@@ -859,202 +863,83 @@ mod tests {
         let _ = server.join();
     }
 
-    /// Serves two requests concurrently and intentionally delays state zero.
-    fn serve_out_of_order() -> (String, thread::JoinHandle<usize>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let root = format!("http://{}", listener.local_addr().unwrap());
+    /// Counts overlapping HTTP/2 streams and returns their peak on join.
+    struct PeakServer {
+        server: h2_fixture::TestServer,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl PeakServer {
+        /// Stops the server after its two requests and returns peak concurrency.
+        fn join(self) -> thread::Result<usize> {
+            self.server.join().map(|_| self.peak.load(Ordering::SeqCst))
+        }
+    }
+
+    /// Serves two streams concurrently and intentionally delays state zero.
+    fn serve_out_of_order() -> (String, PeakServer) {
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
-        let barrier = Arc::new(Barrier::new(2));
-        let handle = thread::spawn(move || {
-            let workers: Vec<_> = (0..2)
-                .map(|_| {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    let active = Arc::clone(&active);
-                    let peak = Arc::clone(&peak);
-                    let barrier = Arc::clone(&barrier);
-                    thread::spawn(move || {
-                        let mut reader = BufReader::new(stream.try_clone().unwrap());
-                        let mut line = String::new();
-                        reader.read_line(&mut line).unwrap();
-                        let mut length = 0;
-                        loop {
-                            line.clear();
-                            reader.read_line(&mut line).unwrap();
-                            if line == "\r\n" {
-                                break;
-                            }
-                            if let Some((name, value)) = line.split_once(':')
-                                && name.eq_ignore_ascii_case("content-length")
-                            {
-                                length = value.trim().parse().unwrap();
-                            }
-                        }
-                        let mut body = vec![0; length];
-                        reader.read_exact(&mut body).unwrap();
-                        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
-                        peak.fetch_max(count, Ordering::SeqCst);
-                        barrier.wait();
-                        if request["state"] == 0 {
-                            thread::sleep(Duration::from_millis(120));
-                        }
-                        let response = answer(1).to_string();
-                        let _ = write!(
-                            stream,
-                            concat!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
-                                "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
-                            ),
-                            response.len(),
-                            response = response
-                        );
-                        active.fetch_sub(1, Ordering::SeqCst);
-                    })
-                })
-                .collect();
-            workers
-                .into_iter()
-                .for_each(|worker| worker.join().unwrap());
-            peak.load(Ordering::SeqCst)
+        let observed_peak = Arc::clone(&peak);
+        let (root, server) = h2_fixture::serve_unbounded(move |_, captured| {
+            let request: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+            let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+            observed_peak.fetch_max(count, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while observed_peak.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+            let mut response = h2_fixture::Response::json(200, answer(1));
+            if request["state"] == 0 {
+                response.delay = Duration::from_millis(120);
+            }
+            response
         });
-        (root, handle)
+        (root, PeakServer { server, peak })
     }
 
     /// Delays one local response long enough for duplicate admission or failure bypass.
-    fn serve_delayed_one(response: serde_json::Value) -> (String, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let root = format!("http://{}", listener.local_addr().unwrap());
-        let handle = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            && Instant::now() < deadline =>
-                    {
-                        thread::sleep(Duration::from_millis(2))
-                    }
-                    Err(_) => return,
-                }
-            };
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                return;
-            }
-            let mut length = 0;
-            loop {
-                line.clear();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                    return;
-                }
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some((name, value)) = line.split_once(':')
-                    && name.eq_ignore_ascii_case("content-length")
-                {
-                    length = value.trim().parse().unwrap();
-                }
-            }
-            let mut body = vec![0; length];
-            if reader.read_exact(&mut body).is_err() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(120));
-            let response = response.to_string();
-            let _ = write!(
-                stream,
-                concat!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
-                    "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
-                ),
-                response.len(),
-                response = response
-            );
-        });
-        (root, handle)
+    fn serve_delayed_one(response: serde_json::Value) -> (String, h2_fixture::TestServer) {
+        h2_fixture::serve_unbounded(move |_, _| {
+            let mut response = h2_fixture::Response::json(200, response.clone());
+            response.delay = Duration::from_millis(120);
+            response
+        })
     }
 
-    /// Gates the first real HTTP response and counts every accepted request.
+    /// Gates the first HTTP/2 response and counts each request stream.
     struct GatedServer {
         root: String,
         started: Option<tokio::sync::oneshot::Receiver<()>>,
         release: Option<std::sync::mpsc::Sender<()>>,
-        stop: std::sync::mpsc::Sender<()>,
-        worker: thread::JoinHandle<usize>,
+        worker: h2_fixture::TestServer,
     }
 
     impl GatedServer {
         /// Starts a loopback server that holds its first response until explicitly released.
         fn new(response: serde_json::Value) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let root = format!("http://{}", listener.local_addr().unwrap());
-            let response = response.to_string();
             let (started_tx, started) = tokio::sync::oneshot::channel();
             let (release, release_rx) = std::sync::mpsc::channel();
-            let (stop, stop_rx) = std::sync::mpsc::channel();
-            let worker = thread::spawn(move || {
-                let mut started_tx = Some(started_tx);
-                let mut requests = 0;
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while Instant::now() < deadline && stop_rx.try_recv().is_err() {
-                    let (mut stream, _) = match listener.accept() {
-                        Ok(connection) => connection,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(1));
-                            continue;
-                        }
-                        Err(error) => panic!("gated server accept failed: {error}"),
-                    };
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    let mut length = 0;
-                    loop {
-                        line.clear();
-                        reader.read_line(&mut line).unwrap();
-                        if line == "\r\n" {
-                            break;
-                        }
-                        if let Some((name, value)) = line.split_once(':')
-                            && name.eq_ignore_ascii_case("content-length")
-                        {
-                            length = value.trim().parse().unwrap();
-                        }
-                    }
-                    let mut body = vec![0; length];
-                    reader.read_exact(&mut body).unwrap();
-                    requests += 1;
-                    if let Some(started_tx) = started_tx.take() {
+            let started_tx = Mutex::new(Some(started_tx));
+            let release_rx = Mutex::new(release_rx);
+            let (root, worker) = h2_fixture::serve_unbounded(move |index, _| {
+                if index == 0 {
+                    if let Some(started_tx) = started_tx.lock().unwrap().take() {
                         let _ = started_tx.send(());
-                        release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
                     }
-                    write!(
-                        stream,
-                        concat!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
-                            "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
-                        ),
-                        response.len(),
-                        response = response
-                    )
-                    .unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap();
                 }
-                requests
+                h2_fixture::Response::json(200, response.clone())
             });
             Self {
                 root,
                 started: Some(started),
                 release: Some(release),
-                stop,
                 worker,
             }
         }
@@ -1069,10 +954,9 @@ mod tests {
             self.release.take().unwrap().send(()).unwrap();
         }
 
-        /// Stops the fixture and returns the number of accepted HTTP requests.
+        /// Stops the fixture and returns the number of accepted HTTP/2 streams.
         fn finish(self) -> usize {
-            self.stop.send(()).unwrap();
-            self.worker.join().unwrap()
+            self.worker.join().unwrap().len()
         }
     }
 
@@ -1094,113 +978,33 @@ mod tests {
     }
 
     /// Returns one retryable status before a valid response for the same logical request.
-    fn serve_retry_once() -> (String, thread::JoinHandle<usize>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let root = format!("http://{}", listener.local_addr().unwrap());
-        let handle = thread::spawn(move || {
-            (0..2)
-                .map(|attempt| {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    let mut length = 0;
-                    loop {
-                        line.clear();
-                        reader.read_line(&mut line).unwrap();
-                        if line == "\r\n" {
-                            break;
-                        }
-                        if let Some((name, value)) = line.split_once(':')
-                            && name.eq_ignore_ascii_case("content-length")
-                        {
-                            length = value.trim().parse().unwrap();
-                        }
-                    }
-                    let mut body = vec![0; length];
-                    reader.read_exact(&mut body).unwrap();
-                    if attempt == 0 {
-                        let _ = write!(
-                            stream,
-                            concat!(
-                                "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\n",
-                                "Content-Length: 0\r\nConnection: close\r\n\r\n"
-                            )
-                        );
-                        thread::sleep(Duration::from_millis(40));
-                    } else {
-                        let response = answer(1).to_string();
-                        let _ = write!(
-                            stream,
-                            concat!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
-                                "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
-                            ),
-                            response.len(),
-                            response = response
-                        );
-                    }
-                    1_usize
-                })
-                .sum()
-        });
-        (root, handle)
+    fn serve_retry_once() -> (String, h2_fixture::TestServer) {
+        h2_fixture::serve(2, |attempt, _| {
+            if attempt == 0 {
+                let mut response = h2_fixture::Response::json(503, json!({}));
+                response.headers.push(("retry-after".into(), "0".into()));
+                response
+            } else {
+                h2_fixture::Response::json(200, answer(1))
+            }
+        })
     }
 
-    /// Holds one retryable failure long enough to test output-drop cancellation.
-    fn serve_long_retry() -> (String, Arc<AtomicUsize>, thread::JoinHandle<usize>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let root = format!("http://{}", listener.local_addr().unwrap());
+    /// Returns one retryable failure, then success, to observe whether output drop stops retries.
+    fn serve_long_retry() -> (String, Arc<AtomicUsize>, h2_fixture::TestServer) {
         let calls = Arc::new(AtomicUsize::new(0));
         let server_calls = Arc::clone(&calls);
-        let handle = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_millis(1400);
-            while Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut reader = BufReader::new(stream.try_clone().unwrap());
-                        let mut line = String::new();
-                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                            continue;
-                        }
-                        let mut length = 0;
-                        loop {
-                            line.clear();
-                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                                break;
-                            }
-                            if line == "\r\n" {
-                                break;
-                            }
-                            if let Some((name, value)) = line.split_once(':')
-                                && name.eq_ignore_ascii_case("content-length")
-                            {
-                                length = value.trim().parse().unwrap();
-                            }
-                        }
-                        let mut body = vec![0; length];
-                        if reader.read_exact(&mut body).is_err() {
-                            continue;
-                        }
-                        server_calls.fetch_add(1, Ordering::SeqCst);
-                        let _ = write!(
-                            stream,
-                            concat!(
-                                "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\n",
-                                "Content-Length: 0\r\nConnection: close\r\n\r\n"
-                            )
-                        );
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(2))
-                    }
-                    Err(error) => panic!("retry mock accept failed: {error}"),
-                }
+        let (root, server) = h2_fixture::serve_unbounded(move |attempt, _| {
+            server_calls.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                let mut response = h2_fixture::Response::json(503, json!({}));
+                response.headers.push(("retry-after".into(), "1".into()));
+                response
+            } else {
+                h2_fixture::Response::json(200, answer(1))
             }
-            server_calls.load(Ordering::SeqCst)
         });
-        (root, calls, handle)
+        (root, calls, server)
     }
 
     /// Keeps normal output ordered while unordered mode releases the faster row first.
@@ -1329,7 +1133,7 @@ mod tests {
             rows[0].result.as_ref().unwrap().request_id,
             rows[1].result.as_ref().unwrap().request_id
         );
-        server.join().unwrap();
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     /// Joins a channel-admitted duplicate before retiring a success or error group.
@@ -1513,7 +1317,7 @@ mod tests {
             rows[0].result.as_ref().unwrap_err(),
             rows[1].result.as_ref().unwrap_err()
         ));
-        server.join().unwrap();
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     /// Subscribers retain one logical identity through every retry attempt.
@@ -1538,7 +1342,7 @@ mod tests {
         let second = rows[1].result.as_ref().unwrap();
         assert_eq!(first.request_id, second.request_id);
         assert!(Arc::ptr_eq(first, second));
-        assert_eq!(server.join().unwrap(), 2);
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     /// A terminal row failure bypasses a slow earlier slot in ordered mode.
@@ -1757,48 +1561,74 @@ mod tests {
     /// Closing one output during Retry-After does not cancel a simultaneous invocation.
     #[test]
     fn output_drop_cancels_retry_without_affecting_another_invocation() {
-        let (stalled_url, stalled_calls, stalled_server) = serve_long_retry();
-        let good = answer(1);
-        let (healthy_url, healthy_server) = serve(vec![good]);
-        let runtime = runtime();
-        let client = JevClient::new().unwrap();
-        let mut stalled_setup = setup(&stalled_url, 1);
-        stalled_setup.client = client.clone();
-        stalled_setup.key = ApiKey::for_test("stalled-key");
-        let stalled = start(
-            Arc::clone(&runtime),
-            stalled_setup,
-            Box::new(std::iter::once(Value::test_string("slow"))),
-            Box::new(build),
-            None,
-            CancelHandle::new(),
-        )
-        .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while stalled_calls.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(2));
+        for close_output in [true, false] {
+            let (stalled_url, stalled_calls, stalled_server) = serve_long_retry();
+            let (healthy_url, healthy_server) = serve(vec![answer(1)]);
+            let runtime = runtime();
+            let mut client = JevClient::new().unwrap();
+            let (retry_started, mut retry_waits) = tokio::sync::mpsc::channel(1);
+            client.observe_retry_waits(retry_started);
+            let mut stalled_setup = setup(&stalled_url, 1);
+            stalled_setup.client = client.clone();
+            stalled_setup.key = ApiKey::for_test("stalled-key");
+            let stalled = start(
+                Arc::clone(&runtime),
+                stalled_setup,
+                Box::new(std::iter::once(Value::test_string("slow"))),
+                Box::new(build),
+                None,
+                CancelHandle::new(),
+            )
+            .unwrap();
+            let (retry_due, delay) = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), retry_waits.recv())
+                    .await
+                    .expect("client did not enter its retry wait")
+                    .expect("retry observer closed")
+            });
+            assert_eq!(delay, Duration::from_secs(1));
+            assert_eq!(stalled_calls.load(Ordering::SeqCst), 1);
+            let mut healthy_setup = setup(&healthy_url, 1);
+            healthy_setup.client = client;
+            healthy_setup.key = ApiKey::for_test("healthy-key");
+            let healthy = start(
+                Arc::clone(&runtime),
+                healthy_setup,
+                Box::new(std::iter::once(Value::test_string("healthy"))),
+                Box::new(build),
+                None,
+                CancelHandle::new(),
+            )
+            .unwrap();
+            let mut stalled = Some(stalled);
+            if close_output {
+                assert!(
+                    Instant::now() < retry_due,
+                    "retry wait ended before output drop"
+                );
+                drop(stalled.take());
+            }
+            let rows: Vec<_> = healthy.collect();
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].result.is_ok());
+            assert_eq!(
+                healthy_server.join().unwrap()[0].authorization.as_deref(),
+                Some("Bearer healthy-key")
+            );
+            let observed_until = retry_due + Duration::from_millis(250);
+            thread::sleep(observed_until.saturating_duration_since(Instant::now()));
+            let expected = if close_output { 1 } else { 2 };
+            if let Some(mut output) = stalled.take() {
+                stalled_server.wait_for_requests(2);
+                let row = output
+                    .next()
+                    .expect("open output should receive the retried result");
+                assert!(row.result.is_ok());
+                drop(row);
+                assert!(output.next().is_none());
+            }
+            assert_eq!(stalled_calls.load(Ordering::SeqCst), expected);
+            assert_eq!(stalled_server.join().unwrap().len(), expected);
         }
-        assert_eq!(stalled_calls.load(Ordering::SeqCst), 1);
-        let mut healthy_setup = setup(&healthy_url, 1);
-        healthy_setup.client = client;
-        healthy_setup.key = ApiKey::for_test("healthy-key");
-        let healthy = start(
-            Arc::clone(&runtime),
-            healthy_setup,
-            Box::new(std::iter::once(Value::test_string("healthy"))),
-            Box::new(build),
-            None,
-            CancelHandle::new(),
-        )
-        .unwrap();
-        drop(stalled);
-        let rows: Vec<_> = healthy.collect();
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].result.is_ok());
-        assert_eq!(
-            healthy_server.join().unwrap()[0].authorization.as_deref(),
-            Some("Bearer healthy-key")
-        );
-        assert_eq!(stalled_server.join().unwrap(), 1);
     }
 }

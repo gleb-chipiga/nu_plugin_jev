@@ -36,9 +36,19 @@ plugin use jev
 help jev
 ```
 
-The default build uses mimalloc and supports NUON diagnostics. Pass
-`--no-default-features` to `cargo install` to use the system allocator and omit
-NUON diagnostics; add `--features nuon-tracing-format` to keep NUON support.
+The default build uses mimalloc, supports NUON diagnostics, and requires
+HTTP/2 for live requests. A custom `base_url` and its proxy route must support
+HTTP/2; local `http://` services can use cleartext prior-knowledge HTTP/2.
+If an endpoint supports only HTTP/1.1, rebuild without the default-enabled
+`http2-prior-knowledge` feature while retaining the other defaults:
+
+```nu
+cargo install --path . --locked --no-default-features --features mimalloc,nuon-tracing-format
+```
+
+That build retains normal HTTPS HTTP/2 negotiation with HTTP/1.1 fallback.
+There is no runtime protocol switch. Plain `--no-default-features` also uses
+the system allocator and omits NUON diagnostic formatting.
 
 Live requests need an API key from `TYPESAFE_API_KEY` or a private TOML file.
 Question constructors and `--dry-run` work without a key or network access.

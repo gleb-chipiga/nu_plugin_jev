@@ -1,16 +1,18 @@
 //! Exercises streaming annotation through the actual Nushell plugin protocol.
 
 use std::{
-    io::{BufRead, BufReader, Read, Write},
-    net::TcpListener,
     process::Command,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
+
+/// Runs ready-made HTTP/2 fixtures for the actual plugin binary.
+#[path = "support/h2_fixture.rs"]
+mod h2_fixture;
 
 /// Parses plugin diagnostics with Nu's single-record and newline-delimited NUON readers.
 #[cfg(feature = "nuon-tracing-format")]
@@ -52,82 +54,24 @@ fn diagnostic_request_id(record: &serde_json::Value) -> Option<&str> {
 }
 
 /// Responds to local System One requests until the subprocess completes.
-fn serve_until_stopped(
-    selective: bool,
-) -> (
-    String,
-    Arc<AtomicBool>,
-    Arc<AtomicUsize>,
-    thread::JoinHandle<()>,
-) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local mock");
-    listener
-        .set_nonblocking(true)
-        .expect("configure local mock");
-    let root = format!("http://{}", listener.local_addr().expect("local address"));
-    let stop = Arc::new(AtomicBool::new(false));
+fn serve_until_stopped(selective: bool) -> (String, Arc<AtomicUsize>, h2_fixture::TestServer) {
     let calls = Arc::new(AtomicUsize::new(0));
-    let server_stop = Arc::clone(&stop);
     let server_calls = Arc::clone(&calls);
-    let handle = thread::spawn(move || {
-        while !server_stop.load(Ordering::SeqCst) {
-            let (mut stream, _) = match listener.accept() {
-                Ok(pair) => pair,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(2));
-                    continue;
-                }
-                Err(error) => panic!("local mock accept failed: {error}"),
-            };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("request timeout");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone socket"));
-            let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                continue;
-            }
-            let mut length = 0;
-            loop {
-                line.clear();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                    break;
-                }
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some((name, value)) = line.split_once(':')
-                    && name.eq_ignore_ascii_case("content-length")
-                {
-                    length = value.trim().parse().expect("body length");
-                }
-            }
-            let mut body = vec![0; length];
-            if reader.read_exact(&mut body).is_err() {
-                continue;
-            }
-            server_calls.fetch_add(1, Ordering::SeqCst);
-            let state: serde_json::Value = serde_json::from_slice(&body).expect("request body");
-            let id = state["state"]["message"].as_i64().expect("selected row id");
-            let probability = if !selective || id % 5 == 0 { 0.9 } else { 0.1 };
-            let response = serde_json::json!({
+    let (root, server) = h2_fixture::serve_unbounded(move |_, request| {
+        server_calls.fetch_add(1, Ordering::SeqCst);
+        let state: serde_json::Value = serde_json::from_slice(&request.body).expect("request body");
+        let id = state["state"]["message"].as_i64().expect("selected row id");
+        let probability = if !selective || id % 5 == 0 { 0.9 } else { 0.1 };
+        h2_fixture::Response::json(
+            200,
+            serde_json::json!({
                 "model": "jev-fixed",
                 "answers": {"match": {"type": "noul", "noul": probability}},
                 "usage": {"input_tokens": 1, "output_tokens": 1}
-            })
-            .to_string();
-            let _ = write!(
-                stream,
-                concat!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
-                    "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
-                ),
-                response.len(),
-                response = response
-            );
-        }
+            }),
+        )
     });
-    (root, stop, calls, handle)
+    (root, calls, server)
 }
 
 /// Runs the same native Nu pipeline against an isolated local mock service.
@@ -135,7 +79,7 @@ fn run_pipeline(selective: bool) -> Option<(Vec<serde_json::Value>, usize)> {
     if Command::new("nu").arg("--version").output().is_err() {
         return None;
     }
-    let (base_url, stop, calls, server) = serve_until_stopped(selective);
+    let (base_url, calls, server) = serve_until_stopped(selective);
     let source = if selective {
         concat!(
             "let q = {match: (jev question noul 'Is this a match?')}; ",
@@ -173,14 +117,12 @@ fn run_pipeline(selective: bool) -> Option<(Vec<serde_json::Value>, usize)> {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            stop.store(true, Ordering::SeqCst);
             server.join().expect("join local mock after timeout");
             panic!("Nu pipeline did not stop after first 10 rows");
         }
         thread::sleep(Duration::from_millis(20));
     }
     let output = child.wait_with_output().expect("read Nu output");
-    stop.store(true, Ordering::SeqCst);
     server.join().expect("join local mock");
     assert!(
         output.status.success(),
@@ -227,52 +169,20 @@ fn annotate_where_rejects_many_rows_before_first_ten() {
 }
 
 /// Serves one complete mixed-answer envelope and returns the captured request body.
-fn serve_mixed_once() -> (String, thread::JoinHandle<serde_json::Value>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mixed mock");
-    let root = format!("http://{}", listener.local_addr().expect("local address"));
-    let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept mixed request");
-        let mut reader = BufReader::new(stream.try_clone().expect("clone socket"));
-        let mut line = String::new();
-        reader.read_line(&mut line).expect("request line");
-        let mut length = 0;
-        loop {
-            line.clear();
-            reader.read_line(&mut line).expect("request header");
-            if line == "\r\n" {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':')
-                && name.eq_ignore_ascii_case("content-length")
-            {
-                length = value.trim().parse().expect("body length");
-            }
-        }
-        let mut body = vec![0; length];
-        reader.read_exact(&mut body).expect("request body");
-        let captured = serde_json::from_slice(&body).expect("request JSON");
-        let response = serde_json::json!({"model": "jev-fixed", "answers": {
+fn serve_mixed_once() -> (String, h2_fixture::TestServer) {
+    h2_fixture::serve(1, |_, _| {
+        h2_fixture::Response::json(
+            200,
+            serde_json::json!({"model": "jev-fixed", "answers": {
             "spam": {"type": "noul", "noul": 0.982},
             "kind": {"type": "choice", "choice": "spam", "confidence": 0.91,
                 "probabilities": {"normal": 0.09, "spam": 0.91}},
             "urgency": {"type": "score", "score": 1.4, "confidence": 0.81,
                 "legend": {"0": "later", "1": "today", "2": "now"},
                 "probabilities": {"0": 0.1, "1": 0.4, "2": 0.5}}
-        }, "usage": {"input_tokens": 42, "output_tokens": 6}})
-        .to_string();
-        write!(
-            stream,
-            concat!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
-                "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
-            ),
-            response.len(),
-            response = response
+        }, "usage": {"input_tokens": 42, "output_tokens": 6}}),
         )
-        .expect("mixed response");
-        captured
-    });
-    (root, handle)
+    })
 }
 
 /// Verifies native projections and caller thresholds over all three answer variants.
@@ -326,7 +236,11 @@ fn ask_native_get_keeps_mixed_answer_details() {
         "elapsed_ns=",
         "attempt_elapsed_ns=",
         "attempts=1",
-        "http_version=\"HTTP/1.1\"",
+        if cfg!(feature = "http2-prior-knowledge") {
+            "http_version=\"HTTP/2\""
+        } else {
+            "http_version=\"HTTP/1.1\""
+        },
     ] {
         assert!(diagnostics.contains(field), "missing {field}");
     }
@@ -345,8 +259,26 @@ fn ask_native_get_keeps_mixed_answer_details() {
     assert_eq!(wire["legend"]["1"], "today");
     assert_eq!(wire["model"], "jev-fixed");
     let captured = server.join().expect("join mixed mock");
-    assert_eq!(captured["state"], "hello");
-    assert_eq!(captured["questions"].as_object().unwrap().len(), 3);
+    let request = &captured[0];
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/v1/systemone");
+    assert_eq!(request.authorization.as_deref(), Some("Bearer local-key"));
+    assert_eq!(request.content_type.as_deref(), Some("application/json"));
+    let expected_version = if cfg!(feature = "http2-prior-knowledge") {
+        reqwest::Version::HTTP_2
+    } else {
+        reqwest::Version::HTTP_11
+    };
+    assert_eq!(request.version, expected_version);
+    if expected_version == reqwest::Version::HTTP_2 {
+        assert_eq!(
+            request.authority.as_deref(),
+            base_url.strip_prefix("http://")
+        );
+    }
+    let body: serde_json::Value = serde_json::from_slice(&request.body).expect("request JSON");
+    assert_eq!(body["state"], "hello");
+    assert_eq!(body["questions"].as_object().unwrap().len(), 3);
 }
 
 /// Keeps retry attempts under one NUON evaluation span without logging secrets.
@@ -356,63 +288,24 @@ fn ask_nuon_correlates_retry_attempts() {
     if Command::new("nu").arg("--version").output().is_err() {
         return;
     }
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind retry mock");
-    let base_url = format!("http://{}", listener.local_addr().expect("local address"));
-    let server = thread::spawn(move || {
-        for (attempt, status) in [(1, 503), (2, 503), (3, 200)] {
-            let (mut stream, _) = listener.accept().expect("accept retry request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone socket"));
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("request line");
-            let mut length = 0;
-            loop {
-                line.clear();
-                reader.read_line(&mut line).expect("request header");
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some((name, value)) = line.split_once(':')
-                    && name.eq_ignore_ascii_case("content-length")
-                {
-                    length = value.trim().parse().expect("body length");
-                }
-            }
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).expect("request body");
-            if status == 503 {
-                let request_id = if attempt == 1 {
-                    "req_retry_1"
-                } else {
-                    "req_local-key"
-                };
-                write!(
-                    stream,
-                    concat!(
-                        "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\n",
-                        "X-TypeSafe-Request-Id: {request_id}\r\n",
-                        "Content-Length: 0\r\nConnection: close\r\n\r\n"
-                    ),
-                    request_id = request_id
-                )
-                .expect("retry response");
-            } else {
-                let response = serde_json::json!({"model": "jev-fixed", "answers": {
-                    "match": {"type": "noul", "noul": 0.9}}, "usage": {
-                    "input_tokens": 2, "output_tokens": 1}})
-                .to_string();
-                write!(
-                    stream,
-                    concat!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
-                        "X-TypeSafe-Request-Id: req_success_3\r\nContent-Length: {}\r\n",
-                        "Connection: close\r\n\r\n{response}"
-                    ),
-                    response.len(),
-                    response = response
-                )
-                .expect("success response");
-            }
-        }
+    let (base_url, server) = h2_fixture::serve(3, |attempt, _| {
+        let request_id = ["req_retry_1", "req_local-key", "req_success_3"][attempt];
+        let mut response = if attempt < 2 {
+            let mut response = h2_fixture::Response::json(503, serde_json::json!({}));
+            response.headers.push(("retry-after".into(), "0".into()));
+            response
+        } else {
+            h2_fixture::Response::json(
+                200,
+                serde_json::json!({"model": "jev-fixed", "answers": {
+                "match": {"type": "noul", "noul": 0.9}}, "usage": {
+                "input_tokens": 2, "output_tokens": 1}}),
+            )
+        };
+        response
+            .headers
+            .push(("x-typesafe-request-id".into(), request_id.into()));
+        response
     });
     let output = Command::new("nu")
         .args([
@@ -567,71 +460,36 @@ fn dry_run_has_no_success_measurement_event() {
 }
 
 /// Responds to three distinct projected states with typed, state-dependent decisions.
-fn serve_mixed_table() -> (String, thread::JoinHandle<Vec<serde_json::Value>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind table mock");
-    let root = format!("http://{}", listener.local_addr().expect("local address"));
-    let handle = thread::spawn(move || {
-        (0..3)
-            .map(|_| {
-                let (mut stream, _) = listener.accept().expect("accept table request");
-                let mut reader = BufReader::new(stream.try_clone().expect("clone socket"));
-                let mut line = String::new();
-                reader.read_line(&mut line).expect("request line");
-                let mut length = 0;
-                loop {
-                    line.clear();
-                    reader.read_line(&mut line).expect("request header");
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((name, value)) = line.split_once(':')
-                        && name.eq_ignore_ascii_case("content-length")
-                    {
-                        length = value.trim().parse().expect("body length");
-                    }
-                }
-                let mut body = vec![0; length];
-                reader.read_exact(&mut body).expect("request body");
-                let captured: serde_json::Value =
-                    serde_json::from_slice(&body).expect("request JSON");
-                let message = captured["state"]["input"]["message"]
-                    .as_str()
-                    .expect("projected message");
-                let (probability, choice, score, levels) = match message {
-                    "urgent" => (0.99, "spam", 1.8, [0.0, 0.2, 0.8]),
-                    "normal" => (0.1, "normal", 0.1, [0.9, 0.1, 0.0]),
-                    "later" => (0.95, "spam", 1.4, [0.1, 0.4, 0.5]),
-                    _ => panic!("unexpected mock state"),
-                };
-                let (normal, spam) = if choice == "spam" {
-                    (0.05, 0.95)
-                } else {
-                    (0.95, 0.05)
-                };
-                let response = serde_json::json!({"model": "jev-fixed", "answers": {
+fn serve_mixed_table() -> (String, h2_fixture::TestServer) {
+    h2_fixture::serve(3, |_, request| {
+        let captured: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("request JSON");
+        let message = captured["state"]["input"]["message"]
+            .as_str()
+            .expect("projected message");
+        let (probability, choice, score, levels) = match message {
+            "urgent" => (0.99, "spam", 1.8, [0.0, 0.2, 0.8]),
+            "normal" => (0.1, "normal", 0.1, [0.9, 0.1, 0.0]),
+            "later" => (0.95, "spam", 1.4, [0.1, 0.4, 0.5]),
+            _ => panic!("unexpected mock state"),
+        };
+        let (normal, spam) = if choice == "spam" {
+            (0.05, 0.95)
+        } else {
+            (0.95, 0.05)
+        };
+        h2_fixture::Response::json(
+            200,
+            serde_json::json!({"model": "jev-fixed", "answers": {
                 "spam": {"type": "noul", "noul": probability},
                 "kind": {"type": "choice", "choice": choice, "confidence": 0.95,
                     "probabilities": {"normal": normal, "spam": spam}},
                 "urgency": {"type": "score", "score": score, "confidence": 0.8,
                     "legend": {"0": "later", "1": "today", "2": "now"},
                     "probabilities": {"0": levels[0], "1": levels[1], "2": levels[2]}}
-            }, "usage": {"input_tokens": 10, "output_tokens": 3}})
-                .to_string();
-                write!(
-                    stream,
-                    concat!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
-                        "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
-                    ),
-                    response.len(),
-                    response = response
-                )
-                .expect("table response");
-                captured
-            })
-            .collect()
-    });
-    (root, handle)
+            }, "usage": {"input_tokens": 10, "output_tokens": 3}}),
+        )
+    })
 }
 
 /// Verifies native table transforms over typed answers and projected outbound state.
@@ -716,6 +574,8 @@ let rows = ([
     let captured = server.join().expect("join table mock");
     assert_eq!(captured.len(), 3);
     for request in captured {
+        let request: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("request JSON");
         assert_eq!(request["questions"].as_object().unwrap().len(), 3);
         assert_eq!(
             request["state"]["context"],
@@ -734,7 +594,7 @@ fn annotate_default_answers_and_explicit_legacy_path_in_real_nu() {
     if Command::new("nu").arg("--version").output().is_err() {
         return;
     }
-    let (base_url, stop, calls, server) = serve_until_stopped(false);
+    let (base_url, calls, server) = serve_until_stopped(false);
     let source = r#"
 let q = {match: {type: noul}}
 let default = ([{id: 1, message: 7}] | jev annotate $q --fields [message] --metrics | first)
@@ -772,7 +632,6 @@ let unordered = ([{id: 9, message: 3} {id: 10, message: 4}]
         .env("NU_PLUGIN_JEV_BASE_URL", &base_url)
         .output()
         .expect("run isolated Nu");
-    stop.store(true, Ordering::SeqCst);
     server.join().expect("join local mock");
     assert!(
         output.status.success(),
@@ -820,7 +679,7 @@ fn annotate_default_destination_collisions_are_terminal_in_real_nu() {
     if Command::new("nu").arg("--version").output().is_err() {
         return;
     }
-    let (base_url, stop, calls, server) = serve_until_stopped(false);
+    let (base_url, calls, server) = serve_until_stopped(false);
     for source in [
         concat!(
             "[{id: 1, message: 7, answers: 'existing'}] ",
@@ -853,7 +712,6 @@ fn annotate_default_destination_collisions_are_terminal_in_real_nu() {
         );
         assert!(output.stdout.is_empty(), "conflicting row reached output");
     }
-    stop.store(true, Ordering::SeqCst);
     server.join().expect("join local mock");
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
@@ -865,7 +723,7 @@ fn annotate_nuon_correlates_cached_rows() {
     if Command::new("nu").arg("--version").output().is_err() {
         return;
     }
-    let (base_url, stop, calls, server) = serve_until_stopped(false);
+    let (base_url, calls, server) = serve_until_stopped(false);
     let source = concat!(
         "let rows = ([{id: 1, message: 7} {id: 2, message: 7} {id: 3, message: 7}] ",
         "| jev annotate {match: {type: noul}} --fields [message] ",
@@ -888,7 +746,6 @@ fn annotate_nuon_correlates_cached_rows() {
         .env("NU_PLUGIN_JEV_LOG_FORMAT", "nuon")
         .output()
         .expect("run isolated Nu");
-    stop.store(true, Ordering::SeqCst);
     server.join().expect("join local mock");
     assert!(
         output.status.success(),
@@ -953,7 +810,7 @@ fn tracing_level_changes_after_plugin_restart() {
     if Command::new("nu").arg("--version").output().is_err() {
         return;
     }
-    let (base_url, stop, calls, server) = serve_until_stopped(false);
+    let (base_url, calls, server) = serve_until_stopped(false);
     let source = r#"
 let q = {match: {type: noul}}
 let first = ({message: 1} | jev ask $q | get answers.match.noul)
@@ -977,7 +834,6 @@ let third = ({message: 3} | jev ask $q | get answers.match.noul)
         .env("JEV_LOG", "debug")
         .output()
         .expect("run isolated Nu");
-    stop.store(true, Ordering::SeqCst);
     server.join().expect("join local mock");
     assert!(
         output.status.success(),
@@ -1086,54 +942,20 @@ fn real_nu_help_lists_focused_short_options() {
 }
 
 /// Serves two independent model catalogs while recording bodyless GET paths.
-fn serve_model_catalogs(names: &[&str]) -> (String, thread::JoinHandle<Vec<(String, String)>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind model mock");
-    let root = format!("http://{}", listener.local_addr().expect("local address"));
+fn serve_model_catalogs(names: &[&str]) -> (String, h2_fixture::TestServer) {
     let names = names
         .iter()
         .map(|name| (*name).to_owned())
         .collect::<Vec<_>>();
-    let handle = thread::spawn(move || {
-        names
-            .into_iter()
-            .map(|name| {
-                let (mut stream, _) = listener.accept().expect("accept model request");
-                let mut reader = BufReader::new(stream.try_clone().expect("clone model socket"));
-                let mut line = String::new();
-                reader
-                    .read_line(&mut line)
-                    .expect("read model request line");
-                let parts: Vec<_> = line.split_whitespace().collect();
-                let method = parts[0].to_owned();
-                let path = parts[1].to_owned();
-                loop {
-                    line.clear();
-                    reader
-                        .read_line(&mut line)
-                        .expect("read model request header");
-                    if line == "\r\n" {
-                        break;
-                    }
-                }
-                let response = serde_json::json!({"models": [{
-                    "name": name, "description": "Mock model", "release_date": "opaque"
-                }]})
-                .to_string();
-                write!(
-                    stream,
-                    concat!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
-                        "Content-Length: {}\r\nConnection: close\r\n\r\n{response}"
-                    ),
-                    response.len(),
-                    response = response
-                )
-                .expect("write model response");
-                (method, path)
-            })
-            .collect()
-    });
-    (root, handle)
+    h2_fixture::serve(names.len(), move |index, request| {
+        assert!(request.body.is_empty(), "model request must be bodyless");
+        h2_fixture::Response::json(
+            200,
+            serde_json::json!({"models": [{
+                "name": names[index], "description": "Mock model", "release_date": "opaque"
+            }]}),
+        )
+    })
 }
 
 /// Composes model rows with native Nu commands and observes fresh service data.
@@ -1175,7 +997,12 @@ fn real_nu_models_are_fresh_native_records() {
         })
     );
     assert_eq!(
-        server.join().unwrap(),
+        server
+            .join()
+            .unwrap()
+            .into_iter()
+            .map(|request| (request.method, request.path))
+            .collect::<Vec<_>>(),
         vec![
             ("GET".to_owned(), "/v1/models".to_owned()),
             ("GET".to_owned(), "/v1/models".to_owned()),
@@ -1308,7 +1135,12 @@ let second_error = (try { jev models --base-url '{URL}' } catch {|err| $err.msg 
         "expected updated TOML to fail validation: {result}"
     );
     assert_eq!(
-        server.join().expect("join model mock"),
+        server
+            .join()
+            .expect("join model mock")
+            .into_iter()
+            .map(|request| (request.method, request.path))
+            .collect::<Vec<_>>(),
         vec![("GET".to_owned(), "/v1/models".to_owned())]
     );
 }
@@ -1335,65 +1167,17 @@ fn real_nu_models_reject_stream_input() {
 }
 
 /// Accepts and retains requests without replying until the test stops the server.
-fn serve_stalled() -> (
-    String,
-    Arc<AtomicBool>,
-    Arc<AtomicUsize>,
-    thread::JoinHandle<()>,
-) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled mock");
-    listener
-        .set_nonblocking(true)
-        .expect("configure stalled mock");
-    let root = format!("http://{}", listener.local_addr().expect("local address"));
-    let stop = Arc::new(AtomicBool::new(false));
+#[cfg(unix)]
+fn serve_stalled() -> (String, Arc<AtomicUsize>, h2_fixture::TestServer) {
     let calls = Arc::new(AtomicUsize::new(0));
-    let server_stop = Arc::clone(&stop);
     let server_calls = Arc::clone(&calls);
-    let handle = thread::spawn(move || {
-        let mut pending = Vec::new();
-        while !server_stop.load(Ordering::SeqCst) {
-            let (stream, _) = match listener.accept() {
-                Ok(pair) => pair,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(2));
-                    continue;
-                }
-                Err(error) => panic!("stalled mock accept failed: {error}"),
-            };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .expect("request timeout");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone socket"));
-            let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                continue;
-            }
-            let mut length = 0;
-            loop {
-                line.clear();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                    break;
-                }
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some((name, value)) = line.split_once(':')
-                    && name.eq_ignore_ascii_case("content-length")
-                {
-                    length = value.trim().parse().expect("body length");
-                }
-            }
-            let mut body = vec![0; length];
-            if reader.read_exact(&mut body).is_err() {
-                continue;
-            }
-            server_calls.fetch_add(1, Ordering::SeqCst);
-            pending.push(stream);
-        }
-        drop(pending);
+    let (root, server) = h2_fixture::serve_unbounded(move |_, _| {
+        server_calls.fetch_add(1, Ordering::SeqCst);
+        let mut response = h2_fixture::Response::json(200, serde_json::json!({}));
+        response.delay = Duration::from_secs(60);
+        response
     });
-    (root, stop, calls, handle)
+    (root, calls, server)
 }
 
 /// Interrupts a stalled real Nu stream and confirms bounded, prompt teardown.
@@ -1403,7 +1187,7 @@ fn interrupt_stalled_annotation_stops_local_work() {
     if Command::new("nu").arg("--version").output().is_err() {
         return;
     }
-    let (base_url, stop, calls, server) = serve_stalled();
+    let (base_url, calls, server) = serve_stalled();
     let source = concat!(
         "let q = {match: (jev question noul 'Match?')}; ",
         "1..1000 | each { |id| {id: $id, message: $id} } ",
@@ -1455,7 +1239,6 @@ fn interrupt_stalled_annotation_stops_local_work() {
     let observed = calls.load(Ordering::SeqCst);
     thread::sleep(Duration::from_millis(100));
     let stable = calls.load(Ordering::SeqCst);
-    stop.store(true, Ordering::SeqCst);
     server.join().expect("join stalled mock");
     assert!(exited, "Nu did not stop promptly after SIGINT");
     assert_eq!(observed, stable, "requests continued after interruption");
@@ -1643,7 +1426,7 @@ fn live_nu_uses_private_toml_key_and_rejects_open_permissions() {
     std::fs::write(&key_file, "api_key = 'fixture-secret-do-not-echo'\n").expect("user key file");
     std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600))
         .expect("private file permissions");
-    let (base_url, stop, calls, server) = serve_until_stopped(false);
+    let (base_url, calls, server) = serve_until_stopped(false);
     let source =
         "{message: 1} | jev ask {match: (jev question noul 'Match?')} | get answers.match.noul";
     let run = || {
@@ -1671,7 +1454,6 @@ fn live_nu_uses_private_toml_key_and_rejects_open_permissions() {
     std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o644))
         .expect("open file permissions");
     let rejected = run();
-    stop.store(true, Ordering::SeqCst);
     server.join().expect("join mock server");
     std::fs::remove_dir_all(&root).expect("remove isolated fixture");
     assert!(!rejected.status.success());
@@ -1687,77 +1469,14 @@ fn live_nu_reuses_compatible_http_connection() {
     if Command::new("nu").arg("--version").output().is_err() {
         return;
     }
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local keep-alive mock");
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking listener");
-    let base_url = format!("http://{}", listener.local_addr().expect("local address"));
-    let connections = Arc::new(AtomicUsize::new(0));
-    let observed = Arc::clone(&connections);
-    let server = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut requests = 0;
-        while requests < 2 && Instant::now() < deadline {
-            let (mut stream, _) = match listener.accept() {
-                Ok(pair) => pair,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(2));
-                    continue;
-                }
-                Err(error) => panic!("keep-alive mock accept failed: {error}"),
-            };
-            observed.fetch_add(1, Ordering::SeqCst);
-            stream
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .expect("read timeout");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone socket"));
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                    break;
-                }
-                let mut length = 0;
-                loop {
-                    line.clear();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                        break;
-                    }
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((name, value)) = line.split_once(':')
-                        && name.eq_ignore_ascii_case("content-length")
-                    {
-                        length = value.trim().parse().expect("body length");
-                    }
-                }
-                let mut body = vec![0; length];
-                if reader.read_exact(&mut body).is_err() {
-                    break;
-                }
-                let response = concat!(
-                    "{\"model\":\"jev-fixed\",\"answers\":{\"match\":",
-                    "{\"type\":\"noul\",\"noul\":0.9}},\"usage\":",
-                    "{\"input_tokens\":1,\"output_tokens\":1}}"
-                );
-                write!(
-                    stream,
-                    concat!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
-                        "Content-Length: {}\r\nConnection: keep-alive\r\n\r\n{response}"
-                    ),
-                    response.len(),
-                    response = response
-                )
-                .expect("write response");
-                stream.flush().expect("flush response");
-                requests += 1;
-                if requests == 2 {
-                    break;
-                }
-            }
-        }
-        requests
+    let (base_url, server) = h2_fixture::serve(2, |_, _| {
+        h2_fixture::Response::json(
+            200,
+            serde_json::json!({
+                "model": "jev-fixed", "answers": {"match": {"type": "noul", "noul": 0.9}},
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+        )
     });
     let source = concat!(
         "let q = {match: (jev question noul 'Match?')}; ",
@@ -1777,16 +1496,17 @@ fn live_nu_reuses_compatible_http_connection() {
         .env("NU_PLUGIN_JEV_BASE_URL", &base_url)
         .output()
         .expect("run isolated Nu");
-    let requests = server.join().expect("join keep-alive mock");
+    let (requests, connections) = server
+        .join_with_connections()
+        .expect("join keep-alive mock");
     assert!(
         output.status.success(),
         "Nu failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(requests, 2);
+    assert_eq!(requests.len(), 2);
     assert_eq!(
-        connections.load(Ordering::SeqCst),
-        1,
+        connections, 1,
         "compatible calls opened separate HTTP connections"
     );
 }

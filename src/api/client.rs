@@ -44,6 +44,8 @@ pub(crate) struct JevClient {
     http: Arc<Client>,
     #[cfg(test)]
     response_work_pause: Option<ResponseWorkPause>,
+    #[cfg(test)]
+    retry_wait_started: Option<tokio::sync::mpsc::Sender<(std::time::Instant, Duration)>>,
 }
 
 /// Pauses test-only offloaded work after it starts on a blocking thread.
@@ -275,11 +277,13 @@ impl JevClient {
         Self::for_policy(&ProxyPolicy::Auto)
     }
 
-    /// Builds a client for one effective policy before entering the async runtime.
-    fn for_policy(policy: &ProxyPolicy) -> Result<Self, JevError> {
+    /// Applies the build's transport mode and one effective proxy policy.
+    fn builder_for_policy(policy: &ProxyPolicy) -> Result<reqwest::ClientBuilder, JevError> {
         let builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never());
+        #[cfg(feature = "http2-prior-knowledge")]
+        let builder = builder.http2_prior_knowledge();
         let builder = match policy {
             ProxyPolicy::Auto => builder,
             ProxyPolicy::Direct => builder.no_proxy(),
@@ -289,14 +293,30 @@ impl JevClient {
                 builder.proxy(proxy)
             }
         };
-        let http = builder
+        Ok(builder)
+    }
+
+    /// Builds one reusable client with the selected proxy and transport policy.
+    fn for_policy(policy: &ProxyPolicy) -> Result<Self, JevError> {
+        let http = Self::builder_for_policy(policy)?
             .build()
             .map_err(|_| JevError::Transport("cannot initialize Jev HTTP client"))?;
         Ok(Self {
             http: Arc::new(http),
             #[cfg(test)]
             response_work_pause: None,
+            #[cfg(test)]
+            retry_wait_started: None,
         })
+    }
+
+    /// Reports retry deadlines and delays to a bounded test channel without blocking workers.
+    #[cfg(test)]
+    pub(crate) fn observe_retry_waits(
+        &mut self,
+        observer: tokio::sync::mpsc::Sender<(std::time::Instant, Duration)>,
+    ) {
+        self.retry_wait_started = Some(observer);
     }
 
     /// Evaluates one complete request and validates every returned typed answer.
@@ -536,7 +556,12 @@ impl JevClient {
                     delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                     "retrying Jev request"
                 );
-                tokio::time::sleep(delay).await;
+                let retry_wait = tokio::time::sleep(delay);
+                #[cfg(test)]
+                if let Some(observer) = &self.retry_wait_started {
+                    let _ = observer.try_send((retry_wait.deadline().into_std(), delay));
+                }
+                retry_wait.await;
                 continue;
             }
             return Err(JevError::Http {
@@ -702,7 +727,7 @@ fn jittered_backoff_with_entropy(attempt: usize, entropy: u64) -> Duration {
 mod tests {
     use std::{
         collections::BTreeMap,
-        io::{BufRead, BufReader, Read, Write},
+        io::{Read, Write},
         net::TcpListener,
         process::Command,
         sync::{
@@ -713,7 +738,7 @@ mod tests {
         time::{Duration, Instant as StdInstant, SystemTime},
     };
 
-    use reqwest::{Client, StatusCode, header::HeaderMap};
+    use reqwest::{StatusCode, header::HeaderMap};
     use serde_json::json;
 
     use crate::{
@@ -747,9 +772,11 @@ mod tests {
     struct CapturedRequest {
         method: String,
         path: String,
+        authority: Option<String>,
         authorization: Option<String>,
         content_type: Option<String>,
         body: Vec<u8>,
+        version: reqwest::Version,
     }
 
     /// Describes one response sent by the local mock server.
@@ -794,108 +821,44 @@ mod tests {
         }
     }
 
-    /// Runs a bounded local HTTP fixture on a dedicated blocking test thread.
-    fn serve(
-        responses: Vec<MockResponse>,
-    ) -> (reqwest::Url, thread::JoinHandle<Vec<CapturedRequest>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let url =
-            reqwest::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
-        let handle = thread::spawn(move || {
-            responses
-                .into_iter()
-                .map(|response| {
-                    let deadline = StdInstant::now() + Duration::from_secs(5);
-                    let mut stream = loop {
-                        match listener.accept() {
-                            Ok((stream, _)) => break stream,
-                            Err(error)
-                                if error.kind() == std::io::ErrorKind::WouldBlock
-                                    && StdInstant::now() < deadline =>
-                            {
-                                thread::sleep(Duration::from_millis(2));
-                            }
-                            Err(error) => panic!("mock server did not receive request: {error}"),
-                        }
-                    };
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    let parts: Vec<_> = line.split_whitespace().collect();
-                    let method = parts[0].to_owned();
-                    let path = parts[1].to_owned();
-                    let mut authorization = None;
-                    let mut content_type = None;
-                    let mut content_length = 0;
-                    loop {
-                        line.clear();
-                        reader.read_line(&mut line).unwrap();
-                        if line == "\r\n" {
-                            break;
-                        }
-                        if let Some((name, value)) = line.split_once(':') {
-                            let value = value.trim();
-                            if name.eq_ignore_ascii_case("authorization") {
-                                authorization = Some(value.to_owned());
-                            }
-                            if name.eq_ignore_ascii_case("content-type") {
-                                content_type = Some(value.to_owned());
-                            }
-                            if name.eq_ignore_ascii_case("content-length") {
-                                content_length = value.parse().unwrap();
-                            }
-                        }
-                    }
-                    let mut body = vec![0; content_length];
-                    reader.read_exact(&mut body).unwrap();
-                    thread::sleep(response.delay);
-                    let chunked = response.headers.iter().any(|(name, value)| {
-                        name.eq_ignore_ascii_case("transfer-encoding")
-                            && value.eq_ignore_ascii_case("chunked")
-                    });
-                    let mut headers = format!(
-                        concat!(
-                            "HTTP/1.1 {} Mock\r\n",
-                            "Content-Type: application/json\r\nConnection: close\r\n"
-                        ),
-                        response.status
-                    );
-                    if !chunked
-                        && !response
-                            .headers
-                            .iter()
-                            .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                    {
-                        headers.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
-                    }
-                    for (name, value) in response.headers {
-                        headers.push_str(&format!("{name}: {value}\r\n"));
-                    }
-                    headers.push_str("\r\n");
-                    let _ = stream.write_all(headers.as_bytes());
-                    if chunked {
-                        let chunk_size = format!("{:X}\r\n", response.body.len());
-                        let _ = stream.write_all(chunk_size.as_bytes());
-                        let _ = stream.write_all(response.body.as_bytes());
-                        let _ = stream.write_all(b"\r\n0\r\n\r\n");
-                    } else {
-                        let _ = stream.write_all(response.body.as_bytes());
-                    }
-                    CapturedRequest {
-                        method,
-                        path,
-                        authorization,
-                        content_type,
-                        body,
-                    }
-                })
-                .collect()
+    /// Keeps the fixture active until the calling test collects its requests.
+    struct ApiTestServer(crate::h2_fixture::TestServer);
+
+    impl ApiTestServer {
+        /// Stops the fixture and maps captured requests for API assertions.
+        fn join(self) -> thread::Result<Vec<CapturedRequest>> {
+            self.0.join().map(|requests| {
+                requests
+                    .into_iter()
+                    .map(|request| CapturedRequest {
+                        method: request.method,
+                        path: request.path,
+                        authority: request.authority,
+                        authorization: request.authorization,
+                        content_type: request.content_type,
+                        body: request.body,
+                        version: request.version,
+                    })
+                    .collect()
+            })
+        }
+    }
+
+    /// Runs a bounded local HTTP/2 fixture on a dedicated test thread.
+    fn serve(responses: Vec<MockResponse>) -> (reqwest::Url, ApiTestServer) {
+        let expected = responses.len();
+        let (root, server) = crate::h2_fixture::serve(expected, move |index, _| {
+            let response = &responses[index];
+            crate::h2_fixture::Response {
+                status: response.status,
+                headers: response.headers.clone(),
+                body: response.body.as_bytes().to_vec(),
+                delay: response.delay,
+                chunk_size: 16_384,
+            }
         });
-        (url, handle)
+        let url = reqwest::Url::parse(&format!("{root}/")).unwrap();
+        (url, ApiTestServer(server))
     }
 
     /// Creates the default mock invocation settings without contacting TypeSafe.
@@ -978,23 +941,31 @@ mod tests {
         )
     }
 
-    /// Bounds both declared lengths and chunked bodies without parsing their payloads.
+    /// Bounds declared and streamed HTTP/2 bodies without parsing their payloads.
     #[test]
     fn successful_body_reader_enforces_byte_limit() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        for chunked in [false, true] {
+        for declared in [false, true] {
             let response = MockResponse::json(200, json!({"payload": "x".repeat(80)}));
-            let response = if chunked {
-                response.header("Transfer-Encoding", "chunked")
+            let response = if declared {
+                let length = response.body.len().to_string();
+                response.header("Content-Length", &length)
             } else {
                 response
             };
             let (url, server) = serve(vec![response]);
             runtime.block_on(async {
-                let response = Client::new().get(url).send().await.unwrap();
+                let response = JevClient::builder_for_policy(&ProxyPolicy::Direct)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .get(url)
+                    .send()
+                    .await
+                    .unwrap();
                 let error = read_success_body(response, 64).await.unwrap_err();
                 assert_eq!(error.kind_name(), "response");
                 assert!(error.to_string().contains("64 byte limit"));
@@ -1008,7 +979,14 @@ mod tests {
             delay: Duration::ZERO,
         }]);
         runtime.block_on(async {
-            let response = Client::new().get(url).send().await.unwrap();
+            let response = JevClient::builder_for_policy(&ProxyPolicy::Direct)
+                .unwrap()
+                .build()
+                .unwrap()
+                .get(url)
+                .send()
+                .await
+                .unwrap();
             assert_eq!(read_success_body(response, 64).await.unwrap().len(), 64);
         });
         server.join().unwrap();
@@ -1060,12 +1038,12 @@ mod tests {
         }
     }
 
-    /// Stops a lengthless chunked model response at the production limit.
+    /// Stops a lengthless streamed HTTP/2 model response at the production limit.
     #[test]
-    fn chunked_oversized_success_is_nonretryable() {
+    fn streamed_oversized_success_is_nonretryable() {
         let response = MockResponse {
             status: 200,
-            headers: vec![("Transfer-Encoding".to_owned(), "chunked".to_owned())],
+            headers: Vec::new(),
             body: "x".repeat(MAX_RESPONSE_BYTES + 1),
             delay: Duration::ZERO,
         };
@@ -1200,12 +1178,19 @@ mod tests {
         assert_eq!(success.measurement.request_bytes, expected_request_bytes);
         assert_eq!(success.measurement.response_bytes, response_bytes);
         assert_eq!(success.measurement.attempts, 1);
-        assert_eq!(success.measurement.http_version, reqwest::Version::HTTP_11);
+        let expected_version = if cfg!(feature = "http2-prior-knowledge") {
+            reqwest::Version::HTTP_2
+        } else {
+            reqwest::Version::HTTP_11
+        };
+        assert_eq!(success.measurement.http_version, expected_version);
         assert_eq!(
             success.measurement.elapsed,
             success.measurement.attempt_elapsed
         );
-        assert_eq!(server.join().unwrap()[0].body.len(), expected_request_bytes);
+        let captured = server.join().unwrap();
+        assert_eq!(captured[0].body.len(), expected_request_bytes);
+        assert_eq!(captured[0].version, expected_version);
     }
 
     /// Includes retry delay only in total time and excludes retry bodies from sizes.
@@ -1269,11 +1254,19 @@ mod tests {
         assert_eq!(success.measurement.request_bytes, 0);
         assert_eq!(success.measurement.response_bytes, response_bytes);
         assert_eq!(success.measurement.attempts, 1);
+        let expected_version = if cfg!(feature = "http2-prior-knowledge") {
+            reqwest::Version::HTTP_2
+        } else {
+            reqwest::Version::HTTP_11
+        };
+        assert_eq!(success.measurement.http_version, expected_version);
         assert_eq!(
             success.measurement.elapsed,
             success.measurement.attempt_elapsed
         );
-        assert!(server.join().unwrap()[0].body.is_empty());
+        let captured = server.join().unwrap();
+        assert_eq!(captured[0].version, expected_version);
+        assert!(captured[0].body.is_empty());
     }
 
     /// Joins the System One path independently of the root's trailing slash.
@@ -2247,14 +2240,18 @@ mod tests {
         });
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].path, "http://localhost:1/v1/systemone");
+        assert_eq!(requests[0].path, "/v1/systemone");
+        assert_eq!(requests[0].authority.as_deref(), Some("localhost:1"));
     }
 
     /// Confirms SOCKS5h sends the destination hostname to the proxy for resolution.
     #[test]
     fn socks5h_proxy_receives_destination_hostname() {
+        let (upstream_url, upstream) = serve(vec![MockResponse::json(200, answer())]);
+        let upstream_address = upstream_url.socket_addrs(|| None).unwrap()[0];
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
@@ -2273,28 +2270,24 @@ mod tests {
             let mut destination = vec![0; request[4] as usize + 2];
             stream.read_exact(&mut destination).unwrap();
             let domain = String::from_utf8(destination[..request[4] as usize].to_vec()).unwrap();
+            let remote = std::net::TcpStream::connect(upstream_address).unwrap();
             stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            assert!(line.starts_with("POST /v1/systemone HTTP/1.1"));
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
+            stream.set_nonblocking(true).unwrap();
+            remote.set_nonblocking(true).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut stream = tokio::net::TcpStream::from_std(stream).unwrap();
+                let mut remote = tokio::net::TcpStream::from_std(remote).unwrap();
+                tokio::select! {
+                    _ = stopped => {}
+                    result = tokio::io::copy_bidirectional(&mut stream, &mut remote) => {
+                        result.unwrap();
+                    }
                 }
-            }
-            let body = answer().to_string();
-            let response = format!(
-                concat!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
-                    "Content-Length: {}\r\nConnection: close\r\n\r\n{body}"
-                ),
-                body.len(),
-                body = body
-            );
-            stream.write_all(response.as_bytes()).unwrap();
+            });
             domain
         });
         let policy = ProxyPolicy::Explicit(format!("socks5h://{address}"));
@@ -2314,7 +2307,9 @@ mod tests {
                     .is_ok()
             );
         });
+        stop.send(()).ok();
         assert_eq!(server.join().unwrap(), "unresolvable.invalid");
+        assert_eq!(upstream.join().unwrap().len(), 1);
     }
 
     /// Checks ordinary proxy routing and NO_PROXY bypass in isolated processes.
@@ -2408,17 +2403,16 @@ mod tests {
             .status()
             .unwrap();
         assert!(routed.success());
-        assert_eq!(
-            proxy_server.join().unwrap()[0].path,
-            "http://localhost:1/v1/systemone"
-        );
+        let requests = proxy_server.join().unwrap();
+        assert_eq!(requests[0].path, "/v1/systemone");
+        assert_eq!(requests[0].authority.as_deref(), Some("localhost:1"));
     }
 
     /// Holds one TLS fixture endpoint, trust anchor, and observed protocol result.
     struct TlsFixture {
         url: reqwest::Url,
         certificate: Vec<u8>,
-        server: thread::JoinHandle<(Vec<u8>, usize)>,
+        server: thread::JoinHandle<(Option<Vec<u8>>, usize)>,
     }
 
     /// Starts a local TLS server advertising either HTTP/2 or HTTP/1.1.
@@ -2455,8 +2449,10 @@ mod tests {
 
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                 let (stream, _) = listener.accept().await.unwrap();
-                let mut tls = acceptor.accept(stream).await.unwrap();
-                let alpn = tls.get_ref().1.alpn_protocol().unwrap_or_default().to_vec();
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return (None, 0);
+                };
+                let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
                 if h2_enabled {
                     let mut connection = h2::server::handshake(tls).await.unwrap();
                     let mut count = 0;
@@ -2493,7 +2489,9 @@ mod tests {
                     let mut reader = tokio::io::BufReader::new(&mut tls);
                     let mut line = String::new();
                     reader.read_line(&mut line).await.unwrap();
-                    assert!(line.starts_with("POST /v1/systemone HTTP/1.1"));
+                    if !line.starts_with("POST /v1/systemone HTTP/1.1") {
+                        return (alpn, 0);
+                    }
                     let mut content_length = 0;
                     loop {
                         line.clear();
@@ -2530,9 +2528,9 @@ mod tests {
         }
     }
 
-    /// Negotiates h2 on capable HTTPS routes and HTTP/1.1 otherwise.
+    /// Requires h2 by default and restores ALPN fallback without the Cargo feature.
     #[test]
-    fn tls_alpn_negotiates_h2_and_http1_fallback() {
+    fn tls_alpn_follows_build_transport_policy() {
         for (h2_enabled, expected_alpn, expected_version) in [
             (true, b"h2".as_slice(), reqwest::Version::HTTP_2),
             (false, b"http/1.1".as_slice(), reqwest::Version::HTTP_11),
@@ -2544,22 +2542,22 @@ mod tests {
             } = tls_fixture(h2_enabled, false);
             let client = JevClient {
                 http: Arc::new(
-                    Client::builder()
-                        .no_proxy()
-                        .retry(reqwest::retry::never())
+                    JevClient::builder_for_policy(&ProxyPolicy::Direct)
+                        .unwrap()
                         .add_root_certificate(reqwest::Certificate::from_der(&certificate).unwrap())
                         .build()
                         .unwrap(),
                 ),
                 response_work_pause: None,
+                retry_wait_started: None,
             };
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            runtime.block_on(async {
+            let result = runtime.block_on(async {
                 let (_handle, signal) = CancelHandle::new();
-                let result = client
+                client
                     .system_one_measured(
                         &request(),
                         &config(url),
@@ -2567,12 +2565,16 @@ mod tests {
                         signal,
                     )
                     .await
-                    .unwrap();
-                assert_eq!(result.measurement.http_version, expected_version);
             });
             let (alpn, count) = server.join().unwrap();
-            assert_eq!(alpn, expected_alpn);
-            assert_eq!(count, 1);
+            if h2_enabled || !cfg!(feature = "http2-prior-knowledge") {
+                assert_eq!(result.unwrap().measurement.http_version, expected_version);
+                assert_eq!(alpn.as_deref(), Some(expected_alpn));
+                assert_eq!(count, 1);
+            } else {
+                assert!(matches!(result, Err(JevError::Transport(_))));
+                assert_eq!(count, 0);
+            }
         }
     }
 
@@ -2586,14 +2588,14 @@ mod tests {
         } = tls_fixture(true, true);
         let client = JevClient {
             http: Arc::new(
-                Client::builder()
-                    .no_proxy()
-                    .retry(reqwest::retry::never())
+                JevClient::builder_for_policy(&ProxyPolicy::Direct)
+                    .unwrap()
                     .add_root_certificate(reqwest::Certificate::from_der(&certificate).unwrap())
                     .build()
                     .unwrap(),
             ),
             response_work_pause: None,
+            retry_wait_started: None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2608,7 +2610,7 @@ mod tests {
             assert_eq!(error.kind_name(), "transport");
         });
         let (alpn, count) = server.join().unwrap();
-        assert_eq!(alpn, b"h2");
+        assert_eq!(alpn.as_deref(), Some(b"h2".as_slice()));
         assert_eq!(count, 1);
     }
 

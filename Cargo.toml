@@ -21,7 +21,8 @@ targets = [
 ]
 
 [features]
-default = ["mimalloc", "nuon-tracing-format"]
+default = ["mimalloc", "nuon-tracing-format", "http2-prior-knowledge"]
+http2-prior-knowledge = []
 nuon-tracing-format = ["dep:time"]
 
 [dependencies]
@@ -50,6 +51,7 @@ mimalloc = { version = "0.1", optional = true }
 nu-plugin-test-support = "=0.116"
 h2 = "0.4"
 http = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio"] }
 rcgen = "0.14"
 tokio-rustls = "0.26"
 

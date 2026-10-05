@@ -22,6 +22,10 @@ mod config;
     reason = "transport errors are consumed by later command stages"
 )]
 mod error;
+/// Hosts the ready-made HTTP/2 fixture shared by network tests.
+#[cfg(test)]
+#[path = "../tests/support/h2_fixture.rs"]
+mod h2_fixture;
 /// Converts Nushell values and composes structured Jev state.
 #[allow(
     dead_code,

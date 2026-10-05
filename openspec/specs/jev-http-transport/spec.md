@@ -22,17 +22,57 @@ Evaluations SHALL use `POST /v1/systemone` under the configured absolute HTTP(S)
 
 ### Requirement: HTTP version negotiation
 
-HTTPS evaluations SHALL offer HTTP/2 through ALPN when supported by the endpoint and selected route. They SHALL fall back to HTTP/1.1 when HTTP/2 is unavailable, without requiring HTTP/2 prior knowledge. HTTP version choice SHALL NOT change the request body, authentication, response contract, or application retry budget.
+With the default-enabled `http2-prior-knowledge` Cargo feature, every live
+`jev ask`, `jev annotate`, and `jev models` request SHALL use HTTP/2 over HTTP
+or HTTPS without HTTP/1.1 fallback. A route unable to serve HTTP/2 SHALL fail
+as a transport error.
 
 #### Scenario: HTTP/2-capable endpoint
 
-- **WHEN** the HTTPS endpoint and route negotiate HTTP/2
-- **THEN** the evaluation uses HTTP/2 and returns the ordinary typed response
+- **WHEN** an endpoint and selected route support HTTP/2
+- **THEN** evaluation and model-list requests use HTTP/2 and return their ordinary typed results
 
 #### Scenario: HTTP/1.1-only endpoint
 
-- **WHEN** a local service supports only HTTP/1.1
-- **THEN** the evaluation succeeds with the same request and response contract
+- **WHEN** a configured service supports only HTTP/1.1
+- **THEN** the live request fails as a transport error without retrying through HTTP/1.1
+
+#### Scenario: Cleartext HTTP/2 endpoint
+
+- **WHEN** a configured `http://` service supports prior-knowledge HTTP/2
+- **THEN** a live request succeeds without an HTTP/1.1 upgrade or fallback
+
+### Requirement: Compatibility build protocol negotiation
+
+Without the `http2-prior-knowledge` Cargo feature, live requests SHALL retain
+the former protocol negotiation: HTTP/2 through HTTPS ALPN when available,
+HTTP/1.1 otherwise, and HTTP/1.1 for cleartext HTTP endpoints.
+
+#### Scenario: HTTPS and cleartext compatibility
+
+- **WHEN** the plugin is built without `http2-prior-knowledge`
+- **THEN** HTTPS requests negotiate HTTP/2 when offered and fall back to HTTP/1.1 otherwise
+- **AND** HTTP requests retain the previous HTTP/1.1 behavior
+
+### Requirement: No runtime transport override
+
+The selected build's HTTP version policy SHALL NOT be changed by command
+flags, environment values, or TOML settings.
+
+#### Scenario: Runtime settings do not change protocol policy
+
+- **WHEN** a default build receives command flags, environment values, or TOML settings
+- **THEN** none of them disables HTTP/2 prior knowledge for a live request
+
+### Requirement: Transport selection preserves application contracts
+
+HTTP version policy SHALL NOT alter JSON request bodies, bearer
+authentication, response contracts, or the application retry budget.
+
+#### Scenario: Same application contract across builds
+
+- **WHEN** either Cargo feature mode sends a live evaluation or model-list request
+- **THEN** its body, authentication, response validation, and retry budget follow the same contract
 
 ### Requirement: Proxy routing without silent fallback
 
@@ -83,7 +123,12 @@ Responses SHALL contain model, named answers, and usage. Names and variants SHAL
 
 ### Requirement: Bounded successful response bodies
 
-Each successful System One or model-list response SHALL be limited to 16 MiB (16,777,216 body bytes), independently of retries and rows. An oversized declared `Content-Length` SHALL be rejected before body reading; a response without a usable length SHALL be limited while reading. Oversize SHALL produce a nonretryable response error without JSON decoding, logging body contents, or returning partial data.
+Each successful System One or model-list response SHALL be limited to 16 MiB
+(16,777,216 body bytes), independently of retries and rows. An oversized
+declared `Content-Length` SHALL be rejected before body reading; a response
+without a usable length SHALL be limited while reading. Oversize SHALL produce
+a nonretryable response error without JSON decoding, logging body contents, or
+returning partial data.
 
 #### Scenario: Declared oversized body
 
@@ -92,7 +137,7 @@ Each successful System One or model-list response SHALL be limited to 16 MiB (16
 
 #### Scenario: Chunked oversized body
 
-- **WHEN** a successful chunked response has no usable length declaration and exceeds 16 MiB while being read
+- **WHEN** a successful HTTP/2 response arrives in DATA chunks without a usable length declaration and exceeds 16 MiB while being read
 - **THEN** the plugin stops reading and returns a response error without retrying it
 
 #### Scenario: Body at the limit
@@ -282,8 +327,8 @@ On a successful logical operation, `request_bytes` SHALL equal one attempt's com
 
 #### Scenario: Final response protocol version
 
-- **WHEN** a valid response arrives over HTTP/1.1 or HTTP/2 after any retryable responses
-- **THEN** `http_version` names the protocol version of that final successful response
+- **WHEN** a valid response arrives after any retryable responses
+- **THEN** `http_version` names the final successful response protocol (HTTP/2 in default builds)
 - **AND** it does not claim whether a new connection was established for the attempt
 
 ### Requirement: Return requested metrics only for validated success

@@ -233,7 +233,12 @@ mod tests {
         assert_eq!(wire["metrics"]["request_bytes"], 0);
         assert_eq!(wire["metrics"]["response_bytes"], response_bytes);
         assert_eq!(wire["metrics"]["attempts"], 1);
-        assert_eq!(wire["metrics"]["http_version"], "HTTP/1.1");
+        let expected_version = if cfg!(feature = "http2-prior-knowledge") {
+            "HTTP/2"
+        } else {
+            "HTTP/1.1"
+        };
+        assert_eq!(wire["metrics"]["http_version"], expected_version);
         assert_eq!(
             wire["metrics"]["elapsed"],
             wire["metrics"]["attempt_elapsed"]
