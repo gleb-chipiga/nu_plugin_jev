@@ -33,7 +33,7 @@ impl SimplePluginCommand for Jev {
             "Build questions with `jev question`, evaluate one state with `jev ask`, ",
             "annotate rows with `jev annotate`, or list current models with `jev models`; ",
             "use native Nu commands for filtering and sorting. Settings resolve per call ",
-            "from flags, Nu config, caller environment, local TOML, user TOML, then defaults. ",
+            "from flags, Nu config, caller environment, local NUON, user NUON, then defaults. ",
             "Use --config or NU_PLUGIN_JEV_CONFIG to select a local file. ",
             "Automatic proxy discovery is captured at plugin startup; restart with ",
             "`plugin stop jev` after ordinary proxy changes. Explicit HTTP/SOCKS5h proxies ",

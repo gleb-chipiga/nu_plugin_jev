@@ -137,21 +137,21 @@ pub(crate) struct ConfigSources {
     /// Explicitly supplied caller credential, including an invalid value.
     key: Option<Value>,
     /// Selected local file, read once before any rows are consumed.
-    local: Option<TomlSettings>,
+    local: Option<FileSettings>,
     /// Optional platform user file, read once before any rows are consumed.
-    user: Option<TomlSettings>,
+    user: Option<FileSettings>,
 }
 
 /// Keeps parsed file values and key-file permission state private to one invocation.
 #[derive(Default)]
-struct TomlSettings {
+struct FileSettings {
     values: BTreeMap<String, Value>,
     key: Option<Value>,
     insecure_key_permissions: bool,
 }
 
 /// Maximum accepted size of each configuration file in bytes.
-const MAX_TOML_BYTES: u64 = 65_536;
+const MAX_CONFIG_BYTES: u64 = 65_536;
 
 /// Captures configuration through the public engine interface before row consumption.
 pub(crate) fn capture_sources(
@@ -227,7 +227,7 @@ pub(crate) fn capture_sources(
     let explicit = selected_path.is_some();
     let local_path = selected_path
         .map(|path| resolve_path(&caller_dir, &path))
-        .unwrap_or_else(|| caller_dir.join(".nu_plugin_jev.toml"));
+        .unwrap_or_else(|| caller_dir.join(".nu_plugin_jev.nuon"));
     let xdg = engine
         .get_env_var("XDG_CONFIG_HOME")
         .map_err(LabeledError::from)?;
@@ -235,7 +235,7 @@ pub(crate) fn capture_sources(
         Some(Value::String { val, .. }) if Path::new(&val).is_absolute() => PathBuf::from(val),
         _ => default_user_config_dir(engine)?,
     };
-    let user_path = user_root.join("nu_plugin_jev/config.toml");
+    let user_path = user_root.join("nu_plugin_jev/config.nuon");
     let same_file = local_path == user_path
         || local_path.canonicalize().ok().is_some_and(|local| {
             user_path
@@ -243,11 +243,11 @@ pub(crate) fn capture_sources(
                 .ok()
                 .is_some_and(|user| local == user)
         });
-    let user = read_toml(&user_path, same_file && explicit, false, "user")?;
+    let user = read_nuon(&user_path, same_file && explicit, false, "user")?;
     let local = if same_file {
         None
     } else {
-        read_toml(&local_path, explicit, !explicit, "local")?
+        read_nuon(&local_path, explicit, !explicit, "local")?
     };
     Ok(ConfigSources {
         flags,
@@ -294,86 +294,78 @@ fn resolve_path(caller_dir: &Path, path: &Path) -> PathBuf {
     }
 }
 
-/// Reads and checks one bounded TOML file without exposing its contents in errors.
-fn read_toml(
+/// Reads one bounded data-only NUON record without exposing parser details or file contents.
+fn read_nuon(
     path: &Path,
     required: bool,
     implicit_local: bool,
     label: &str,
-) -> Result<Option<TomlSettings>, LabeledError> {
+) -> Result<Option<FileSettings>, LabeledError> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => {
             return Err(config_error(format!(
-                "cannot read {label} TOML configuration"
+                "cannot read {label} NUON configuration"
             )));
         }
     };
     let metadata = file
         .metadata()
-        .map_err(|_| config_error(format!("cannot inspect {label} TOML configuration")))?;
-    if !metadata.is_file() || metadata.len() > MAX_TOML_BYTES {
+        .map_err(|_| config_error(format!("cannot inspect {label} NUON configuration")))?;
+    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
         return Err(config_error(format!(
-            "{label} TOML configuration must be a regular file of at most {MAX_TOML_BYTES} bytes"
+            "{label} NUON configuration must be a regular file of at most {MAX_CONFIG_BYTES} bytes"
         )));
     }
     let mut bytes = Vec::with_capacity((metadata.len() + 1) as usize);
-    file.take(MAX_TOML_BYTES + 1)
+    file.take(MAX_CONFIG_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| config_error(format!("cannot read {label} TOML configuration")))?;
-    if bytes.len() as u64 > MAX_TOML_BYTES {
+        .map_err(|_| config_error(format!("cannot read {label} NUON configuration")))?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
         return Err(config_error(format!(
-            "{label} TOML configuration exceeds {MAX_TOML_BYTES} bytes"
+            "{label} NUON configuration exceeds {MAX_CONFIG_BYTES} bytes"
         )));
     }
     let source = std::str::from_utf8(&bytes)
-        .map_err(|_| config_error(format!("{label} TOML configuration is not UTF-8")))?;
-    let table: toml::Table = toml::from_str(source).map_err(|error: toml::de::Error| {
-        let location = error
-            .span()
-            .map(|span| {
-                format!(
-                    " at line {}",
-                    source[..span.start]
-                        .bytes()
-                        .filter(|byte| *byte == b'\n')
-                        .count()
-                        + 1
-                )
-            })
-            .unwrap_or_default();
-        config_error(format!("malformed {label} TOML configuration{location}"))
-    })?;
-    let mut settings = TomlSettings::default();
-    for (name, value) in table {
+        .map_err(|_| config_error(format!("{label} NUON configuration is not UTF-8")))?;
+    let value = if source
+        .lines()
+        .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
+    {
+        Value::record(Record::new(), Span::unknown())
+    } else {
+        nuon::from_nuon(source, None)
+            .map_err(|_| config_error(format!("malformed {label} NUON configuration")))?
+    };
+    let Value::Record { val, .. } = value else {
+        return Err(config_error(format!(
+            "{label} NUON configuration must be a record"
+        )));
+    };
+    let mut settings = FileSettings::default();
+    for (name, value) in val.into_owned() {
         match name.as_str() {
-            "api_key" => settings.key = Some(toml_value(value)),
+            "api_key" => settings.key = Some(value),
             "cache" => {
-                let toml::Value::Table(cache) = value else {
-                    settings.values.insert(name, toml_value(value));
-                    continue;
-                };
-                let mut record = Record::new();
-                for (cache_name, cache_value) in cache {
-                    if !matches!(cache_name.as_str(), "max_entries" | "max_approx_bytes") {
-                        return Err(config_error(format!("unknown {label} TOML cache field")));
-                    }
-                    record.push(cache_name, toml_value(cache_value));
+                if let Value::Record { val: cache, .. } = &value
+                    && cache
+                        .columns()
+                        .any(|key| !matches!(key.as_str(), "max_entries" | "max_approx_bytes"))
+                {
+                    return Err(config_error(format!("unknown {label} NUON cache field")));
                 }
-                settings
-                    .values
-                    .insert(name, Value::record(record, Span::unknown()));
+                settings.values.insert(name, value);
             }
             "base_url" | "proxy" if implicit_local => {
                 return Err(config_error(format!(
-                    "implicit local TOML cannot set {name}"
+                    "implicit local NUON cannot set {name}"
                 )));
             }
             "model" | "base_url" | "timeout_ms" | "jobs" | "retries" | "proxy" => {
-                settings.values.insert(name, toml_value(value));
+                settings.values.insert(name, value);
             }
-            _ => return Err(config_error(format!("unknown {label} TOML field"))),
+            _ => return Err(config_error(format!("unknown {label} NUON field"))),
         }
     }
     #[cfg(unix)]
@@ -383,15 +375,6 @@ fn read_toml(
             settings.key.is_some() && metadata.permissions().mode() & 0o077 != 0;
     }
     Ok(Some(settings))
-}
-
-/// Converts TOML settings into Nu scalars for the existing selected-value validators.
-fn toml_value(value: toml::Value) -> Value {
-    match value {
-        toml::Value::String(value) => Value::string(value, Span::unknown()),
-        toml::Value::Integer(value) => Value::int(value, Span::unknown()),
-        _ => Value::nothing(Span::unknown()),
-    }
 }
 
 /// Resolves each applicable setting independently using the documented priority.
@@ -448,7 +431,7 @@ pub(crate) fn resolve(
                 .get("cache")
                 .is_some_and(|value| !matches!(value, Value::Record { .. }))
             {
-                return Err(config_error("TOML cache must be a table"));
+                return Err(config_error("NUON cache must be a record"));
             }
         }
         let cache_record = match plugin.and_then(|record| record.get("cache")) {
@@ -560,7 +543,7 @@ pub(crate) fn require_api_key(sources: &ConfigSources) -> Result<ApiKey, Labeled
             .as_ref()
             .is_some_and(|file| file.insecure_key_permissions)
     {
-        return Err(config_error("key-bearing TOML file must be owner-only"));
+        return Err(config_error("key-bearing NUON file must be owner-only"));
     }
     parse_api_key(
         sources
@@ -598,8 +581,8 @@ impl std::fmt::Display for Source {
             Self::Flag => "flag",
             Self::Plugin => "plugin config",
             Self::Environment => "environment",
-            Self::Local => "local TOML",
-            Self::User => "user TOML",
+            Self::Local => "local NUON",
+            Self::User => "user NUON",
         };
         formatter.write_str(name)
     }
@@ -775,7 +758,7 @@ fn cache_limit(
 }
 
 /// Finds one nested file cache field while allowing another field to fall through.
-fn file_cache_value<'a>(file: Option<&'a TomlSettings>, key: &str) -> Option<&'a Value> {
+fn file_cache_value<'a>(file: Option<&'a FileSettings>, key: &str) -> Option<&'a Value> {
     match file?.values.get("cache") {
         Some(Value::Record { val, .. }) => val.get(key),
         _ => None,
@@ -798,7 +781,7 @@ mod tests {
     use nu_protocol::{Record, Value};
 
     use super::{
-        ConfigScope, ConfigSources, ProxyPolicy, parse_api_key, read_toml, require_api_key,
+        ConfigScope, ConfigSources, ProxyPolicy, parse_api_key, read_nuon, require_api_key,
         resolve, resolve_models,
     };
 
@@ -818,10 +801,10 @@ mod tests {
             Self(path)
         }
 
-        /// Writes a private TOML fixture and returns its absolute path.
+        /// Writes a private NUON fixture and returns its absolute path.
         fn write(&self, name: &str, contents: &str) -> PathBuf {
             let path = self.0.join(name);
-            fs::write(&path, contents).expect("write TOML fixture");
+            fs::write(&path, contents).expect("write NUON fixture");
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -843,26 +826,107 @@ mod tests {
     #[test]
     fn reads_bounded_files_and_redacts_parse_errors() {
         let fixture = Fixture::new();
-        let missing = fixture.0.join("missing.toml");
+        let missing = fixture.0.join("missing.nuon");
         assert!(
-            read_toml(&missing, false, false, "local")
+            read_nuon(&missing, false, false, "local")
                 .unwrap()
                 .is_none()
         );
-        assert!(read_toml(&missing, true, false, "local").is_err());
-        let empty = fixture.write("empty.toml", "");
-        assert!(read_toml(&empty, true, false, "local").unwrap().is_some());
-        let malformed = fixture.write("bad.toml", "api_key = 'SECRET_DO_NOT_SHOW' trailing");
-        let message = read_toml(&malformed, true, false, "local")
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(message.contains("line 1"));
-        assert!(!message.contains("SECRET_DO_NOT_SHOW"));
-        let unknown = fixture.write("unknown.toml", "unexpected = 1");
-        assert!(read_toml(&unknown, true, false, "local").is_err());
-        let large = fixture.write("large.toml", &" ".repeat(65_537));
-        assert!(read_toml(&large, true, false, "local").is_err());
+        assert!(read_nuon(&missing, true, false, "local").is_err());
+        let empty = fixture.write("empty.nuon", "");
+        assert!(read_nuon(&empty, true, false, "local").unwrap().is_some());
+        let malformed = fixture.write("bad.nuon", "{api_key: 'SECRET_DO_NOT_SHOW' trailing}");
+        let error = read_nuon(&malformed, true, false, "local").err().unwrap();
+        assert!(error.to_string().contains("malformed local NUON"));
+        assert!(!format!("{error:?}").contains("SECRET_DO_NOT_SHOW"));
+        let unknown = fixture.write("unknown.nuon", "{unexpected: 1}");
+        assert!(read_nuon(&unknown, true, false, "local").is_err());
+        let large = fixture.write("large.nuon", &" ".repeat(65_537));
+        assert!(read_nuon(&large, true, false, "local").is_err());
+        let at_limit = fixture.write("limit.nuon", &format!("{{}}{}", " ".repeat(65_534)));
+        assert!(read_nuon(&at_limit, true, false, "local").is_ok());
+        let invalid_utf8 = fixture.write("invalid.nuon", "");
+        fs::write(&invalid_utf8, [0xff]).unwrap();
+        assert!(read_nuon(&invalid_utf8, true, false, "local").is_err());
+        assert!(read_nuon(&fixture.0, true, false, "local").is_err());
+    }
+
+    /// Accepts every empty-record form without changing the resolver's defaults.
+    #[test]
+    fn empty_nuon_files_preserve_defaults() {
+        let fixture = Fixture::new();
+        for source in ["", " \n\t", "# empty settings\n  # another comment\n", "{}"] {
+            let path = fixture.write("empty.nuon", source);
+            let sources = ConfigSources {
+                local: read_nuon(&path, true, true, "local").unwrap(),
+                ..ConfigSources::default()
+            };
+            assert_eq!(
+                resolve(&sources, ConfigScope::Table).unwrap().model,
+                "jev-latest"
+            );
+            assert!(require_api_key(&sources).is_err());
+        }
+    }
+
+    /// Rejects invalid roots, executable values, duplicates, and unknown fields without execution.
+    #[test]
+    fn nuon_is_data_only_with_unique_known_record_fields() {
+        let fixture = Fixture::new();
+        let marker = fixture.0.join("must-not-exist");
+        let executable = format!(
+            "{{model: ('SECRET_DO_NOT_SHOW' | save '{}')}}",
+            marker.display()
+        );
+        for source in [
+            "[]",
+            "42",
+            "null",
+            "{}; {}",
+            "api_key = 'SECRET_DO_NOT_SHOW'",
+            "{model: $env.SECRET_DO_NOT_SHOW}",
+            "{model: $'SECRET_DO_NOT_SHOW(1)'}",
+            "{model: {|| 'SECRET_DO_NOT_SHOW'}}",
+            "{model: first, model: SECRET_DO_NOT_SHOW}",
+            "{cache: {max_entries: 1, max_entries: SECRET_DO_NOT_SHOW}}",
+            "{SECRET_DO_NOT_SHOW: 'hidden-value'}",
+            "{cache: {SECRET_DO_NOT_SHOW: 'hidden-value'}}",
+            executable.as_str(),
+        ] {
+            let path = fixture.write("invalid.nuon", source);
+            let error = read_nuon(&path, true, false, "local").err().unwrap();
+            assert_eq!(error.code.as_deref(), Some("jev::configuration"));
+            assert!(!format!("{error:?}").contains("SECRET_DO_NOT_SHOW"));
+            assert!(!marker.exists());
+        }
+    }
+
+    /// Preserves native types for selected validation without coercing floats or durations.
+    #[test]
+    fn nuon_setting_types_are_validated_only_when_selected() {
+        let fixture = Fixture::new();
+        for source in [
+            "{model: [invalid]}",
+            "{timeout_ms: 5sec}",
+            "{jobs: 3.5}",
+            "{retries: true}",
+            "{cache: {max_entries: null}}",
+        ] {
+            let path = fixture.write("types.nuon", source);
+            let mut sources = ConfigSources {
+                local: read_nuon(&path, true, true, "local").unwrap(),
+                ..ConfigSources::default()
+            };
+            assert!(resolve(&sources, ConfigScope::Table).is_err());
+            sources.plugin = Some(record([
+                ("model", Value::test_string("override")),
+                ("timeout", Value::test_duration(1_000_000_000)),
+                ("jobs", Value::test_int(2)),
+                ("retries", Value::test_int(0)),
+                ("cache", record([("max_entries", Value::test_int(1))])),
+            ]));
+            assert!(resolve(&sources, ConfigScope::Table).is_ok());
+        }
     }
 
     /// Composes partial files field by field and never falls back after invalid selection.
@@ -870,19 +934,19 @@ mod tests {
     fn resolves_file_overlays_and_key_priority() {
         let fixture = Fixture::new();
         let user_path = fixture.write(
-            "user.toml",
+            "user.nuon",
             concat!(
-                "api_key = 'user-secret'\nmodel = 'user-model'\n",
-                "timeout_ms = 4000\n[cache]\nmax_entries = 9",
+                "{api_key: 'user-secret', model: 'user-model', ",
+                "timeout_ms: 4000, cache: {max_entries: 9}}",
             ),
         );
         let local_path = fixture.write(
-            "local.toml",
-            "jobs = 7\napi_key = 'local-secret'\n[cache]\nmax_approx_bytes = 12345",
+            "local.nuon",
+            "{jobs: 7, api_key: 'local-secret', cache: {max_approx_bytes: 12345}}",
         );
         let mut sources = ConfigSources {
-            user: read_toml(&user_path, true, false, "user").unwrap(),
-            local: read_toml(&local_path, true, true, "local").unwrap(),
+            user: read_nuon(&user_path, true, false, "user").unwrap(),
+            local: read_nuon(&local_path, true, true, "local").unwrap(),
             ..ConfigSources::default()
         };
         let config = resolve(&sources, ConfigScope::Table).unwrap();
@@ -906,30 +970,30 @@ mod tests {
     fn implicit_local_transport_is_rejected() {
         let fixture = Fixture::new();
         let path = fixture.write(
-            "redirect.toml",
-            "base_url = 'http://evil.invalid'\napi_key = 'secret'",
+            "redirect.nuon",
+            "{base_url: 'http://evil.invalid', api_key: 'secret'}",
         );
-        let message = read_toml(&path, true, true, "local")
+        let message = read_nuon(&path, true, true, "local")
             .err()
             .unwrap()
             .to_string();
         assert!(message.contains("base_url"));
         assert!(!message.contains("evil.invalid"));
-        assert!(read_toml(&path, true, false, "local").is_ok());
+        assert!(read_nuon(&path, true, false, "local").is_ok());
     }
 
     /// Notices edits at the next read while earlier snapshots remain immutable.
     #[test]
     fn file_edits_do_not_change_existing_snapshots() {
         let fixture = Fixture::new();
-        let path = fixture.write("local.toml", "model = 'first'");
+        let path = fixture.write("local.nuon", "{model: 'first'}");
         let first = ConfigSources {
-            local: read_toml(&path, true, true, "local").unwrap(),
+            local: read_nuon(&path, true, true, "local").unwrap(),
             ..ConfigSources::default()
         };
-        fixture.write("local.toml", "model = 'second'");
+        fixture.write("local.nuon", "{model: 'second'}");
         let second = ConfigSources {
-            local: read_toml(&path, true, true, "local").unwrap(),
+            local: read_nuon(&path, true, true, "local").unwrap(),
             ..ConfigSources::default()
         };
         assert_eq!(resolve(&first, ConfigScope::Single).unwrap().model, "first");
@@ -945,10 +1009,10 @@ mod tests {
     fn key_files_must_be_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let fixture = Fixture::new();
-        let path = fixture.write("key.toml", "api_key = 'secret'");
+        let path = fixture.write("key.nuon", "{api_key: 'secret'}");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         let sources = ConfigSources {
-            local: read_toml(&path, true, true, "local").unwrap(),
+            local: read_nuon(&path, true, true, "local").unwrap(),
             key: Some(Value::test_string("env-secret")),
             ..ConfigSources::default()
         };
@@ -1213,20 +1277,20 @@ mod tests {
     fn models_scope_uses_transport_precedence_only() {
         let fixture = Fixture::new();
         let user_path = fixture.write(
-            "models-user.toml",
+            "models-user.nuon",
             concat!(
-                "api_key = 'user-key'\nbase_url = 'https://user.example/'\n",
-                "timeout_ms = 5000\nmodel = 7\njobs = -1\n",
-                "[cache]\nmax_entries = -1",
+                "{api_key: 'user-key', base_url: 'https://user.example/', ",
+                "timeout_ms: 5000, model: 7, jobs: -1, ",
+                "cache: {max_entries: -1}}",
             ),
         );
         let local_path = fixture.write(
-            "models-local.toml",
-            "api_key = 'local-key'\nretries = 2\nmodel = 9",
+            "models-local.nuon",
+            "{api_key: 'local-key', retries: 2, model: 9}",
         );
         let mut sources = ConfigSources {
-            user: read_toml(&user_path, true, false, "user").unwrap(),
-            local: read_toml(&local_path, true, true, "local").unwrap(),
+            user: read_nuon(&user_path, true, false, "user").unwrap(),
+            local: read_nuon(&local_path, true, true, "local").unwrap(),
             plugin: Some(record([
                 ("model", Value::test_int(1)),
                 ("jobs", Value::test_int(0)),
@@ -1260,8 +1324,8 @@ mod tests {
     #[test]
     fn models_scope_keeps_transport_boundary() {
         let fixture = Fixture::new();
-        let path = fixture.write("models-unsafe.toml", "proxy = 'http://localhost:1111'");
-        assert!(read_toml(&path, true, true, "local").is_err());
+        let path = fixture.write("models-unsafe.nuon", "{proxy: 'http://localhost:1111'}");
+        assert!(read_nuon(&path, true, true, "local").is_err());
         assert!(require_api_key(&ConfigSources::default()).is_err());
         assert_eq!(
             resolve_models(&ConfigSources::default()).unwrap().retries,

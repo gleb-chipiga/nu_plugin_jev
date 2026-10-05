@@ -929,7 +929,7 @@ fn real_nu_help_lists_focused_short_options() {
             assert!(help.contains(long_only));
         }
         assert!(help.contains("NU_PLUGIN_JEV_CONFIG"));
-        assert!(help.contains(".nu_plugin_jev.toml"));
+        assert!(help.contains(".nu_plugin_jev.nuon"));
         assert!(!help.contains("-b, --base-url"));
         assert!(!help.contains("-t, --timeout"));
     }
@@ -1085,26 +1085,35 @@ fn models_nuon_completion_matches_optional_metrics() {
     assert_eq!(server.join().unwrap().len(), 2);
 }
 
-/// Reads changed user TOML again for a second models call in the same Nu session.
+/// Reloads user NUON and honors explicit local selection during one models session.
 #[test]
-fn real_nu_models_reload_toml_between_calls() {
+fn real_nu_models_reload_nuon_and_honor_explicit_config() {
     if Command::new("nu").arg("--version").output().is_err() {
         return;
     }
-    let root = std::env::temp_dir().join(format!("jev-model-toml-reload-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("jev-model-nuon-reload-{}", std::process::id()));
     let user = root.join("user");
     std::fs::create_dir_all(user.join("nu_plugin_jev")).expect("user config directory");
-    let config = user.join("nu_plugin_jev/config.toml");
-    std::fs::write(&config, "timeout_ms = 5000\n").expect("initial user TOML");
-    let (url, server) = serve_model_catalogs(&["first"]);
+    let config = user.join("nu_plugin_jev/config.nuon");
+    std::fs::write(&config, "{timeout_ms: 5000}").expect("initial user NUON");
+    let (url, server) = serve_model_catalogs(&["first", "explicit"]);
+    let explicit = root.join("selected.nuon");
+    std::fs::write(
+        &explicit,
+        format!("{{base_url: '{url}', timeout_ms: 5000}}"),
+    )
+    .expect("explicit local NUON");
     let source = r#"
 let first = (jev models --base-url '{URL}' | get models.0.name)
-'timeout_ms = 0' | save --force '{CONFIG}'
+{timeout_ms: 0} | save --force '{CONFIG}'
 let second_error = (try { jev models --base-url '{URL}' } catch {|err| $err.msg })
-{first: $first, second_error: $second_error} | to json --raw
+$env.NU_PLUGIN_JEV_CONFIG = 'missing-env-selected.nuon'
+let explicit = (jev models --config '{EXPLICIT}' | get models.0.name)
+{first: $first, second_error: $second_error, explicit: $explicit} | to json --raw
 "#
     .replace("{URL}", &url)
-    .replace("{CONFIG}", &config.to_string_lossy());
+    .replace("{CONFIG}", &config.to_string_lossy())
+    .replace("{EXPLICIT}", &explicit.to_string_lossy());
     let output = Command::new("nu")
         .args([
             "--no-config-file",
@@ -1131,9 +1140,10 @@ let second_error = (try { jev models --base-url '{URL}' } catch {|err| $err.msg 
     assert!(
         result["second_error"]
             .as_str()
-            .is_some_and(|error| error.contains("user TOML timeout_ms")),
-        "expected updated TOML to fail validation: {result}"
+            .is_some_and(|error| error.contains("user NUON timeout_ms")),
+        "expected updated NUON to fail validation: {result}"
     );
+    assert_eq!(result["explicit"], "explicit");
     assert_eq!(
         server
             .join()
@@ -1141,7 +1151,7 @@ let second_error = (try { jev models --base-url '{URL}' } catch {|err| $err.msg 
             .into_iter()
             .map(|request| (request.method, request.path))
             .collect::<Vec<_>>(),
-        vec![("GET".to_owned(), "/v1/models".to_owned())]
+        vec![("GET".to_owned(), "/v1/models".to_owned()); 2]
     );
 }
 
@@ -1248,9 +1258,9 @@ fn interrupt_stalled_annotation_stops_local_work() {
     );
 }
 
-/// Resolves TOML from each caller directory while reusing one Nu plugin session.
+/// Resolves and reloads caller NUON, ignores legacy TOML, and converts it without key disclosure.
 #[test]
-fn toml_defaults_follow_caller_directory_and_reload_between_calls() {
+fn nuon_defaults_follow_caller_directory_and_reload_between_calls() {
     if Command::new("nu").arg("--version").output().is_err() {
         return;
     }
@@ -1264,46 +1274,56 @@ fn toml_defaults_follow_caller_directory_and_reload_between_calls() {
     std::fs::create_dir_all(&second).expect("second caller directory");
     std::fs::create_dir_all(&broken).expect("broken caller directory");
     std::fs::create_dir_all(user.join("nu_plugin_jev")).expect("user config directory");
-    std::fs::create_dir_all(legacy_user.join("jev")).expect("legacy user directory");
-    std::fs::write(first.join(".nu_plugin_jev.toml"), "model = 'first-model'\n")
-        .expect("first local TOML");
+    std::fs::create_dir_all(legacy_user.join("nu_plugin_jev")).expect("legacy user directory");
+    std::fs::write(first.join(".nu_plugin_jev.nuon"), "{model: 'first-model'}")
+        .expect("first local NUON");
     std::fs::write(
-        user.join("nu_plugin_jev/config.toml"),
-        "model = 'user-model'\n",
+        user.join("nu_plugin_jev/config.nuon"),
+        "{model: 'user-model'}",
     )
-    .expect("user TOML");
+    .expect("user NUON");
     std::fs::write(second.join(".jev.toml"), "model = 'legacy-local'\n")
         .expect("legacy local TOML");
     std::fs::write(
-        legacy_user.join("jev/config.toml"),
+        second.join(".nu_plugin_jev.toml"),
+        "model = 'legacy-local'\napi_key = 'fixture-migration-key'\n[cache]\nmax_entries = 7",
+    )
+    .expect("former plugin-scoped local TOML");
+    std::fs::write(
+        legacy_user.join("nu_plugin_jev/config.toml"),
         "model = 'legacy-user'\n",
     )
     .expect("legacy user TOML");
-    std::fs::write(root.join("explicit.toml"), "model = 'explicit-model'\n")
-        .expect("explicit TOML");
-    std::fs::write(root.join(".nu_plugin_jev.toml"), "model = 'parent-model'\n")
-        .expect("parent TOML");
+    std::fs::write(root.join("explicit.data"), "{model: 'explicit-model'}")
+        .expect("explicit NUON with nonstandard extension");
+    std::fs::write(root.join(".nu_plugin_jev.nuon"), "{model: 'parent-model'}")
+        .expect("parent NUON");
+    std::fs::write(
+        broken.join(".nu_plugin_jev.nuon"),
+        "{api_key: 'secret' invalid NUON}",
+    )
+    .expect("broken NUON");
     std::fs::write(
         broken.join(".nu_plugin_jev.toml"),
         "api_key = 'secret' invalid TOML",
     )
-    .expect("broken TOML");
+    .expect("broken legacy TOML");
     let source = r#"
 let q = {match: (jev question noul 'Match?')};
 cd '{FIRST}';
 let a = ('hello' | jev ask $q --dry-run | get request.model);
 let pending = ([{message: 1}] | jev annotate $q --dry-run);
-"model = 'updated-model'" | save --force .nu_plugin_jev.toml;
+{model: 'updated-model'} | save --force .nu_plugin_jev.nuon;
 let frozen = ($pending | get 0.request.model);
 let b = ('hello' | jev ask $q --dry-run | get request.model);
 cd '{SECOND}';
 let c = ('hello' | jev ask $q --dry-run | get request.model);
-"model = 'changed-user'" | save --force '{USER}/nu_plugin_jev/config.toml';
+{model: 'changed-user'} | save --force '{USER}/nu_plugin_jev/config.nuon';
 let changed_user = ('hello' | jev ask $q --dry-run | get request.model);
 $env.NU_PLUGIN_JEV_MODEL = 'env-model';
 let changed_env = ('hello' | jev ask $q --dry-run | get request.model);
 hide-env NU_PLUGIN_JEV_MODEL;
-$env.NU_PLUGIN_JEV_CONFIG = '{FIRST}/.nu_plugin_jev.toml';
+$env.NU_PLUGIN_JEV_CONFIG = '{FIRST}/.nu_plugin_jev.nuon';
 let d = ('hello' | jev ask $q --dry-run | get request.model);
 let e = ('hello' | jev ask $q --config '{EXPLICIT}' --dry-run | get request.model);
 hide-env NU_PLUGIN_JEV_CONFIG;
@@ -1314,13 +1334,19 @@ let parallel = (['{FIRST}' '{SECOND}'] | par-each { |dir|
 cd '{SECOND}';
 $env.XDG_CONFIG_HOME = '{LEGACY_USER}';
 let ignored_legacy_files = ('hello' | jev ask $q --dry-run | get request.model);
-let explicit_legacy = ('hello' | jev ask $q --config .jev.toml --dry-run | get request.model);
+let legacy_error = (try {
+    'hello' | jev ask $q --config .jev.toml --dry-run
+} catch {|err| $err.msg});
+open .nu_plugin_jev.toml | save converted.nuon;
+let converted = ('hello' | jev ask $q --config converted.nuon --dry-run | get request.model);
+let retained = (open converted.nuon | {key: ($in.api_key == 'fixture-migration-key'),
+    cache: $in.cache.max_entries});
 cd '{BROKEN}';
 let offline = ((jev question noul 'Still offline?') | get type);
 let guidance = (jev | str contains 'jev ask');
 [
     $a $frozen $b $c $changed_user $changed_env $d $e
-    $parallel $ignored_legacy_files $explicit_legacy $offline $guidance
+    $parallel $ignored_legacy_files $legacy_error $converted $retained $offline $guidance
 ] | to json --raw
 "#
     .replace("{FIRST}", &first.to_string_lossy())
@@ -1328,7 +1354,7 @@ let guidance = (jev | str contains 'jev ask');
     .replace("{BROKEN}", &broken.to_string_lossy())
     .replace("{USER}", &user.to_string_lossy())
     .replace("{LEGACY_USER}", &legacy_user.to_string_lossy())
-    .replace("{EXPLICIT}", &root.join("explicit.toml").to_string_lossy());
+    .replace("{EXPLICIT}", &root.join("explicit.data").to_string_lossy());
     let output = Command::new("nu")
         .args([
             "--no-config-file",
@@ -1360,7 +1386,9 @@ let guidance = (jev | str contains 'jev ask');
             "explicit-model",
             ["changed-user", "updated-model"],
             "jev-latest",
+            "malformed local NUON configuration",
             "legacy-local",
+            {"key": true, "cache": 7},
             "noul",
             true
         ])
@@ -1413,7 +1441,7 @@ fn replaced_environment_names_are_not_selected() {
 /// Uses a private user-file key for live HTTP and blocks an insecure key file.
 #[cfg(unix)]
 #[test]
-fn live_nu_uses_private_toml_key_and_rejects_open_permissions() {
+fn live_nu_uses_private_nuon_key_and_rejects_open_permissions() {
     use std::os::unix::fs::PermissionsExt;
 
     if Command::new("nu").arg("--version").output().is_err() {
@@ -1422,10 +1450,28 @@ fn live_nu_uses_private_toml_key_and_rejects_open_permissions() {
     let root = std::env::temp_dir().join(format!("jev-real-key-{}", std::process::id()));
     let user = root.join("user");
     std::fs::create_dir_all(user.join("nu_plugin_jev")).expect("user config directory");
-    let key_file = user.join("nu_plugin_jev/config.toml");
-    std::fs::write(&key_file, "api_key = 'fixture-secret-do-not-echo'\n").expect("user key file");
-    std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600))
+    let key_file = user.join("nu_plugin_jev/config.nuon");
+    let old_file = user.join("nu_plugin_jev/config.toml");
+    std::fs::write(&old_file, "api_key = 'fixture-secret-do-not-echo'").expect("old user key file");
+    std::fs::set_permissions(&old_file, std::fs::Permissions::from_mode(0o600))
         .expect("private file permissions");
+    let migration = concat!(
+        "touch '{NEW}'; ^chmod 600 '{NEW}'; ",
+        "open '{OLD}' | save --force '{NEW}'"
+    )
+    .replace("{NEW}", &key_file.to_string_lossy())
+    .replace("{OLD}", &old_file.to_string_lossy());
+    let converted = Command::new("nu")
+        .args(["--no-config-file", "--commands", &migration])
+        .output()
+        .expect("convert private TOML using documented Nu commands");
+    assert!(converted.status.success());
+    assert!(converted.stdout.is_empty());
+    assert!(converted.stderr.is_empty());
+    assert_eq!(
+        std::fs::metadata(&key_file).unwrap().permissions().mode() & 0o077,
+        0
+    );
     let (base_url, calls, server) = serve_until_stopped(false);
     let source =
         "{message: 1} | jev ask {match: (jev question noul 'Match?')} | get answers.match.noul";
@@ -1438,6 +1484,7 @@ fn live_nu_uses_private_toml_key_and_rejects_open_permissions() {
                 "--commands",
                 source,
             ])
+            .current_dir(&root)
             .env("XDG_CONFIG_HOME", &user)
             .env("NU_PLUGIN_JEV_BASE_URL", &base_url)
             .env_remove("TYPESAFE_API_KEY")

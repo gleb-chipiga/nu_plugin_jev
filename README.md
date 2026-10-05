@@ -50,7 +50,7 @@ That build retains normal HTTPS HTTP/2 negotiation with HTTP/1.1 fallback.
 There is no runtime protocol switch. Plain `--no-default-features` also uses
 the system allocator and omits NUON diagnostic formatting.
 
-Live requests need an API key from `TYPESAFE_API_KEY` or a private TOML file.
+Live requests need an API key from `TYPESAFE_API_KEY` or a private NUON file.
 Question constructors and `--dry-run` work without a key or network access.
 
 ## List current models
@@ -174,15 +174,15 @@ Each setting is resolved independently, from highest to lowest priority:
 1. Command flag, where available.
 2. `$env.config.plugins.jev`.
 3. Caller environment (`NU_PLUGIN_JEV_*`; key: `TYPESAFE_API_KEY`).
-4. Local TOML file.
-5. User TOML file.
+4. Local NUON file.
+5. User NUON file.
 6. Built-in default.
 
 An invalid value is an error, not a reason to try a lower-priority source.
 Settings are captured per command invocation, so later calls can see edited
 files even when the plugin process persists.
 
-| Setting | Environment | TOML | Default |
+| Setting | Environment | NUON | Default |
 | --- | --- | --- | --- |
 | Model | `NU_PLUGIN_JEV_MODEL` | `model` | `jev-latest` |
 | Service root | `NU_PLUGIN_JEV_BASE_URL` | `base_url` | `https://api.typesafe.ai` |
@@ -194,14 +194,27 @@ files even when the plugin process persists.
 `jev models` reads only the transport, retry, proxy, and credential settings;
 invalid evaluation-only model, jobs, or cache values do not block a listing.
 
-The optional user file is `nu_plugin_jev/config.toml` in the platform user
-config directory (usually `~/.config/nu_plugin_jev/config.toml` on Linux). The
-optional local file is `.nu_plugin_jev.toml` in the calling Nu directory.
+The optional user file is `nu_plugin_jev/config.nuon` in the platform user
+config directory (usually `~/.config/nu_plugin_jev/config.nuon` on Linux). The
+optional local file is `.nu_plugin_jev.nuon` in the calling Nu directory.
 Select another local file with `--config <path>` or
-`NU_PLUGIN_JEV_CONFIG`. Every TOML field is optional.
+`NU_PLUGIN_JEV_CONFIG`. Files contain a NUON record; every field is optional:
+
+```nuon
+{
+    model: "jev-latest"
+    timeout_ms: 30000
+    jobs: 16
+    cache: {max_entries: 1024, max_approx_bytes: 16777216}
+}
+```
+
+Empty files and `{}` inherit all settings. Files are data, not executable Nu
+scripts. Duplicate or unknown keys are errors. `timeout_ms` remains an integer
+millisecond count, not a Nu duration.
 
 A local file discovered implicitly cannot set `base_url` or `proxy`. Select it
-explicitly if you intend to allow those settings. A TOML file containing
+explicitly if you intend to allow those settings. A NUON file containing
 `api_key` must be owner-only on Unix (for example, `chmod 600`). Keep it out
 of version control. The key can also come from `TYPESAFE_API_KEY`; it is never
 accepted as a command flag or included in a request preview.

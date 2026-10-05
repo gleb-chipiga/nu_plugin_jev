@@ -56,7 +56,7 @@ impl PluginCommand for JevAsk {
             .named(
                 "config",
                 SyntaxShape::String,
-                "Explicit local TOML file",
+                "Explicit local NUON file",
                 None,
             )
             .switch(
@@ -80,8 +80,8 @@ impl PluginCommand for JevAsk {
             "--metrics adds HTTP-only metrics. --context wraps the state as {input, context}; ",
             "--dry-run returns {request, request_bytes} without an API key. ",
             "The byte count covers only the compact JSON body. Defaults are resolved per call ",
-            "from flags, Nu config, caller environment, selected local TOML (--config or ",
-            "NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.toml), user TOML, then built-ins."
+            "from flags, Nu config, caller environment, selected local NUON (--config or ",
+            "NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.nuon), user NUON, then built-ins."
         )
     }
 

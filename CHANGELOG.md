@@ -15,6 +15,10 @@ Notable changes to `nu_plugin_jev` are documented here.
 
 ### Changed
 
+- Replace file-backed TOML configuration with native NUON records in
+  `.nu_plugin_jev.nuon` and user `nu_plugin_jev/config.nuon`; retain precedence,
+  per-invocation reloads, and credential safeguards. Convert existing TOML
+  contents rather than renaming the extension.
 - Share table questions and preconvert valid static context across rows.
 - Reject successful API response bodies larger than 16 MiB with a nonretryable
   response error before JSON decoding, including chunked bodies.

@@ -101,7 +101,7 @@ impl PluginCommand for JevAnnotate {
             .named(
                 "config",
                 SyntaxShape::String,
-                "Explicit local TOML file",
+                "Explicit local NUON file",
                 None,
             )
             .named(
@@ -157,8 +157,8 @@ impl PluginCommand for JevAnnotate {
             "--metrics adds jev_metrics with one shared request_id and HTTP measurements. ",
             "--fields selects literal top-level names, while --state follows a Nu cell path. ",
             "Use native where and sort-by on answers. Settings are snapshotted per call from ",
-            "flags, Nu config, caller environment, local TOML (--config or ",
-            "NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.toml), user TOML, then defaults."
+            "flags, Nu config, caller environment, local NUON (--config or ",
+            "NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.nuon), user NUON, then defaults."
         )
     }
 

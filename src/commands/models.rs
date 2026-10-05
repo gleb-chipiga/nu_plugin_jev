@@ -45,7 +45,7 @@ impl PluginCommand for JevModels {
             .named(
                 "config",
                 SyntaxShape::String,
-                "Explicit local TOML file",
+                "Explicit local NUON file",
                 None,
             )
             .switch("metrics", "Include successful HTTP measurements", None)
