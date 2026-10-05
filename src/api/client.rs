@@ -22,10 +22,13 @@ use reqwest::{
     header::{CONTENT_TYPE, HeaderMap, RETRY_AFTER},
 };
 use serde::de::DeserializeOwned;
-use tokio::{task::JoinHandle, time::Instant};
+use tokio::{sync::Semaphore, task::JoinHandle, time::Instant};
 
 use crate::{
-    config::{ApiKey, InvocationConfig, ProxyPolicy, TransportConfig, TransportSettings},
+    config::{
+        ApiKey, InvocationConfig, ProxyPolicy, TransportConfig, TransportSettings,
+        process::HttpAttemptLimit,
+    },
     error::JevError,
 };
 
@@ -38,14 +41,24 @@ use super::{
 /// Caps one successful JSON response before decoding or retaining it.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Reuses one HTTP connection pool for every request using the same policy.
+/// Verifies aggregate admission, permit lifetimes, cancellation, and measurements.
+#[cfg(test)]
+#[path = "client/concurrency_tests.rs"]
+mod concurrency_tests;
+
+/// Reuses a policy-specific connection pool and the process-wide HTTP attempt budget.
+/// Clones share both resources without serializing command handlers.
 #[derive(Clone)]
 pub(crate) struct JevClient {
     http: Arc<Client>,
+    /// Counts active sends and body reads across all callers, endpoints, policies, and retries.
+    attempts: Arc<Semaphore>,
     #[cfg(test)]
     response_work_pause: Option<ResponseWorkPause>,
     #[cfg(test)]
     retry_wait_started: Option<tokio::sync::mpsc::Sender<(std::time::Instant, Duration)>>,
+    #[cfg(test)]
+    admission_started: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 /// Pauses test-only offloaded work after it starts on a blocking thread.
@@ -67,7 +80,8 @@ impl ResponseWorkPause {
     }
 }
 
-/// Aborts a queued blocking task when its awaiting evaluation is dropped.
+/// Aborts queued blocking work when its awaiting evaluation is dropped.
+/// Already-running CPU work cannot be stopped, but its result is no longer delivered.
 struct AbortOnDrop<T>(JoinHandle<T>);
 
 impl<T> Drop for AbortOnDrop<T> {
@@ -95,10 +109,15 @@ pub(crate) struct JevClientPool {
 }
 
 impl JevClientPool {
-    /// Captures ordinary process and OS proxy settings in the startup client.
-    pub(crate) fn new() -> Result<Self, JevError> {
+    /// Captures startup proxy discovery and constructs one budget shared by every pooled client.
+    pub(crate) fn new(limit: HttpAttemptLimit) -> Result<Self, JevError> {
+        // Create the budget once, not per policy or HTTP connection. Alternate clients
+        // must retain this same semaphore even when their connection pools are recreated.
         Ok(Self {
-            auto: JevClient::new()?,
+            auto: JevClient::with_budget(
+                &ProxyPolicy::Auto,
+                Arc::new(Semaphore::new(limit.get())),
+            )?,
             alternate: Mutex::new(LruCache::new(
                 NonZeroUsize::new(8).expect("nonzero pool limit"),
             )),
@@ -119,11 +138,15 @@ impl JevClientPool {
                 return Ok(client.clone());
             }
         }
-        let client = JevClient::for_policy(policy)?;
+        // Client construction may block, so it runs on the synchronous caller outside
+        // the cache lock. A concurrent miss may construct a second candidate safely.
+        let client = JevClient::with_budget(policy, Arc::clone(&self.auto.attempts))?;
         let mut alternate = self
             .alternate
             .lock()
             .map_err(|_| JevError::Transport("Jev HTTP client pool is unavailable"))?;
+        // Recheck after construction: replacing a racing winner would discard its pool
+        // and unnecessarily split compatible callers across separate connections.
         if let Some(existing) = alternate.get(policy) {
             return Ok(existing.clone());
         }
@@ -147,9 +170,10 @@ pub(crate) struct HttpMeasurement {
     pub(crate) request_bytes: usize,
     /// Bytes consumed from the final successful response body.
     pub(crate) response_bytes: usize,
-    /// Time from the first send through response decoding and validation.
+    /// First send through validation, including retries and later capacity waits.
+    /// Initial capacity waiting is excluded; it still consumes the operation deadline.
     pub(crate) elapsed: Duration,
-    /// Time from the final send through the same successful completion.
+    /// Final send through the same validation instant, excluding its preceding capacity wait.
     pub(crate) attempt_elapsed: Duration,
     /// Explicit HTTP attempts, including failed attempts before success.
     pub(crate) attempts: usize,
@@ -273,6 +297,7 @@ fn encode_request(request: &SystemOneRequest) -> Result<Bytes, JevError> {
 
 impl JevClient {
     /// Builds an automatic-proxy client without authenticated redirects or hidden retries.
+    #[cfg(test)]
     pub(crate) fn new() -> Result<Self, JevError> {
         Self::for_policy(&ProxyPolicy::Auto)
     }
@@ -297,16 +322,28 @@ impl JevClient {
     }
 
     /// Builds one reusable client with the selected proxy and transport policy.
+    #[cfg(test)]
     fn for_policy(policy: &ProxyPolicy) -> Result<Self, JevError> {
+        Self::with_budget(
+            policy,
+            Arc::new(Semaphore::new(HttpAttemptLimit::default().get())),
+        )
+    }
+
+    /// Couples a reusable client with the process budget shared across proxy policies.
+    fn with_budget(policy: &ProxyPolicy, attempts: Arc<Semaphore>) -> Result<Self, JevError> {
         let http = Self::builder_for_policy(policy)?
             .build()
             .map_err(|_| JevError::Transport("cannot initialize Jev HTTP client"))?;
         Ok(Self {
             http: Arc::new(http),
+            attempts,
             #[cfg(test)]
             response_work_pause: None,
             #[cfg(test)]
             retry_wait_started: None,
+            #[cfg(test)]
+            admission_started: None,
         })
     }
 
@@ -317,6 +354,18 @@ impl JevClient {
         observer: tokio::sync::mpsc::Sender<(std::time::Instant, Duration)>,
     ) {
         self.retry_wait_started = Some(observer);
+    }
+
+    /// Reports test attempt admission before acquiring capacity without blocking workers.
+    #[cfg(test)]
+    pub(crate) fn observe_admission(&mut self, observer: tokio::sync::mpsc::UnboundedSender<()>) {
+        self.admission_started = Some(observer);
+    }
+
+    /// Reads free process slots for bounded scheduler and cancellation assertions.
+    #[cfg(test)]
+    pub(crate) fn free_attempt_slots(&self) -> usize {
+        self.attempts.available_permits()
     }
 
     /// Evaluates one complete request and validates every returned typed answer.
@@ -454,7 +503,8 @@ impl JevClient {
             .await
     }
 
-    /// Applies the same status retries, deadline, and cancellation to both endpoints.
+    /// Applies status-only retries and per-attempt admission to both endpoints.
+    /// The enclosing operation deadline and cancellation also cover capacity and retry waits.
     async fn send<T: DeserializeOwned + Send + 'static>(
         &self,
         operation: HttpOperation<'_>,
@@ -473,6 +523,22 @@ impl JevClient {
         };
         let mut first_started = None;
         for attempt in 0..=retries {
+            #[cfg(test)]
+            if let Some(observer) = &self.admission_started {
+                let _ = observer.send(());
+            }
+            // One slot represents an HTTP attempt, not an HTTP/2 connection or command.
+            // Dropping the enclosing operation cancels this async wait or releases its permit.
+            let permit = self
+                .attempts
+                .acquire()
+                .await
+                .map_err(|_| JevError::Transport("Jev HTTP attempt budget is unavailable"))?;
+            // Admission can finish at the deadline. A ready permit is not permission
+            // to send after expiry, even if the timeout wrapper has not observed it yet.
+            if Instant::now() >= deadline {
+                return Err(JevError::Timeout("Jev evaluation deadline expired"));
+            }
             let attempt_number = attempt + 1;
             tracing::debug!(attempt = attempt_number, "Jev HTTP attempt started");
             let request = match operation {
@@ -484,6 +550,8 @@ impl JevClient {
                     .header(CONTENT_TYPE, "application/json")
                     .body(body.clone()),
             };
+            // HTTP metrics start at sending, not initial queueing. Subsequent admission
+            // waits remain inside elapsed but outside the final attempt's own interval.
             let attempt_started = Instant::now();
             first_started.get_or_insert(attempt_started);
             let response = request.send().await.map_err(|_| {
@@ -510,6 +578,9 @@ impl JevClient {
             if status.is_success() {
                 let http_version = response.version();
                 let body = read_success_body(response, MAX_RESPONSE_BYTES).await?;
+                // Headers alone do not finish an attempt. Release only after bounded body
+                // acquisition, but before decoding or validation can delay neighboring sends.
+                drop(permit);
                 let response_bytes = body.len();
                 let decoded = if response_bytes > 64 * 1024 {
                     #[cfg(test)]
@@ -541,6 +612,10 @@ impl JevClient {
             }
             if attempt < retries && retryable(status) {
                 let delay = retry_delay(response.headers(), SystemTime::now(), attempt);
+                // Backoff is not network activity. Drop the rejected response and slot
+                // before sleeping; the next iteration must acquire capacity again.
+                drop(response);
+                drop(permit);
                 if Instant::now()
                     .checked_add(delay)
                     .is_none_or(|next| next >= deadline)
@@ -572,7 +647,8 @@ impl JevClient {
     }
 }
 
-/// Enforces one cancellation and timeout boundary across transport and response processing.
+/// Enforces one cancellation and timeout boundary across admission, retries, and response work.
+/// Dropping the operation releases attempt capacity; no retry starts a new deadline.
 async fn run_with_deadline<T>(
     task: impl Future<Output = Result<T, JevError>>,
     deadline: Instant,
@@ -752,14 +828,14 @@ mod tests {
     };
 
     use super::{
-        Bytes, JevClient, JevClientPool, MAX_RESPONSE_BYTES, ResponseWorkPause, jittered_backoff,
-        jittered_backoff_with_entropy, models_url, offload_response_work, read_success_body,
-        request_body_bytes, retry_after, retry_after_ms, retry_delay, retryable, server_request_id,
-        system_one_url,
+        Bytes, HttpAttemptLimit, JevClient, JevClientPool, MAX_RESPONSE_BYTES, ResponseWorkPause,
+        Semaphore, jittered_backoff, jittered_backoff_with_entropy, models_url,
+        offload_response_work, read_success_body, request_body_bytes, retry_after, retry_after_ms,
+        retry_delay, retryable, server_request_id, system_one_url,
     };
 
     /// Releases a paused blocking test closure even when its assertion panics.
-    struct ReleaseOnDrop(Arc<AtomicBool>);
+    pub(super) struct ReleaseOnDrop(pub(super) Arc<AtomicBool>);
 
     impl Drop for ReleaseOnDrop {
         /// Lets the worker finish before the test runtime is torn down.
@@ -788,7 +864,7 @@ mod tests {
     }
 
     /// Collects test diagnostics through a dedicated non-blocking tracing worker.
-    struct CapturedDiagnostics(Arc<Mutex<Vec<u8>>>);
+    pub(super) struct CapturedDiagnostics(pub(super) Arc<Mutex<Vec<u8>>>);
 
     impl Write for CapturedDiagnostics {
         /// Appends one diagnostic buffer outside the Tokio runtime worker.
@@ -855,6 +931,8 @@ mod tests {
                 body: response.body.as_bytes().to_vec(),
                 delay: response.delay,
                 chunk_size: 16_384,
+                header_gate: None,
+                body_gate: None,
             }
         });
         let url = reqwest::Url::parse(&format!("{root}/")).unwrap();
@@ -862,7 +940,7 @@ mod tests {
     }
 
     /// Creates the default mock invocation settings without contacting TypeSafe.
-    fn config(base_url: reqwest::Url) -> InvocationConfig {
+    pub(super) fn config(base_url: reqwest::Url) -> InvocationConfig {
         InvocationConfig {
             model: "jev-latest".to_owned(),
             base_url,
@@ -875,7 +953,7 @@ mod tests {
     }
 
     /// Creates transport-only settings for model-discovery mock requests.
-    fn models_config(base_url: reqwest::Url) -> TransportConfig {
+    pub(super) fn models_config(base_url: reqwest::Url) -> TransportConfig {
         TransportConfig {
             base_url,
             proxy: ProxyPolicy::Auto,
@@ -885,7 +963,7 @@ mod tests {
     }
 
     /// Returns a catalog with two ordered entries and forward-compatible fields.
-    fn model_list() -> serde_json::Value {
+    pub(super) fn model_list() -> serde_json::Value {
         json!({"models": [
             {"name": "jev-latest", "description": "General", "release_date": "unknown", "extra": 1},
             {"name": "jev-fixed", "description": "Pinned", "release_date": "2026-09-15"}
@@ -893,7 +971,7 @@ mod tests {
     }
 
     /// Builds one typed Noul request for transport tests.
-    fn request() -> SystemOneRequest {
+    pub(super) fn request() -> SystemOneRequest {
         SystemOneRequest {
             state: json!({"message": "hello"}),
             model: "jev-latest".to_owned(),
@@ -908,13 +986,13 @@ mod tests {
     }
 
     /// Returns one complete valid typed answer envelope.
-    fn answer() -> serde_json::Value {
+    pub(super) fn answer() -> serde_json::Value {
         json!({"model": "jev-2026-09", "answers": {"spam": {"type": "noul", "noul": 0.9}},
             "usage": {"input_tokens": 10, "output_tokens": 2}})
     }
 
     /// Constructs a small response whose many questions trigger offloaded validation.
-    fn many_question_exchange() -> (SystemOneRequest, serde_json::Value) {
+    pub(super) fn many_question_exchange() -> (SystemOneRequest, serde_json::Value) {
         let mut request = request();
         let questions = Arc::make_mut(&mut request.questions);
         questions.clear();
@@ -1000,16 +1078,18 @@ mod tests {
             .build()
             .unwrap();
         for models in [false, true] {
-            let response = MockResponse {
-                status: 200,
-                headers: vec![(
+            let gate = crate::h2_fixture::ResponseGate::default();
+            let held = gate.clone();
+            let (url, server) = crate::h2_fixture::serve(1, move |_, _| {
+                let mut response = crate::h2_fixture::Response::json(200, json!({}));
+                response.headers.push((
                     "Content-Length".to_owned(),
                     (MAX_RESPONSE_BYTES + 1).to_string(),
-                )],
-                body: String::new(),
-                delay: Duration::ZERO,
-            };
-            let (url, server) = serve(vec![response]);
+                ));
+                response.body_gate = Some(held.clone());
+                response
+            });
+            let url = url.parse().unwrap();
             let error = runtime.block_on(async {
                 let client = JevClient::new().unwrap();
                 let (_handle, signal) = CancelHandle::new();
@@ -1034,6 +1114,7 @@ mod tests {
                 error.to_string(),
                 format!("Jev response exceeds {MAX_RESPONSE_BYTES} byte limit")
             );
+            gate.release();
             assert_eq!(server.join().unwrap().len(), 1);
         }
     }
@@ -2173,12 +2254,14 @@ mod tests {
     /// Reuses compatible pools, bounds alternates, and preserves active evicted clients.
     #[test]
     fn proxy_client_cache_reuses_and_safely_evicts() {
-        let pool = JevClientPool::new().unwrap();
+        let pool = JevClientPool::new(HttpAttemptLimit::new(2).unwrap()).unwrap();
         let direct = pool.for_policy(&ProxyPolicy::Direct).unwrap();
         let same = pool.for_policy(&ProxyPolicy::Direct).unwrap();
         assert!(Arc::ptr_eq(&direct.http, &same.http));
+        assert!(Arc::ptr_eq(&direct.attempts, &same.attempts));
         let auto = pool.for_policy(&ProxyPolicy::Auto).unwrap();
         assert!(!Arc::ptr_eq(&direct.http, &auto.http));
+        assert!(Arc::ptr_eq(&direct.attempts, &auto.attempts));
         for port in 10000..10008 {
             pool.for_policy(&ProxyPolicy::Explicit(format!("http://127.0.0.1:{port}")))
                 .unwrap();
@@ -2186,13 +2269,18 @@ mod tests {
         assert_eq!(pool.alternate.lock().unwrap().len(), 8);
         let replacement = pool.for_policy(&ProxyPolicy::Direct).unwrap();
         assert!(!Arc::ptr_eq(&direct.http, &replacement.http));
+        assert!(Arc::ptr_eq(&direct.attempts, &replacement.attempts));
+        let permits = auto.attempts.try_acquire_many(2).unwrap();
+        assert!(replacement.attempts.try_acquire().is_err());
+        drop(permits);
+        assert_eq!(replacement.attempts.available_permits(), 2);
         assert!(Arc::strong_count(&direct.http) >= 1);
     }
 
     /// Concurrent misses retain and return the same cached alternate client.
     #[test]
     fn concurrent_policy_selection_rechecks_before_insertion() {
-        let pool = Arc::new(JevClientPool::new().unwrap());
+        let pool = Arc::new(JevClientPool::new(Default::default()).unwrap());
         let gate = Arc::new(Barrier::new(12));
         let workers: Vec<_> = (0..12)
             .map(|_| {
@@ -2220,7 +2308,7 @@ mod tests {
     #[test]
     fn explicit_http_proxy_is_authoritative() {
         let (proxy_url, server) = serve(vec![MockResponse::json(200, answer())]);
-        let pool = JevClientPool::new().unwrap();
+        let pool = JevClientPool::new(Default::default()).unwrap();
         let policy = ProxyPolicy::Explicit(proxy_url.to_string());
         let client = pool.for_policy(&policy).unwrap();
         let mut settings = config(reqwest::Url::parse("http://localhost:1/").unwrap());
@@ -2291,7 +2379,10 @@ mod tests {
             domain
         });
         let policy = ProxyPolicy::Explicit(format!("socks5h://{address}"));
-        let client = JevClientPool::new().unwrap().for_policy(&policy).unwrap();
+        let client = JevClientPool::new(Default::default())
+            .unwrap()
+            .for_policy(&policy)
+            .unwrap();
         let mut settings = config(reqwest::Url::parse("http://unresolvable.invalid/").unwrap());
         settings.proxy = policy;
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2541,6 +2632,7 @@ mod tests {
                 server,
             } = tls_fixture(h2_enabled, false);
             let client = JevClient {
+                attempts: Arc::new(Semaphore::new(HttpAttemptLimit::default().get())),
                 http: Arc::new(
                     JevClient::builder_for_policy(&ProxyPolicy::Direct)
                         .unwrap()
@@ -2550,6 +2642,7 @@ mod tests {
                 ),
                 response_work_pause: None,
                 retry_wait_started: None,
+                admission_started: None,
             };
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2587,6 +2680,7 @@ mod tests {
             server,
         } = tls_fixture(true, true);
         let client = JevClient {
+            attempts: Arc::new(Semaphore::new(HttpAttemptLimit::default().get())),
             http: Arc::new(
                 JevClient::builder_for_policy(&ProxyPolicy::Direct)
                     .unwrap()
@@ -2596,6 +2690,7 @@ mod tests {
             ),
             response_work_pause: None,
             retry_wait_started: None,
+            admission_started: None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2621,7 +2716,7 @@ mod tests {
         target.set_nonblocking(true).unwrap();
         let url =
             reqwest::Url::parse(&format!("http://{}/", target.local_addr().unwrap())).unwrap();
-        let pool = JevClientPool::new().unwrap();
+        let pool = JevClientPool::new(Default::default()).unwrap();
         let policy = ProxyPolicy::Explicit("http://proxy-user:proxy-secret@127.0.0.1:1".to_owned());
         let client = pool.for_policy(&policy).unwrap();
         let mut settings = config(url);

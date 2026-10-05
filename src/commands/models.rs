@@ -2,13 +2,15 @@
 
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{
-    Example, LabeledError, PipelineData, Record, SignalAction, Signature, SyntaxShape, Type, Value,
+    Example, LabeledError, PipelineData, Record, Signature, SyntaxShape, Type, Value,
 };
 
 use crate::{
-    api::cancel::CancelHandle,
     config::{ConfigScope, capture_sources, require_api_key, resolve_models},
-    nu::cache::next_request_id,
+    nu::{
+        cache::next_request_id,
+        signals::{InterruptRegistration, register_interrupt},
+    },
     plugin::JevPlugin,
     tracing::trace_models,
 };
@@ -99,19 +101,13 @@ impl PluginCommand for JevModels {
             .client
             .for_policy(&config.proxy)
             .map_err(|error| error.into_labeled())?;
-        engine
-            .signals()
-            .check(&call.head)
-            .map_err(LabeledError::from)?;
-        let (cancel, signal) = CancelHandle::new();
-        let handler = cancel.clone();
-        let _guard = engine
-            .register_signal_handler(Box::new(move |action| {
-                if action == SignalAction::Interrupt {
-                    handler.cancel();
-                }
-            }))
-            .map_err(LabeledError::from)?;
+        // Keep registration and the cancellation sender alive until this synchronous
+        // handler's async operation ends; neither belongs to global mutable caller state.
+        let InterruptRegistration {
+            guard: _guard,
+            cancel: _cancel,
+            signal,
+        } = register_interrupt(engine, call.head)?;
         let request_id = next_request_id();
         let list = plugin
             .runtime
@@ -161,7 +157,16 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        PluginTest::new("jev", JevPlugin::new(runtime).into()).map_err(Box::new)
+        let plugin = JevPlugin::new(runtime, Default::default()).unwrap();
+        let mut test = PluginTest::new("jev", plugin.into()).map_err(Box::new)?;
+        test.engine_state_mut().add_env_var(
+            "XDG_CONFIG_HOME".into(),
+            Value::test_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/target/isolated-nu-test-config"
+            )),
+        );
+        Ok(test)
     }
 
     /// Returns ordered string records and preserves an empty service catalog.

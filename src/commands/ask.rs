@@ -166,7 +166,16 @@ mod tests {
             .enable_all()
             .build()
             .expect("build test runtime");
-        PluginTest::new("jev", JevPlugin::new(runtime).into()).map_err(Box::new)
+        let plugin = JevPlugin::new(runtime, Default::default()).unwrap();
+        let mut test = PluginTest::new("jev", plugin.into()).map_err(Box::new)?;
+        test.engine_state_mut().add_env_var(
+            "XDG_CONFIG_HOME".into(),
+            Value::test_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/target/isolated-nu-test-config"
+            )),
+        );
+        Ok(test)
     }
 
     /// Keeps the documented short-form help example executable without a key.

@@ -153,7 +153,8 @@ mod tests {
             .enable_all()
             .build()
             .expect("build test runtime");
-        PluginTest::new("jev", JevPlugin::new(runtime).into()).map_err(Box::new)
+        let plugin = JevPlugin::new(runtime, Default::default()).unwrap();
+        PluginTest::new("jev", plugin.into()).map_err(Box::new)
     }
 
     /// Preserves one-sided and explicitly null Noul descriptions.

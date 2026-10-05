@@ -25,6 +25,13 @@ Run bare `jev` without pipeline input for offline guidance.
   they cannot be combined. Duplicate keys in selected values fail, while
   unselected row fields are not inspected or sent. Shared context is sent with
   each row.
+- `--jobs` limits one annotation's concurrent evaluations; its default is 16.
+  Live calls share a process limit resolved at startup: environment
+  `NU_PLUGIN_JEV_MAX_IN_FLIGHT` → local NUON `max_in_flight` → user NUON
+  `max_in_flight` → 128. Startup local selection uses `NU_PLUGIN_JEV_CONFIG` or
+  `.nu_plugin_jev.nuon` in startup Nu `PWD`. Restart with `plugin stop jev`
+  after changing it; later caller settings, `--config`, and file edits do not
+  change this limit. Invalid selected startup values prevent plugin startup.
 - Use native Nu commands for filtering, sorting, and projecting answers. There
   are no scalar `jev noul|choice|score` or `jev where` commands.
 - Use `jev models` to fetch the current model catalog. It accepts no pipeline
@@ -53,6 +60,14 @@ To inspect available names before choosing a model:
 jev models | get models | sort-by name | select name release_date
 ```
 
+For independent one-state calls, use Nu's native parallelism:
+
+```nu
+$states | par-each --threads 4 { |state| $state | jev ask $questions }
+```
+
+Prefer one `jev annotate --jobs N` invocation for table rows.
+
 ## Inspect and consume results
 
 - Use `--dry-run` to inspect the exact outbound request before sending data.
@@ -63,8 +78,8 @@ jev models | get models | sort-by name | select name release_date
   network access. The listing accepts `--base-url`, `--timeout`, and `--config`
   but no evaluation model or table options. If a sandbox
   blocks access, report the call as unverified, not as an API failure.
-  `--timeout` covers retries, response decoding, and answer validation for each
-  logical request.
+  `--timeout` covers capacity waits, retries, decoding, and validation for each
+  logical request; HTTP durations start at sending, not initial slot waiting.
   A successful API response body larger than 16 MiB fails with a nonretryable
   response error before JSON decoding; no partial answers are exposed.
 - `jev ask` returns `{answers, meta: {base_url, model, usage}}`;
@@ -77,7 +92,9 @@ jev models | get models | sort-by name | select name release_date
   `--metrics` adds HTTP measurements: `metrics` on `ask`/`models`,
   `jev_metrics` on `annotate`. Reused rows share `jev_metrics.request_id`;
   count usage and body bytes once per distinct ID.
-- With `--on-error keep` or `record`, some rows lack answers. Check for an
+- Default `--on-error fail` stops remaining local work on an observed terminal
+  failure before delivering its original error.
+  With `--on-error keep` or `record`, some rows lack answers. Check for an
   annotation before accessing nested answer fields.
   `record` adds `jev_error: {kind, message, status}`; only HTTP failures have a
   numeric status.

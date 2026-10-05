@@ -14,11 +14,123 @@ use std::{
 #[path = "support/h2_fixture.rs"]
 mod h2_fixture;
 
+/// Proves same-process command overlap, aggregate admission, and caller isolation.
+#[path = "real_nu/concurrency.rs"]
+mod concurrency;
+
+/// Prevents native test children from selecting real user settings, files, or credentials.
+fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("real-nu-environment-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("create isolated native-test environment");
+    let mut command = Command::new(program);
+    command
+        .current_dir(&directory)
+        .env("PWD", &directory)
+        .env("XDG_CONFIG_HOME", &directory)
+        .env("NU_PLUGIN_JEV_MAX_IN_FLIGHT", "128")
+        .env("NU_PLUGIN_JEV_LOG", "off")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost");
+    for name in [
+        "TYPESAFE_API_KEY",
+        "NU_PLUGIN_JEV_CONFIG",
+        "NU_PLUGIN_JEV_MODEL",
+        "NU_PLUGIN_JEV_BASE_URL",
+        "NU_PLUGIN_JEV_TIMEOUT_MS",
+        "NU_PLUGIN_JEV_JOBS",
+        "NU_PLUGIN_JEV_RETRIES",
+        "NU_PLUGIN_JEV_PROXY",
+        "NU_PLUGIN_JEV_LOG_FORMAT",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// Rejects invalid process limits before entering the plugin protocol without echoing values.
+#[test]
+fn invalid_startup_limit_has_a_redacted_diagnostic() {
+    for value in [
+        "",
+        "0",
+        "-1",
+        "2.5",
+        "private-value",
+        "99999999999999999999999999999",
+    ] {
+        let output = isolated_command(env!("CARGO_BIN_EXE_nu_plugin_jev"))
+            .arg("--help")
+            .env("NU_PLUGIN_JEV_MAX_IN_FLIGHT", value)
+            .env("NU_PLUGIN_JEV_LOG", "off")
+            .output()
+            .expect("start plugin with invalid limit");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostic.contains("NU_PLUGIN_JEV_MAX_IN_FLIGHT"));
+        assert!(!diagnostic.contains("panicked"));
+        assert!(!diagnostic.contains("private-value"));
+    }
+}
+
+/// Accepts absent and positive process limits without needing a key or network.
+#[test]
+fn valid_startup_limit_serves_offline_help() {
+    for value in [None, Some("2")] {
+        let mut command = isolated_command(env!("CARGO_BIN_EXE_nu_plugin_jev"));
+        command
+            .arg("--help")
+            .env("NU_PLUGIN_JEV_LOG", "off")
+            .env_remove("NU_PLUGIN_JEV_CONFIG")
+            .env(
+                "XDG_CONFIG_HOME",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/target/isolated-nu-test-config"
+                ),
+            );
+        match value {
+            Some(value) => command.env("NU_PLUGIN_JEV_MAX_IN_FLIGHT", value),
+            None => command.env_remove("NU_PLUGIN_JEV_MAX_IN_FLIGHT"),
+        };
+        let output = command.output().expect("start plugin with valid limit");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Non-Unicode process values fail startup without lossy diagnostic contents.
+#[cfg(unix)]
+#[test]
+fn non_unicode_startup_limit_fails_safely() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let output = isolated_command(env!("CARGO_BIN_EXE_nu_plugin_jev"))
+        .arg("--help")
+        .env(
+            "NU_PLUGIN_JEV_MAX_IN_FLIGHT",
+            std::ffi::OsStr::from_bytes(b"private-\xff-value"),
+        )
+        .env("NU_PLUGIN_JEV_LOG", "off")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostic.contains("NU_PLUGIN_JEV_MAX_IN_FLIGHT"));
+    assert!(!diagnostic.contains("private"));
+    assert!(!diagnostic.contains("panicked"));
+}
+
 /// Parses plugin diagnostics with Nu's single-record and newline-delimited NUON readers.
 #[cfg(feature = "nuon-tracing-format")]
 fn parse_nuon_diagnostics_in_nu(stderr: &[u8]) -> Vec<serde_json::Value> {
     let diagnostics = String::from_utf8(stderr.to_vec()).expect("UTF-8 diagnostics");
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--commands",
@@ -76,7 +188,7 @@ fn serve_until_stopped(selective: bool) -> (String, Arc<AtomicUsize>, h2_fixture
 
 /// Runs the same native Nu pipeline against an isolated local mock service.
 fn run_pipeline(selective: bool) -> Option<(Vec<serde_json::Value>, usize)> {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return None;
     }
     let (base_url, calls, server) = serve_until_stopped(selective);
@@ -96,7 +208,7 @@ fn run_pipeline(selective: bool) -> Option<(Vec<serde_json::Value>, usize)> {
         )
     };
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut child = Command::new("nu")
+    let mut child = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -188,7 +300,7 @@ fn serve_mixed_once() -> (String, h2_fixture::TestServer) {
 /// Verifies native projections and caller thresholds over all three answer variants.
 #[test]
 fn ask_native_get_keeps_mixed_answer_details() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let (base_url, server) = serve_mixed_once();
@@ -206,7 +318,7 @@ fn ask_native_get_keeps_mixed_answer_details() {
         "legend: ($result | get answers.urgency.legend), ",
         "model: ($result | get meta.model)} | to json --raw"
     );
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -285,7 +397,7 @@ fn ask_native_get_keeps_mixed_answer_details() {
 #[test]
 #[cfg(feature = "nuon-tracing-format")]
 fn ask_nuon_correlates_retry_attempts() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let (base_url, server) = h2_fixture::serve(3, |attempt, _| {
@@ -307,7 +419,7 @@ fn ask_nuon_correlates_retry_attempts() {
             .push(("x-typesafe-request-id".into(), request_id.into()));
         response
     });
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -424,7 +536,7 @@ fn ask_nuon_correlates_retry_attempts() {
 /// Keeps offline previews free of fabricated successful HTTP diagnostics.
 #[test]
 fn dry_run_has_no_success_measurement_event() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let source = concat!(
@@ -433,7 +545,7 @@ fn dry_run_has_no_success_measurement_event() {
         "| jev annotate {q: {type: noul}} --dry-run); ",
         "{ask: $ask, annotate: $annotate} | to json --raw"
     );
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -495,7 +607,7 @@ fn serve_mixed_table() -> (String, h2_fixture::TestServer) {
 /// Verifies native table transforms over typed answers and projected outbound state.
 #[test]
 fn annotate_composes_with_native_table_commands() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let (base_url, server) = serve_mixed_table();
@@ -522,7 +634,7 @@ let rows = ([
     )
 } | to json --raw
 "#;
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -591,7 +703,7 @@ let rows = ([
 /// Keeps the default answer path aligned with ask while preserving legacy and metadata fields.
 #[test]
 fn annotate_default_answers_and_explicit_legacy_path_in_real_nu() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let (base_url, calls, server) = serve_until_stopped(false);
@@ -620,7 +732,7 @@ let unordered = ([{id: 9, message: 3} {id: 10, message: 4}]
     unordered: $unordered
 } | to json --raw
 "#;
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -676,7 +788,7 @@ let unordered = ([{id: 9, message: 3} {id: 10, message: 4}]
 /// Rejects new-default source collisions and removed destination flags before HTTP dispatch.
 #[test]
 fn annotate_default_destination_collisions_are_terminal_in_real_nu() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let (base_url, calls, server) = serve_until_stopped(false);
@@ -694,7 +806,7 @@ fn annotate_default_destination_collisions_are_terminal_in_real_nu() {
         "[] | jev annotate {match: {type: noul}} --meta-into ai | to json --raw",
         "[] | jev annotate {match: {type: noul}} --metrics-into ai | to json --raw",
     ] {
-        let output = Command::new("nu")
+        let output = isolated_command("nu")
             .args([
                 "--no-config-file",
                 "--plugins",
@@ -720,7 +832,7 @@ fn annotate_default_destination_collisions_are_terminal_in_real_nu() {
 #[test]
 #[cfg(feature = "nuon-tracing-format")]
 fn annotate_nuon_correlates_cached_rows() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let (base_url, calls, server) = serve_until_stopped(false);
@@ -732,7 +844,7 @@ fn annotate_nuon_correlates_cached_rows() {
         "attempt_elapsed_ns: ($rows | get 0.jev_metrics.attempt_elapsed | into int)} ",
         "| to json --raw"
     );
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -807,7 +919,7 @@ fn annotate_nuon_correlates_cached_rows() {
 /// Applies a changed logging level only after the plugin process restarts.
 #[test]
 fn tracing_level_changes_after_plugin_restart() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let (base_url, calls, server) = serve_until_stopped(false);
@@ -820,7 +932,7 @@ plugin stop jev
 let third = ({message: 3} | jev ask $q | get answers.match.noul)
 [$first $second $third] | to json --raw
 "#;
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -854,10 +966,10 @@ let third = ({message: 3} | jev ask $q | get answers.match.noul)
 /// Keeps the installed Nu namespace limited to the seven declared commands.
 #[test]
 fn real_nu_registers_only_the_seven_core_commands() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -891,10 +1003,10 @@ fn real_nu_registers_only_the_seven_core_commands() {
 /// Shows only the selected short aliases in real Nushell command help.
 #[test]
 fn real_nu_help_lists_focused_short_options() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -961,7 +1073,7 @@ fn serve_model_catalogs(names: &[&str]) -> (String, h2_fixture::TestServer) {
 /// Composes model rows with native Nu commands and observes fresh service data.
 #[test]
 fn real_nu_models_are_fresh_native_records() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let (url, server) = serve_model_catalogs(&["first", "second"]);
@@ -971,7 +1083,7 @@ fn real_nu_models_are_fresh_native_records() {
         "second: (jev models | get models | where name == 'second' ",
         "| select name release_date)} | to json --raw"
     );
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -1014,7 +1126,7 @@ fn real_nu_models_are_fresh_native_records() {
 #[test]
 #[cfg(feature = "nuon-tracing-format")]
 fn models_nuon_completion_matches_optional_metrics() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let (base_url, server) = serve_model_catalogs(&["first", "second"]);
@@ -1025,7 +1137,7 @@ fn models_nuon_completion_matches_optional_metrics() {
         "attempt_elapsed_ns: ($second.metrics.attempt_elapsed | into int)} ",
         "| to json --raw"
     );
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -1088,7 +1200,7 @@ fn models_nuon_completion_matches_optional_metrics() {
 /// Reloads user NUON and honors explicit local selection during one models session.
 #[test]
 fn real_nu_models_reload_nuon_and_honor_explicit_config() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let root = std::env::temp_dir().join(format!("jev-model-nuon-reload-{}", std::process::id()));
@@ -1114,7 +1226,7 @@ let explicit = (jev models --config '{EXPLICIT}' | get models.0.name)
     .replace("{URL}", &url)
     .replace("{CONFIG}", &config.to_string_lossy())
     .replace("{EXPLICIT}", &explicit.to_string_lossy());
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -1158,10 +1270,10 @@ let explicit = (jev models --config '{EXPLICIT}' | get models.0.name)
 /// Rejects an actual lazy Nu stream without requiring an API key or HTTP server.
 #[test]
 fn real_nu_models_reject_stream_input() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -1194,7 +1306,7 @@ fn serve_stalled() -> (String, Arc<AtomicUsize>, h2_fixture::TestServer) {
 #[cfg(unix)]
 #[test]
 fn interrupt_stalled_annotation_stops_local_work() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let (base_url, calls, server) = serve_stalled();
@@ -1204,7 +1316,7 @@ fn interrupt_stalled_annotation_stops_local_work() {
         "| jev annotate $q --fields [message] --jobs 4 ",
         "| first 10 | to json --raw"
     );
-    let mut child = Command::new("nu")
+    let mut child = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -1261,7 +1373,7 @@ fn interrupt_stalled_annotation_stops_local_work() {
 /// Resolves and reloads caller NUON, ignores legacy TOML, and converts it without key disclosure.
 #[test]
 fn nuon_defaults_follow_caller_directory_and_reload_between_calls() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let root = std::env::temp_dir().join(format!("jev-real-config-{}", std::process::id()));
@@ -1355,7 +1467,7 @@ let guidance = (jev | str contains 'jev ask');
     .replace("{USER}", &user.to_string_lossy())
     .replace("{LEGACY_USER}", &legacy_user.to_string_lossy())
     .replace("{EXPLICIT}", &root.join("explicit.data").to_string_lossy());
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -1398,7 +1510,7 @@ let guidance = (jev | str contains 'jev ask');
 /// Ignores former setting names in the calling Nu environment.
 #[test]
 fn replaced_environment_names_are_not_selected() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let root = std::env::temp_dir().join(format!("jev-old-env-{}", std::process::id()));
@@ -1409,7 +1521,7 @@ fn replaced_environment_names_are_not_selected() {
         "let b = ([{message: 'hello'}] | jev annotate $q --dry-run ",
         "| get 0.request.model); [$a $b] | to json --raw"
     );
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",
@@ -1444,7 +1556,7 @@ fn replaced_environment_names_are_not_selected() {
 fn live_nu_uses_private_nuon_key_and_rejects_open_permissions() {
     use std::os::unix::fs::PermissionsExt;
 
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let root = std::env::temp_dir().join(format!("jev-real-key-{}", std::process::id()));
@@ -1461,7 +1573,7 @@ fn live_nu_uses_private_nuon_key_and_rejects_open_permissions() {
     )
     .replace("{NEW}", &key_file.to_string_lossy())
     .replace("{OLD}", &old_file.to_string_lossy());
-    let converted = Command::new("nu")
+    let converted = isolated_command("nu")
         .args(["--no-config-file", "--commands", &migration])
         .output()
         .expect("convert private TOML using documented Nu commands");
@@ -1476,7 +1588,7 @@ fn live_nu_uses_private_nuon_key_and_rejects_open_permissions() {
     let source =
         "{message: 1} | jev ask {match: (jev question noul 'Match?')} | get answers.match.noul";
     let run = || {
-        Command::new("nu")
+        isolated_command("nu")
             .args([
                 "--no-config-file",
                 "--plugins",
@@ -1513,7 +1625,7 @@ fn live_nu_uses_private_nuon_key_and_rejects_open_permissions() {
 /// Confirms a reused plugin process keeps one live HTTP connection for compatible calls.
 #[test]
 fn live_nu_reuses_compatible_http_connection() {
-    if Command::new("nu").arg("--version").output().is_err() {
+    if isolated_command("nu").arg("--version").output().is_err() {
         return;
     }
     let (base_url, server) = h2_fixture::serve(2, |_, _| {
@@ -1531,7 +1643,7 @@ fn live_nu_reuses_compatible_http_connection() {
         "let b = ({message: 2} | jev ask $q | get answers.match.noul); ",
         "[$a $b] | to json --raw"
     );
-    let output = Command::new("nu")
+    let output = isolated_command("nu")
         .args([
             "--no-config-file",
             "--plugins",

@@ -12,21 +12,29 @@ use crate::commands::{
     question::{choice::JevQuestionChoice, noul::JevQuestionNoul, score::JevQuestionScore},
     root::Jev,
 };
+use crate::config::process::HttpAttemptLimit;
+use crate::error::JevError;
 
 /// Holds reusable resources shared by all plugin command invocations.
+/// Nu dispatches concurrent handlers; request settings and cancellation stay with each caller.
 pub(crate) struct JevPlugin {
+    /// Reuses policy-specific connection pools under one immutable process attempt budget.
     pub(crate) client: JevClientPool,
+    /// Serves async work for every caller without serializing synchronous command handlers.
     pub(crate) runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl JevPlugin {
     /// Builds the startup automatic pool and retains the process runtime.
-    pub(crate) fn new(runtime: tokio::runtime::Runtime) -> Self {
-        let client = JevClientPool::new().expect("build HTTP client");
-        Self {
+    pub(crate) fn new(
+        runtime: tokio::runtime::Runtime,
+        limit: HttpAttemptLimit,
+    ) -> Result<Self, JevError> {
+        let client = JevClientPool::new(limit)?;
+        Ok(Self {
             client,
             runtime: Arc::new(runtime),
-        }
+        })
     }
 }
 
@@ -104,7 +112,8 @@ mod tests {
             .enable_all()
             .build()
             .expect("build test runtime");
-        let mut test = PluginTest::new("jev", JevPlugin::new(runtime).into())?;
+        let plugin = JevPlugin::new(runtime, Default::default()).unwrap();
+        let mut test = PluginTest::new("jev", plugin.into())?;
         let result = test.eval("jev")?.into_value(Span::test_data())?;
         assert!(result.as_str()?.contains("jev ask"));
         assert!(test.eval("'ignored' | jev").is_err());

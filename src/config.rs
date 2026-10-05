@@ -15,6 +15,9 @@ use nu_protocol::{LabeledError, Record, Span, Value};
 use reqwest::Url;
 use tokio::sync::Semaphore;
 
+/// Resolves startup-only resource policy without invocation overrides.
+pub(crate) mod process;
+
 /// Identifies which settings apply to the current command family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigScope {
@@ -142,7 +145,7 @@ pub(crate) struct ConfigSources {
     user: Option<FileSettings>,
 }
 
-/// Keeps parsed file values and key-file permission state private to one invocation.
+/// Holds bounded file values temporarily for startup or invocation resolution.
 #[derive(Default)]
 struct FileSettings {
     values: BTreeMap<String, Value>,
@@ -236,13 +239,7 @@ pub(crate) fn capture_sources(
         _ => default_user_config_dir(engine)?,
     };
     let user_path = user_root.join("nu_plugin_jev/config.nuon");
-    let same_file = local_path == user_path
-        || local_path.canonicalize().ok().is_some_and(|local| {
-            user_path
-                .canonicalize()
-                .ok()
-                .is_some_and(|user| local == user)
-        });
+    let same_file = same_file(&local_path, &user_path);
     let user = read_nuon(&user_path, same_file && explicit, false, "user")?;
     let local = if same_file {
         None
@@ -292,6 +289,17 @@ fn resolve_path(caller_dir: &Path, path: &Path) -> PathBuf {
     } else {
         caller_dir.join(path)
     }
+}
+
+/// Recognizes an identical local/user file so its user-layer restrictions apply once.
+fn same_file(local_path: &Path, user_path: &Path) -> bool {
+    local_path == user_path
+        || local_path.canonicalize().ok().is_some_and(|local| {
+            user_path
+                .canonicalize()
+                .ok()
+                .is_some_and(|user| local == user)
+        })
 }
 
 /// Reads one bounded data-only NUON record without exposing parser details or file contents.
@@ -362,7 +370,10 @@ fn read_nuon(
                     "implicit local NUON cannot set {name}"
                 )));
             }
-            "model" | "base_url" | "timeout_ms" | "jobs" | "retries" | "proxy" => {
+            // Recognize max_in_flight here, but validate/apply it only at startup.
+            // Invocation reads must not turn later edits into budget changes or call errors.
+            "model" | "base_url" | "timeout_ms" | "jobs" | "retries" | "proxy"
+            | "max_in_flight" => {
                 settings.values.insert(name, value);
             }
             _ => return Err(config_error(format!("unknown {label} NUON field"))),

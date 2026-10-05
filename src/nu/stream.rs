@@ -1,15 +1,6 @@
 //! Schedules independent row requests with bounded admission and invocation-local reuse.
-//!
-//! At most `2 * jobs` source rows are admitted, including queued, active, ordered,
-//! and output-buffered rows. Admission credit is returned only when downstream
-//! consumes an outcome. Each bridge channel holds at most `jobs` items, and no
-//! Tokio worker reads Nu input or performs blocking channel operations. Ordered
-//! output may stall behind an early request; unordered output may return sooner.
-//!
-//! Completed successes use a separate bounded LRU. Its approximate key/result/
-//! provenance weight is not a process-RSS cap or an invocation-wide guarantee
-//! of once-only evaluation: eviction and oversized bypass permit new requests.
-//! One array passed to `jev ask` is a different, intentional shared state.
+//! Independent tasks keep HTTP progressing under output stalls; row credit bounds read-ahead.
+//! Terminal cleanup precedes error delivery and does not wait for a blocked external source.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -18,9 +9,12 @@ use std::{
     thread,
 };
 
-use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use futures::FutureExt;
 use nu_protocol::{HandlerGuard, Value};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    task::{Id, JoinError, JoinSet},
+};
 
 use crate::{
     api::{
@@ -39,7 +33,7 @@ pub(crate) type RowBuilder = Box<dyn Fn(&Value) -> Result<SystemOneRequest, JevE
 
 /// Captures all immutable evaluation settings before table input is consumed.
 pub(crate) struct StreamSetup {
-    /// Shared HTTP connection pool for this invocation.
+    /// Shared HTTP connection pool and process attempt budget for this invocation.
     pub(crate) client: JevClient,
     /// Validated caller-scoped model, transport, and scheduling settings.
     pub(crate) config: InvocationConfig,
@@ -49,9 +43,26 @@ pub(crate) struct StreamSetup {
     pub(crate) unordered: bool,
     /// Stops on the first row failure instead of returning error outcomes.
     pub(crate) fail_fast: bool,
+    /// Reports task admission and output stalls for deterministic scheduler tests.
+    #[cfg(test)]
+    pub(crate) observer: Option<mpsc::UnboundedSender<SupervisorEvent>>,
 }
 
-/// Owns a source row, its result, and admission credit until downstream consumes it.
+/// Exposes controlled scheduler boundaries without changing production execution.
+#[cfg(test)]
+pub(crate) enum SupervisorEvent {
+    /// Counts tasks retained by the set, including unjoined completions.
+    TaskCount(usize),
+    /// Marks a ready outcome about to wait for a full, open output channel.
+    OutputBlocked,
+    /// Confirms local admission is closed and evaluation tasks and routing are cleaned up.
+    WorkStopped,
+    /// Confirms evaluation cleanup and output sender release at supervisor termination.
+    Stopped,
+}
+
+/// Owns a source row, its result, and admission credit until consumed or discarded.
+/// Credit bounds this bridge, not upstream Nu protocol buffers or completed-cache storage.
 pub(crate) struct RowOutcome {
     /// Input sequence number, independent of completion order.
     pub(crate) sequence: u64,
@@ -59,7 +70,7 @@ pub(crate) struct RowOutcome {
     pub(crate) source: Value,
     /// Shared successful result or classified row failure.
     pub(crate) result: Result<Arc<SharedResponse>, Arc<JevError>>,
-    /// Row admission credit released only after this outcome is consumed.
+    /// Local row credit, not HTTP capacity; retained through reordering and output buffering.
     _permit: OwnedSemaphorePermit,
 }
 
@@ -67,7 +78,9 @@ pub(crate) struct RowOutcome {
 pub(crate) struct ScheduledOutput {
     receiver: mpsc::Receiver<RowOutcome>,
     cancel: CancelHandle,
+    /// Retains interrupt protection after the command returns its lazy stream.
     _handler: Option<HandlerGuard>,
+    /// Keeps the async bridge alive until the returned stream is consumed or dropped.
     _runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -81,7 +94,7 @@ impl Iterator for ScheduledOutput {
 }
 
 impl Drop for ScheduledOutput {
-    /// Stops input admission and abandons pending HTTP operations.
+    /// Wakes the supervisor to cancel local work without interrupting neighboring invocations.
     fn drop(&mut self) {
         self.cancel.cancel();
         self.receiver.close();
@@ -117,6 +130,8 @@ struct PendingGroup {
 
 /// Owns invocation-local row routing, duplicate groups, and ordered outcomes.
 struct SupervisorState {
+    /// Separate success LRU with approximate byte accounting, not a process-RSS ceiling.
+    /// Eviction or oversized bypass permits a fresh request for a previously evaluated state.
     cache: CompletedCache,
     pending_groups: VecDeque<PendingGroup>,
     in_flight: HashMap<RequestKey, Vec<InputRow>>,
@@ -131,7 +146,14 @@ type Completion = (
     Result<MeasuredSuccess<SystemOneResponse>, JevError>,
 );
 
+/// Returns a validated response or classified failure from one independent evaluation task.
+type EvaluationResult = Result<MeasuredSuccess<SystemOneResponse>, JevError>;
+
+/// Identifies a finished task even when it panicked before returning its evaluation result.
+type TaskOutcome = Result<(Id, EvaluationResult), JoinError>;
+
 /// Starts a bounded row stream without reading its first input value on the caller thread.
+/// The output owns interrupt protection; a blocked external source may outlive its drop.
 pub(crate) fn start(
     runtime: Arc<tokio::runtime::Runtime>,
     setup: StreamSetup,
@@ -145,8 +167,12 @@ pub(crate) fn start(
         .jobs
         .expect("table settings include jobs")
         .get();
+    // Queue capacities alone do not bound duplicate waiters or ordered results.
+    // One credit follows each row across all stages; HTTP completion does not return it.
     let window = jobs * 2;
     let admission = Arc::new(Semaphore::new(window));
+    // Each channel holds at most jobs rows, but their combined read-ahead also includes
+    // active, duplicate, and reordered rows; the shared row credits enforce the total 2N.
     let (input_sender, input_receiver) = mpsc::channel(jobs);
     let (output_sender, output_receiver) = mpsc::channel(jobs);
     let (cancel, signal) = cancellation;
@@ -154,6 +180,8 @@ pub(crate) fn start(
     let producer_signal = signal.clone();
     let producer_admission = Arc::clone(&admission);
     let service_root: Arc<str> = Arc::from(setup.config.base_url.as_str());
+    // Arbitrary synchronous next() calls cannot be aborted. A dedicated thread avoids
+    // blocking Tokio workers or making runtime shutdown wait for a stuck spawn_blocking call.
     thread::Builder::new()
         .name("jev-row-input".into())
         .spawn(move || {
@@ -176,6 +204,7 @@ pub(crate) fn start(
             output_sender,
             signal,
             supervisor_cancel,
+            admission,
         )
         .await;
     });
@@ -187,7 +216,8 @@ pub(crate) fn start(
     })
 }
 
-/// Reads rows only after admission credit is available, off Tokio worker threads.
+/// Reads and prepares admitted rows on a dedicated thread, never on Tokio workers.
+/// A stuck next() retains its source, builder, runtime, and one local credit, not HTTP capacity.
 fn produce(
     mut input: Box<dyn Iterator<Item = Value> + Send>,
     build: RowBuilder,
@@ -199,6 +229,8 @@ fn produce(
 ) {
     let mut sequence = 0_u64;
     loop {
+        // Waiting blocks only this dedicated producer; the semaphore and cancellation
+        // are awaited asynchronously, so the shared runtime remains free to drive HTTP.
         let permit = runtime.block_on(async {
             let acquired = Arc::clone(&admission).acquire_owned();
             let cancelled = cancel.cancelled();
@@ -210,11 +242,13 @@ fn produce(
             }
         });
         let Some(permit) = permit else { break };
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || admission.is_closed() {
             break;
         }
         let Some(source) = input.next() else { break };
-        if cancel.is_cancelled() {
+        // next() may return after worker cleanup but before saved-error delivery finishes.
+        // Admission closure, unlike stream cancellation, already forbids preparing this row.
+        if cancel.is_cancelled() || admission.is_closed() {
             break;
         }
         let request = build(&source).and_then(|wire| {
@@ -228,7 +262,9 @@ fn produce(
             request: Some(request),
             permit,
         };
-        if cancel.is_cancelled() {
+        // Request preparation can race with termination too. A closed input receiver
+        // rejects any remaining send; the next iteration cannot acquire fresh admission.
+        if cancel.is_cancelled() || admission.is_closed() {
             break;
         }
         let sent = runtime.block_on(async {
@@ -248,12 +284,14 @@ fn produce(
 }
 
 /// Runs at most `jobs` unique evaluations while coalescing admitted duplicates.
+/// Owns task cleanup separately from output delivery, preserving first-observed failure semantics.
 async fn supervise(
     setup: StreamSetup,
     mut input: mpsc::Receiver<InputRow>,
     output: mpsc::Sender<RowOutcome>,
     mut signal: CancelSignal,
     cancel: CancelHandle,
+    admission: Arc<Semaphore>,
 ) {
     let StreamSetup {
         client,
@@ -261,6 +299,8 @@ async fn supervise(
         key,
         unordered,
         fail_fast,
+        #[cfg(test)]
+        observer,
     } = setup;
     let jobs = config.jobs.expect("table settings include jobs").get();
     let mut state = SupervisorState {
@@ -272,10 +312,15 @@ async fn supervise(
     };
     let config = Arc::new(config);
     let key = Arc::new(key);
-    let mut active: FuturesUnordered<BoxFuture<'static, Completion>> = FuturesUnordered::new();
+    // Spawn complete evaluations, including deadlines and retries. Raw HTTP futures in
+    // FuturesUnordered would stop progressing while this supervisor awaits a full output.
+    let mut active = JoinSet::new();
+    let mut task_routes = HashMap::new();
     let mut input_closed = false;
 
-    loop {
+    let terminal = loop {
+        // len() also counts completed, unjoined tasks. Separately, every retained row
+        // still owns admission credit, even after joining a result frees a task position.
         while active.len() < jobs {
             let Some(group) = state.pending_groups.pop_front() else {
                 break;
@@ -292,26 +337,26 @@ async fn supervise(
             let key = Arc::clone(&key);
             let request_signal = signal.clone();
             let trace_id = request_id.clone();
-            active.push(
-                async move {
-                    let result = crate::tracing::trace_evaluation(
-                        "annotate",
-                        &trace_id,
-                        client.system_one_prepared_measured(
-                            &request,
-                            &config,
-                            &key,
-                            request_signal,
-                        ),
-                    )
-                    .await;
-                    (request_key, request_id, result)
-                }
-                .boxed(),
-            );
+            // Keep the deadline wrapper in the spawned task, not in the output path;
+            // HTTP completion or timeout must release shared slots while output is stalled.
+            let task = active.spawn(async move {
+                crate::tracing::trace_evaluation(
+                    "annotate",
+                    &trace_id,
+                    client.system_one_prepared_measured(&request, &config, &key, request_signal),
+                )
+                .await
+            });
+            // A panicking task has no return value; its Tokio ID still identifies its
+            // duplicate group so task_completion can return a redacted error to every waiter.
+            task_routes.insert(task.id(), (request_key, request_id));
+            #[cfg(test)]
+            if let Some(observer) = &observer {
+                let _ = observer.send(SupervisorEvent::TaskCount(active.len()));
+            }
         }
         if input_closed && state.pending_groups.is_empty() && active.is_empty() {
-            break;
+            break None;
         }
         let event = {
             let next_row = async {
@@ -326,13 +371,16 @@ async fn supervise(
                 if active.is_empty() {
                     pending().await
                 } else {
-                    active.next().await
+                    active.join_next_with_id().await
                 }
             }
             .fuse();
             let closed = output.closed().fuse();
             let interrupted = signal.cancelled().fuse();
             futures::pin_mut!(next_row, completion, closed, interrupted);
+            // Prefer termination and completed work over admitting another ready row.
+            // Failure means first observed, not first completed: a successful send may
+            // already be waiting for output capacity before another failure is joined.
             futures::select_biased! {
                 _ = interrupted => Event::Interrupted,
                 _ = closed => Event::OutputClosed,
@@ -340,26 +388,42 @@ async fn supervise(
                 row = next_row => Event::Row(row),
             }
         };
-        match event {
+        let routed = match event {
             Event::Interrupted => {
                 tracing::info!(active_evaluations = active.len(), "annotation interrupted");
-                break;
+                break None;
             }
             Event::OutputClosed => {
                 tracing::info!(
                     active_evaluations = active.len(),
                     "annotation output closed"
                 );
-                break;
+                break None;
             }
-            Event::Row(None) => input_closed = true,
+            Event::Row(None) => {
+                input_closed = true;
+                continue;
+            }
             Event::Row(Some(row)) => {
-                if !route_row(row, &mut state, &output, &mut signal, unordered, fail_fast).await {
-                    break;
-                }
+                route_row(row, &mut state, &output, &mut signal, unordered, fail_fast).await
             }
-            Event::Completed(Some(completion)) => {
-                if !finish_request(
+            Event::Completed(Some(task)) => {
+                let completion = task_completion(task, &mut task_routes);
+                #[cfg(test)]
+                if let Some(observer) = &observer {
+                    let next_ready = state.in_flight[&completion.0]
+                        .iter()
+                        .any(|row| row.sequence == state.next_sequence);
+                    let terminal = completion
+                        .2
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| terminal_error(error, fail_fast));
+                    if output.capacity() == 0 && (unordered || next_ready) && !terminal {
+                        let _ = observer.send(SupervisorEvent::OutputBlocked);
+                    }
+                }
+                finish_request(
                     completion,
                     &mut input,
                     &output,
@@ -369,17 +433,81 @@ async fn supervise(
                     fail_fast,
                 )
                 .await
-                {
-                    break;
-                }
             }
-            Event::Completed(None) => break,
+            Event::Completed(None) => break None,
+        };
+        match routed {
+            Routing::Continue => {}
+            Routing::Stopped => break None,
+            Routing::Terminal(row) => break Some(row),
         }
+    };
+    // Stop the producer before dropping rows returns their credits. Close only this
+    // invocation's row budget; closing the shared HTTP budget would cancel other callers.
+    admission.close();
+    input.close();
+    drop(input);
+    // shutdown aborts AND joins tasks. Their HTTP permits must be released before any
+    // potentially unbounded wait to deliver the saved error. Never join the input thread:
+    // an external next() may not return, but it owns no HTTP permit or shared mutex.
+    active.shutdown().await;
+    // Release the supervisor's cache, duplicate groups, key, and task-routing state
+    // before a stalled consumer can retain the saved outcome and stream lifetime.
+    drop(state);
+    drop(task_routes);
+    drop(config);
+    drop(key);
+    drop(client);
+    #[cfg(test)]
+    if let Some(observer) = &observer {
+        let _ = observer.send(SupervisorEvent::WorkStopped);
+    }
+    if let Some(row) = terminal {
+        #[cfg(test)]
+        if output.capacity() == 0
+            && let Some(observer) = &observer
+        {
+            let _ = observer.send(SupervisorEvent::OutputBlocked);
+        }
+        // Cancelling signal during worker cleanup would discard the original cause here.
+        // External interrupt or output drop still cancels this wait through send_or_cancel.
+        send_or_cancel(&output, row, &mut signal).await;
     }
     cancel.cancel();
+    // Make closure visible before the test completion event. Relying on end-of-scope
+    // drop lets the observer run first and incorrectly see an open output after Stopped.
+    drop(output);
+    #[cfg(test)]
+    if let Some(observer) = observer {
+        let _ = observer.send(SupervisorEvent::Stopped);
+    }
 }
 
-/// Routes already-admitted rows before retiring one completed single-flight group.
+/// Routes task failures without exposing panic payloads or leaving duplicate waiters stranded.
+fn task_completion(
+    task: TaskOutcome,
+    routes: &mut HashMap<Id, (RequestKey, String)>,
+) -> Completion {
+    let (id, result) = match task {
+        Ok(completed) => completed,
+        Err(error) => {
+            tracing::error!(
+                task_cancelled = error.is_cancelled(),
+                "Jev evaluation task failed"
+            );
+            (
+                error.id(),
+                Err(JevError::Transport("Jev evaluation task failed")),
+            )
+        }
+    };
+    let (key, request_id) = routes
+        .remove(&id)
+        .expect("evaluation task has routing state");
+    (key, request_id, result)
+}
+
+/// Preserves terminal failures; otherwise joins admitted rows before retiring a shared group.
 async fn finish_request(
     (request_key, request_id, result): Completion,
     input: &mut mpsc::Receiver<InputRow>,
@@ -388,12 +516,31 @@ async fn finish_request(
     signal: &mut CancelSignal,
     unordered: bool,
     fail_fast: bool,
-) -> bool {
+) -> Routing {
+    let result = match result {
+        Err(error) if terminal_error(&error, fail_fast) => {
+            // Preserve the observed cause before inspecting queued input, whose own
+            // failures or output sends could otherwise replace or delay this failure.
+            // Keep the other duplicate rows and their credits until admission is closed;
+            // dropping the whole group now would briefly let the producer read ahead.
+            let first = state
+                .in_flight
+                .get_mut(&request_key)
+                .expect("active request has waiters")
+                .swap_remove(0);
+            return Routing::Terminal(first.finish(Err(Arc::new(error))));
+        }
+        result => result,
+    };
+    // Drain only the currently queued prefix while this request is still in-flight.
+    // Its duplicates must share this result even if the completed LRU cannot retain it.
+    // A live drain-until-empty would let the producer delay group retirement indefinitely.
     let queued = input.len();
     for _ in 0..queued {
         let Ok(row) = input.try_recv() else { break };
-        if !route_row(row, state, output, signal, unordered, fail_fast).await {
-            return false;
+        match route_row(row, state, output, signal, unordered, fail_fast).await {
+            Routing::Continue => {}
+            stopped => return stopped,
         }
     }
     let waiters = state
@@ -414,7 +561,7 @@ async fn finish_request(
         Err(error) => Err(Arc::new(error)),
     };
     for row in waiters {
-        if !emit(
+        match emit(
             row.finish(shared.clone()),
             output,
             &mut state.ordered,
@@ -425,10 +572,11 @@ async fn finish_request(
         )
         .await
         {
-            return false;
+            Routing::Continue => {}
+            stopped => return stopped,
         }
     }
-    true
+    Routing::Continue
 }
 
 /// Routes one accepted input row to cached, active, queued, or new work.
@@ -439,7 +587,7 @@ async fn route_row(
     signal: &mut CancelSignal,
     unordered: bool,
     fail_fast: bool,
-) -> bool {
+) -> Routing {
     let (request, request_key) = match row.request.take().expect("producer prepares every row") {
         Ok(request) => request,
         Err(error) => {
@@ -477,7 +625,7 @@ async fn route_row(
             "joined in-flight Jev evaluation"
         );
         waiters.push(row);
-        true
+        Routing::Continue
     } else if let Some(group) = state
         .pending_groups
         .iter_mut()
@@ -485,21 +633,35 @@ async fn route_row(
     {
         tracing::debug!(row_sequence = row.sequence, "joined queued Jev evaluation");
         group.rows.push(row);
-        true
+        Routing::Continue
     } else {
         state.pending_groups.push_back(PendingGroup {
             key: request_key,
             request,
             rows: vec![row],
         });
-        true
+        Routing::Continue
     }
+}
+
+/// Separates routine output progress from cancellation and a saved terminal outcome.
+/// Terminal outcomes bypass ordered output so cleanup need not wait for earlier rows.
+enum Routing {
+    Continue,
+    Stopped,
+    Terminal(RowOutcome),
+}
+
+/// Stops on fail-policy errors and on unconditional output-destination collisions.
+/// Keep/record cannot repair a reserved-field collision by passing the same conflicting row.
+fn terminal_error(error: &JevError, fail_fast: bool) -> bool {
+    fail_fast || matches!(error, JevError::FieldCollision(_))
 }
 
 /// Describes which bounded source of work became ready in the supervisor.
 enum Event {
     Row(Option<InputRow>),
-    Completed(Option<Completion>),
+    Completed(Option<TaskOutcome>),
     Interrupted,
     OutputClosed,
 }
@@ -513,25 +675,38 @@ async fn emit(
     unordered: bool,
     fail_fast: bool,
     signal: &mut CancelSignal,
-) -> bool {
-    let terminal =
-        row.result.as_ref().err().is_some_and(|error| {
-            fail_fast || matches!(error.as_ref(), JevError::FieldCollision(_))
-        });
-    if unordered || terminal {
-        return send_or_cancel(output, row, signal).await && !terminal;
+) -> Routing {
+    if row
+        .result
+        .as_ref()
+        .err()
+        .is_some_and(|error| terminal_error(error, fail_fast))
+    {
+        // Do not send here: output may be full. Return ownership so the supervisor
+        // can stop HTTP work before attempting terminal-error delivery.
+        return Routing::Terminal(row);
     }
+    if unordered {
+        return if send_or_cancel(output, row, signal).await {
+            Routing::Continue
+        } else {
+            Routing::Stopped
+        };
+    }
+    // Each buffered outcome keeps its row credit; a slow first row cannot create
+    // an unbounded reorder buffer by allowing completed later rows to admit more input.
     ordered.insert(row.sequence, row);
     while let Some(ready) = ordered.remove(next_sequence) {
         if !send_or_cancel(output, ready, signal).await {
-            return false;
+            return Routing::Stopped;
         }
         *next_sequence = next_sequence.wrapping_add(1);
     }
-    true
+    Routing::Continue
 }
 
-/// Stops a backpressured send immediately when the invocation is cancelled.
+/// Awaits output capacity without blocking a worker and stops on local cancellation.
+/// This wait does not poll task results; independently spawned evaluations still progress.
 async fn send_or_cancel(
     output: &mpsc::Sender<RowOutcome>,
     row: RowOutcome,
@@ -540,6 +715,8 @@ async fn send_or_cancel(
     let cancelled = signal.cancelled().fuse();
     let send = output.send(row).fuse();
     futures::pin_mut!(cancelled, send);
+    // When cancellation and capacity are both ready, cancellation wins; do not deliver
+    // a late outcome merely because the consumer resumed at the same instant.
     futures::select_biased! {
         _ = cancelled => false,
         result = send => result.is_ok(),
@@ -548,6 +725,11 @@ async fn send_or_cancel(
 
 #[cfg(test)]
 mod tests {
+    /// Exercises independent task progress with full but open annotation output.
+    mod backpressure;
+    /// Checks cleanup before terminal-error delivery and uninterruptible input boundaries.
+    mod terminal;
+
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -563,16 +745,16 @@ mod tests {
     use crate::{
         api::{
             cancel::CancelHandle,
-            client::JevClient,
+            client::{JevClient, JevClientPool},
             types::{Question, SystemOneRequest},
         },
         commands::tests::serve,
-        config::{ApiKey, ConfigScope, ConfigSources, resolve},
+        config::{ApiKey, ConfigScope, ConfigSources, process::HttpAttemptLimit, resolve},
         h2_fixture,
         nu::value::to_json,
     };
 
-    use super::{InputRow, StreamSetup, emit, finish_request, start, supervise};
+    use super::{InputRow, Routing, StreamSetup, emit, finish_request, start, supervise};
 
     /// Builds a stable successful response for scheduler tests.
     fn answer(input_tokens: u64) -> serde_json::Value {
@@ -621,12 +803,13 @@ mod tests {
             tokio::task::yield_now().await;
             assert!(!task.is_finished());
             cancel.cancel();
-            assert!(
-                !tokio::time::timeout(Duration::from_millis(250), task)
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_millis(250), task)
                     .await
                     .expect("cancelled send must stop promptly")
-                    .unwrap()
-            );
+                    .unwrap(),
+                Routing::Stopped
+            ));
         });
     }
 
@@ -770,6 +953,7 @@ mod tests {
             key: ApiKey::for_test("local-key"),
             unordered: false,
             fail_fast: true,
+            observer: None,
         }
     }
 
@@ -781,6 +965,276 @@ mod tests {
                 .build()
                 .unwrap(),
         )
+    }
+
+    /// Waits for logical attempt admission independently of actual HTTP sends.
+    async fn wait_for_admissions(
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+        n: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            for _ in 0..n {
+                receiver.recv().await.expect("admission observer closed");
+            }
+        })
+        .await
+        .expect("table did not admit its jobs allowance");
+    }
+
+    /// Jobs and read-ahead stay local while the shared budget stalls queued or active rows.
+    #[test]
+    fn process_budget_preserves_table_bounds_and_local_output_drop() {
+        for unordered in [false, true] {
+            for (jobs, capacity) in [(Some(8), 2), (None, 128)] {
+                let gate = h2_fixture::ResponseGate::default();
+                let held = gate.clone();
+                let (base_url, server) = h2_fixture::serve_unbounded(move |_, _| {
+                    let mut response = h2_fixture::Response::json(200, answer(1));
+                    response.body_gate = Some(held.clone());
+                    response
+                });
+                let pool = JevClientPool::new(HttpAttemptLimit::new(capacity).unwrap()).unwrap();
+                let mut client = pool
+                    .for_policy(&crate::config::ProxyPolicy::Direct)
+                    .unwrap();
+                let (observed, mut admissions) = tokio::sync::mpsc::unbounded_channel();
+                client.observe_admission(observed);
+                let runtime = runtime();
+                let mut busy = None;
+                if capacity == 2 {
+                    let mut settings = setup(&base_url, 2);
+                    settings.client = client.clone();
+                    busy = Some(
+                        start(
+                            Arc::clone(&runtime),
+                            settings,
+                            Box::new(
+                                [Value::test_string("busy-1"), Value::test_string("busy-2")]
+                                    .into_iter(),
+                            ),
+                            Box::new(build),
+                            None,
+                            CancelHandle::new(),
+                        )
+                        .unwrap(),
+                    );
+                    runtime.block_on(async {
+                        wait_for_admissions(&mut admissions, 2).await;
+                        gate.wait_for_arrivals(2).await;
+                    });
+                }
+                let mut settings = setup(&base_url, jobs.unwrap_or(16));
+                if jobs.is_none() {
+                    settings.config =
+                        resolve(&ConfigSources::default(), ConfigScope::Table).unwrap();
+                    settings.config.base_url = base_url.parse().unwrap();
+                }
+                let n = settings.config.jobs.unwrap().get();
+                assert_eq!(n, jobs.unwrap_or(16));
+                settings.client = client.clone();
+                settings.unordered = unordered;
+                let reads = Arc::new(AtomicUsize::new(0));
+                let input_reads = Arc::clone(&reads);
+                let input = (0..1000).map(move |index| {
+                    input_reads.fetch_add(1, Ordering::SeqCst);
+                    Value::test_string(format!("row-{index}"))
+                });
+                let output = start(
+                    Arc::clone(&runtime),
+                    settings,
+                    Box::new(input),
+                    Box::new(build),
+                    None,
+                    CancelHandle::new(),
+                )
+                .unwrap();
+                runtime.block_on(async {
+                    wait_for_admissions(&mut admissions, n).await;
+                    if capacity == 128 {
+                        gate.wait_for_arrivals(n).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    assert!(
+                        admissions.try_recv().is_err(),
+                        "jobs allowed extra evaluations"
+                    );
+                });
+                assert!(reads.load(Ordering::SeqCst) <= 2 * n);
+                assert_eq!(server.request_count(), if capacity == 2 { 2 } else { n });
+                drop(output);
+                if let Some(busy) = busy {
+                    runtime.block_on(async { tokio::time::sleep(Duration::from_millis(30)).await });
+                    assert_eq!(client.free_attempt_slots(), 0);
+                    assert!(
+                        !busy.receiver.is_closed(),
+                        "queued cancellation stopped a neighbor"
+                    );
+                    gate.release();
+                    let rows: Vec<_> = busy.collect();
+                    assert_eq!(rows.len(), 2);
+                    assert!(rows.iter().all(|row| row.result.is_ok()));
+                }
+                runtime.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        while client.free_attempt_slots() != capacity {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("output drop retained HTTP capacity");
+                });
+                let (healthy_url, healthy_server) = serve(vec![answer(1)]);
+                let mut healthy = setup(&healthy_url, 1);
+                healthy.client = client;
+                let rows: Vec<_> = start(
+                    Arc::clone(&runtime),
+                    healthy,
+                    Box::new(std::iter::once(Value::test_string("healthy"))),
+                    Box::new(build),
+                    None,
+                    CancelHandle::new(),
+                )
+                .unwrap()
+                .collect();
+                assert!(rows[0].result.is_ok());
+                gate.release();
+                assert!(reads.load(Ordering::SeqCst) <= 2 * n);
+                assert_eq!(
+                    server.join().unwrap().len(),
+                    if capacity == 2 { 2 } else { n }
+                );
+                healthy_server.join().unwrap();
+            }
+        }
+    }
+
+    /// A completed-cache hit stays available while a different invocation owns the only slot.
+    #[test]
+    fn cached_rows_bypass_a_full_process_budget() {
+        /// Releases the dedicated producer even if a cache assertion fails.
+        struct InputRelease(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for InputRelease {
+            /// Makes an intentionally stalled upstream iterator return during test cleanup.
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let gate = h2_fixture::ResponseGate::default();
+        let held = gate.clone();
+        let (base_url, server) = h2_fixture::serve(2, move |_, request| {
+            let mut response = h2_fixture::Response::json(200, answer(1));
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body["state"] == "busy" {
+                response.body_gate = Some(held.clone());
+            }
+            response
+        });
+        let pool = JevClientPool::new(HttpAttemptLimit::new(1).unwrap()).unwrap();
+        let client = pool
+            .for_policy(&crate::config::ProxyPolicy::Direct)
+            .unwrap();
+        let runtime = runtime();
+        let input_release = InputRelease(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let mut settings = setup(&base_url, 1);
+        settings.client = client.clone();
+        let mut output = start(
+            Arc::clone(&runtime),
+            settings,
+            gated_input(vec!["same", "same"], Arc::clone(&input_release.0)),
+            Box::new(build),
+            None,
+            CancelHandle::new(),
+        )
+        .unwrap();
+        let first = output.next().unwrap().result.unwrap();
+        let mut settings = setup(&base_url, 1);
+        settings.client = client;
+        let busy = start(
+            Arc::clone(&runtime),
+            settings,
+            Box::new(std::iter::once(Value::test_string("busy"))),
+            Box::new(build),
+            None,
+            CancelHandle::new(),
+        )
+        .unwrap();
+        runtime.block_on(gate.wait_for_arrivals(1));
+        input_release.0.store(true, Ordering::SeqCst);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while output.receiver.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cache hit waited for a network slot");
+        });
+        let second = output.next().unwrap().result.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(output.next().is_none());
+        assert_eq!(server.request_count(), 2);
+        drop(busy);
+        gate.release();
+        server.join().unwrap();
+    }
+
+    /// Dropping an admitted stream releases only its slot and leaves a held neighbor active.
+    #[test]
+    fn output_drop_preserves_another_active_http_attempt() {
+        let gate = h2_fixture::ResponseGate::default();
+        let held = gate.clone();
+        let (base_url, server) = h2_fixture::serve(2, move |_, _| {
+            let mut response = h2_fixture::Response::json(200, answer(1));
+            response.body_gate = Some(held.clone());
+            response
+        });
+        let pool = JevClientPool::new(HttpAttemptLimit::new(2).unwrap()).unwrap();
+        let client = pool
+            .for_policy(&crate::config::ProxyPolicy::Direct)
+            .unwrap();
+        let runtime = runtime();
+        let mut first = setup(&base_url, 1);
+        first.client = client.clone();
+        let mut second = setup(&base_url, 1);
+        second.client = client.clone();
+        let cancelled = start(
+            Arc::clone(&runtime),
+            first,
+            Box::new((0..100).map(|index| Value::test_string(format!("cancel-{index}")))),
+            Box::new(build),
+            None,
+            CancelHandle::new(),
+        )
+        .unwrap();
+        let healthy = start(
+            Arc::clone(&runtime),
+            second,
+            Box::new(std::iter::once(Value::test_string("healthy"))),
+            Box::new(build),
+            None,
+            CancelHandle::new(),
+        )
+        .unwrap();
+        runtime.block_on(gate.wait_for_arrivals(2));
+        drop(cancelled);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while client.free_attempt_slots() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("active cancellation lost or retained a neighbor's permit");
+        });
+        assert!(!healthy.receiver.is_closed());
+        assert!(healthy.receiver.is_empty());
+        gate.release();
+        let rows: Vec<_> = healthy.collect();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].result.is_ok());
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     /// Shares one logical evaluation and provenance across equal admitted rows.
@@ -1191,7 +1645,7 @@ mod tests {
                     Err(crate::error::JevError::Response("test failure"))
                 };
                 let (_cancel, mut signal) = CancelHandle::new();
-                assert!(
+                assert!(matches!(
                     finish_request(
                         (key, "jev-shared".into(), result),
                         &mut input,
@@ -1201,8 +1655,9 @@ mod tests {
                         false,
                         false,
                     )
-                    .await
-                );
+                    .await,
+                    Routing::Continue
+                ));
                 assert!(input.is_empty());
                 assert!(state.pending_groups.is_empty());
                 assert!(state.in_flight.is_empty());
@@ -1251,6 +1706,7 @@ mod tests {
                     output_sender,
                     signal,
                     cancel,
+                    Arc::clone(&admission),
                 ));
                 input_sender
                     .send(prepared_input_row(0, Arc::clone(&root), Arc::clone(&admission)).await)
@@ -1565,7 +2021,10 @@ mod tests {
             let (stalled_url, stalled_calls, stalled_server) = serve_long_retry();
             let (healthy_url, healthy_server) = serve(vec![answer(1)]);
             let runtime = runtime();
-            let mut client = JevClient::new().unwrap();
+            let pool = JevClientPool::new(HttpAttemptLimit::new(1).unwrap()).unwrap();
+            let mut client = pool
+                .for_policy(&crate::config::ProxyPolicy::Direct)
+                .unwrap();
             let (retry_started, mut retry_waits) = tokio::sync::mpsc::channel(1);
             client.observe_retry_waits(retry_started);
             let mut stalled_setup = setup(&stalled_url, 1);

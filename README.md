@@ -102,6 +102,14 @@ Duplicate keys in the outbound state or context are rejected.
 Add separate context with `--context <value>`. The outgoing state becomes
 `{input: <pipeline value>, context: <value>}`; fields are not merged.
 
+For independent single-state calls, Nu provides command parallelism:
+
+```nu
+$states | par-each --threads 4 { |state| $state | jev ask $questions }
+```
+
+For table rows, prefer one `jev annotate` call with `--jobs` instead.
+
 Inspect the exact request body and its compact UTF-8 JSON size before sending data:
 
 ```nu
@@ -153,7 +161,8 @@ Useful options:
 State-error paths in `jev_error` are escaped and limited in length. Nested
 upstream Nu error text is not copied into a row diagnostic.
 
-The default error mode is `fail`. Successful duplicates can share an
+The default error mode is `fail`: an observed terminal failure stops remaining
+local work before waiting to deliver its error. Successful duplicates can share an
 in-progress request or a bounded, per-invocation cache. Eviction permits a
 later request for the same state. Output and input are bounded, and stopping
 downstream consumption cancels outstanding local work. If a third-party input
@@ -169,7 +178,7 @@ shared state.
 
 ## Configuration
 
-Each setting is resolved independently, from highest to lowest priority:
+Invocation settings resolve independently, from highest to lowest priority:
 
 1. Command flag, where available.
 2. `$env.config.plugins.jev`.
@@ -191,6 +200,17 @@ files even when the plugin process persists.
 | Additional retries | `NU_PLUGIN_JEV_RETRIES` | `retries` | 3 |
 | Proxy policy | `NU_PLUGIN_JEV_PROXY` | `proxy` | `auto` |
 
+All live commands in one plugin process share an HTTP attempt limit of **128**.
+It resolves once at plugin startup: `NU_PLUGIN_JEV_MAX_IN_FLIGHT` → local NUON
+`max_in_flight` → user NUON `max_in_flight` → 128. Use a positive integer and
+restart with `plugin stop jev` after changing it. Startup selects the local file
+from `NU_PLUGIN_JEV_CONFIG` or `.nu_plugin_jev.nuon` in startup Nu `PWD`.
+Later file edits, caller directories, `--config`, and Nu plugin
+config cannot change this limit. It does not change the invocation-local
+`--jobs` default of **16** or limit requests per second.
+An invalid selected startup value prevents the plugin from starting, including
+for offline commands.
+
 `jev models` reads only the transport, retry, proxy, and credential settings;
 invalid evaluation-only model, jobs, or cache values do not block a listing.
 
@@ -205,6 +225,7 @@ Select another local file with `--config <path>` or
     model: "jev-latest"
     timeout_ms: 30000
     jobs: 16
+    max_in_flight: 128
     cache: {max_entries: 1024, max_approx_bytes: 16777216}
 }
 ```
@@ -246,7 +267,8 @@ with `timestamp`, `level`, `target`, `message`, typed `fields`, and root-to-leaf
 `spans`. Successful completion events include the selected `base_url`, body
 byte counts, attempt count, HTTP version, both durations in nanoseconds, and
 evaluation input/output tokens. They occur once per HTTP operation, not per
-cached row. `elapsed` includes retries and waits; `attempt_elapsed` covers
+cached row. HTTP durations start at sending, after initial capacity waiting.
+`elapsed` includes retries and later slot waits; `attempt_elapsed` covers
 only the final successful attempt through response validation. Byte counts
 exclude headers and earlier retry responses.
 Parse captured diagnostic-only output in Nu with `use std/formats *` and
@@ -263,10 +285,11 @@ library does not emit.
 Use the always-present `meta` or `jev_meta` for model and usage data. Add
 `--metrics` for HTTP measurements and annotation request identity.
 
-One logical evaluation has a total timeout covering retry waits, response
-decoding, and answer validation. HTTP `429`, `502`, `503`, `504`, and `529` may
-be retried; valid `Retry-After` guidance is honored. Other client errors and
-invalid responses are not retried. Retries can repeat remote work, so
+One logical evaluation has a total timeout covering capacity waits, retry
+waits, response decoding, and answer validation. HTTP `429`, `502`, `503`,
+`504`, and `529` may be retried; valid `Retry-After` guidance is honored.
+Other client errors and invalid responses are not retried.
+Retries can repeat remote work, so
 `request_id` guarantees neither idempotency nor billing.
 
 Successful API response bodies are limited to 16 MiB per request. Larger bodies

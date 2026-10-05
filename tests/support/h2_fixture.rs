@@ -22,6 +22,71 @@ use axum::{
 };
 use bytes::Bytes;
 
+/// Controls fixture progress with non-blocking async waits and bounded test rendezvous.
+#[derive(Clone)]
+pub(crate) struct ResponseGate {
+    arrivals: tokio::sync::watch::Sender<usize>,
+    released: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for ResponseGate {
+    /// Creates a closed gate with no announced arrivals.
+    fn default() -> Self {
+        Self {
+            arrivals: tokio::sync::watch::channel(0).0,
+            released: tokio::sync::watch::channel(false).0,
+        }
+    }
+}
+
+impl ResponseGate {
+    /// Announces a reached header/body boundary and waits asynchronously for test release.
+    async fn wait(&self) {
+        // watch remembers release even when it precedes subscription, so gates cannot
+        // lose a wakeup when the test and HTTP handler reach this boundary concurrently.
+        let mut released = self.released.subscribe();
+        self.arrivals.send_modify(|arrivals| *arrivals += 1);
+        while !*released.borrow_and_update() {
+            released.changed().await.expect("fixture gate retained");
+        }
+    }
+
+    /// Waits for body gates without blocking the runtime that drives client requests.
+    pub(crate) async fn wait_for_arrivals(&self, count: usize) {
+        let mut arrivals = self.arrivals.subscribe();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while *arrivals.borrow_and_update() < count {
+                arrivals.changed().await.expect("fixture gate retained");
+            }
+        })
+        .await
+        .expect("missing fixture gate arrival");
+    }
+
+    /// Reports how many response bodies or handlers have reached this gate.
+    pub(crate) fn arrivals(&self) -> usize {
+        *self.arrivals.borrow()
+    }
+
+    /// Opens the gate for existing and future waiters.
+    pub(crate) fn release(&self) {
+        self.released.send_replace(true);
+    }
+
+    /// Gates blocking fixture callbacks until all peers arrive, with a protective deadline.
+    pub(crate) fn rendezvous(&self, peers: usize) {
+        self.arrivals.send_modify(|arrivals| *arrivals += 1);
+        if self.arrivals() >= peers {
+            self.release();
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !*self.released.borrow() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(*self.released.borrow(), "HTTP attempts did not overlap");
+    }
+}
+
 /// Captures fields needed to assert the wire behavior of a local request.
 #[derive(Clone)]
 pub(crate) struct CapturedRequest {
@@ -54,6 +119,10 @@ pub(crate) struct Response {
     pub(crate) delay: Duration,
     /// Maximum size of one response body chunk.
     pub(crate) chunk_size: usize,
+    /// Optional asynchronous gate before the response headers are sent.
+    pub(crate) header_gate: Option<ResponseGate>,
+    /// Optional asynchronous gate after headers and before the first body chunk.
+    pub(crate) body_gate: Option<ResponseGate>,
 }
 
 impl Response {
@@ -65,6 +134,8 @@ impl Response {
             body: value.to_string().into_bytes(),
             delay: Duration::ZERO,
             chunk_size: 16_384,
+            header_gate: None,
+            body_gate: None,
         }
     }
 }
@@ -79,6 +150,11 @@ pub(crate) struct TestServer {
 }
 
 impl TestServer {
+    /// Reads the accepted request count without waiting or stopping the fixture.
+    pub(crate) fn request_count(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+
     /// Stops the server and returns all captured requests in arrival order.
     pub(crate) fn join(self) -> thread::Result<Vec<CapturedRequest>> {
         self.join_with_connections().map(|(requests, _)| requests)
@@ -177,11 +253,16 @@ where
                             .expect("capture lock")
                             .push((index, captured.clone()));
                         requests.fetch_add(1, Ordering::SeqCst);
+                        // A synchronous rendezvous may wait for another request. Offload
+                        // it so this current-thread server can still receive that peer.
                         let response =
                             tokio::task::spawn_blocking(move || handler(index, &captured))
                                 .await
                                 .expect("response handler");
                         tokio::time::sleep(response.delay).await;
+                        if let Some(gate) = &response.header_gate {
+                            gate.wait().await;
+                        }
                         make_response(response)
                     }
                 }
@@ -249,13 +330,16 @@ fn make_response(response: Response) -> HttpResponse<Body> {
     }
     let chunk_size = response.chunk_size.max(1);
     let chunks = futures::stream::unfold(
-        Bytes::from(response.body),
-        move |mut remaining| async move {
+        (Bytes::from(response.body), response.body_gate),
+        move |(mut remaining, gate)| async move {
+            if let Some(gate) = gate {
+                gate.wait().await;
+            }
             if remaining.is_empty() {
                 None
             } else {
                 let chunk = remaining.split_to(remaining.len().min(chunk_size));
-                Some((Ok::<Bytes, Infallible>(chunk), remaining))
+                Some((Ok::<Bytes, Infallible>(chunk), (remaining, None)))
             }
         },
     );

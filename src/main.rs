@@ -10,7 +10,7 @@ mod api;
 mod app;
 /// Groups the commands exposed to Nushell.
 mod commands;
-/// Resolves per-invocation settings from flags, plugin config, and caller environment.
+/// Resolves invocation settings and immutable startup resource policy.
 #[allow(
     dead_code,
     reason = "configuration is consumed by later command stages"
@@ -43,11 +43,17 @@ mod tracing;
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Initializes diagnostics before starting the async runtime and plugin.
-fn main() {
+fn main() -> std::process::ExitCode {
     let _tracing_guard = tracing::init().expect("initialize tracing");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("build Tokio runtime");
-    app::serve(runtime);
+    match app::serve(runtime) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }

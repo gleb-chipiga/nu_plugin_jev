@@ -7,16 +7,17 @@ use std::{
 
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{
-    Example, LabeledError, ListStream, PipelineData, Record, ShellError, SignalAction, Signature,
-    Span, SyntaxShape, Type, Value,
+    Example, LabeledError, ListStream, PipelineData, Record, ShellError, Signature, Span,
+    SyntaxShape, Type, Value,
     ast::{CellPath, PathMember},
 };
 
 use crate::{
-    api::{cancel::CancelHandle, types::Question},
+    api::types::Question,
     config::{ConfigScope, capture_sources, require_api_key, resolve},
     error::JevError,
     nu::{
+        signals::{InterruptRegistration, register_interrupt},
         state::{build_request, build_shared_request},
         stream::{RowBuilder, RowOutcome, StreamSetup, start},
         typed::answers_to_nu,
@@ -107,7 +108,7 @@ impl PluginCommand for JevAnnotate {
             .named(
                 "jobs",
                 SyntaxShape::Int,
-                "Maximum concurrent unique evaluations",
+                "Maximum concurrent unique evaluations in this invocation",
                 Some('j'),
             )
             .named(
@@ -156,7 +157,7 @@ impl PluginCommand for JevAnnotate {
             "answer path. Successful rows always add jev_meta with base_url, model, and usage; ",
             "--metrics adds jev_metrics with one shared request_id and HTTP measurements. ",
             "--fields selects literal top-level names, while --state follows a Nu cell path. ",
-            "Use native where and sort-by on answers. Settings are snapshotted per call from ",
+            "Use native where and sort-by on answers. Invocation settings resolve per call from ",
             "flags, Nu config, caller environment, local NUON (--config or ",
             "NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.nuon), user NUON, then defaults."
         )
@@ -219,30 +220,29 @@ impl PluginCommand for JevAnnotate {
             .client
             .for_policy(&config.proxy)
             .map_err(JevError::into_labeled)?;
-        signals.check(&span).map_err(LabeledError::from)?;
-        let cancellation = CancelHandle::new();
-        let handler_cancel = cancellation.0.clone();
-        let handler = engine
-            .register_signal_handler(Box::new(move |action| {
-                if action == SignalAction::Interrupt {
-                    handler_cancel.cancel();
-                }
-            }))
-            .map_err(LabeledError::from)?;
+        let InterruptRegistration {
+            guard,
+            cancel,
+            signal,
+        } = register_interrupt(engine, span)?;
         let setup = StreamSetup {
             client,
             config,
             key: key.expect("live command has a caller key"),
             unordered: options.unordered,
             fail_fast: options.on_error == ErrorPolicy::Fail,
+            #[cfg(test)]
+            observer: None,
         };
+        // Transfer interrupt protection into the returned stream: run returns before
+        // its lazy HTTP work ends, so a guard kept only on this stack would expire too soon.
         let output = start(
             Arc::clone(&plugin.runtime),
             setup,
             rows,
             build,
-            Some(handler),
-            cancellation,
+            Some(guard),
+            (cancel, signal),
         )
         .map_err(JevError::into_labeled)?;
         let iterator = output.map(move |outcome| annotate_outcome(outcome, &options, span));
@@ -556,7 +556,16 @@ mod tests {
             .enable_all()
             .build()
             .expect("build test runtime");
-        PluginTest::new("jev", JevPlugin::new(runtime).into()).map_err(Box::new)
+        let plugin = JevPlugin::new(runtime, Default::default()).unwrap();
+        let mut test = PluginTest::new("jev", plugin.into()).map_err(Box::new)?;
+        test.engine_state_mut().add_env_var(
+            "XDG_CONFIG_HOME".into(),
+            Value::test_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/target/isolated-nu-test-config"
+            )),
+        );
+        Ok(test)
     }
 
     /// Builds a stable Noul answer for annotation tests.

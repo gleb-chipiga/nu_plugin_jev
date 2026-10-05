@@ -6,6 +6,10 @@ Notable changes to `nu_plugin_jev` are documented here.
 
 ### Added
 
+- Share a startup-configured HTTP attempt budget across concurrent Nu commands
+  and retries; startup `NU_PLUGIN_JEV_MAX_IN_FLIGHT` overrides local/user NUON
+  `max_in_flight`, then defaults to 128 independently of annotation's unchanged
+  `--jobs 16` default. Changes require a plugin restart.
 - Add `jev models` for uncached, authenticated model discovery with ordinary
   model records and shared transport settings.
 - Report exact compact JSON body bytes in offline `jev ask --dry-run` and
@@ -29,6 +33,15 @@ Notable changes to `nu_plugin_jev` are documented here.
 - Return always-present `meta` on live `jev ask` and `jev models`, and
   `jev_meta` on successful annotation rows. Use `get models` for model-table
   pipelines; annotation's former `--meta` flag is removed.
+
+### Fixed
+
+- Stop remaining annotation work before waiting to deliver an observed terminal
+  error to a slow consumer, preserving the original failure.
+- Keep dispatched annotation requests and deadlines progressing with full
+  output so slow consumers cannot retain shared HTTP slots indefinitely.
+- Prevent interrupts from being missed between signal checking and handler
+  registration in live commands.
 
 ## [0.1.1]
 

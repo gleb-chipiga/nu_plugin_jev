@@ -3,11 +3,10 @@
 use std::collections::BTreeMap;
 
 use nu_plugin::{EngineInterface, EvaluatedCall};
-use nu_protocol::{LabeledError, Record, SignalAction, Span, Value};
+use nu_protocol::{LabeledError, Record, Span, Value};
 
 use crate::{
     api::{
-        cancel::CancelHandle,
         client::{HttpMeasurement, MeasuredSuccess, PreparedRequest, request_body_bytes},
         types::{Question, SystemOneRequest, SystemOneResponse},
     },
@@ -15,6 +14,7 @@ use crate::{
     error::JevError,
     nu::{
         cache::next_request_id,
+        signals::{InterruptRegistration, register_interrupt},
         state::{StateBuildError, build_request},
         typed::{request_to_nu, usage_to_nu},
     },
@@ -52,20 +52,15 @@ pub(crate) fn evaluate(
         .client
         .for_policy(&config.proxy)
         .map_err(|error| error.into_labeled())?;
-    engine
-        .signals()
-        .check(&call.head)
-        .map_err(LabeledError::from)?;
-    let (cancel, signal) = CancelHandle::new();
-    let handler = cancel.clone();
-    let _guard = engine
-        .register_signal_handler(Box::new(move |action| {
-            if action == SignalAction::Interrupt {
-                handler.cancel();
-            }
-        }))
-        .map_err(LabeledError::from)?;
+    // Retain both owners through block_on: the guard handles interrupts, and dropping
+    // every cancellation sender would itself end the async signal's wait as cancelled.
+    let InterruptRegistration {
+        guard: _guard,
+        cancel: _cancel,
+        signal,
+    } = register_interrupt(engine, call.head)?;
     let request_id = next_request_id();
+    // This blocks Nu's synchronous handler, not a Tokio worker or another command handler.
     let response = plugin
         .runtime
         .block_on(trace_evaluation(
