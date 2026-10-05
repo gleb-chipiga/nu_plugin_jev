@@ -1,4 +1,5 @@
-//! Evaluates one finite Nushell state against multiple named questions.
+//! Evaluates one finite Nu state using an explicit `PipelineData` adapter.
+//! Collection is intentional for array states; bytes and absent input are never coerced.
 
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{
@@ -10,6 +11,7 @@ use crate::{api::validate::parse_questions, nu::typed::answers_to_nu, plugin::Je
 use super::evaluate::{Evaluation, evaluate, evaluation_meta, measurement_value, preview_value};
 
 /// Sends one structured state and a nonempty question record to System One.
+/// Uses `PluginCommand` to reject unsupported pipeline kinds before SDK materialization.
 pub(crate) struct JevAsk;
 
 impl PluginCommand for JevAsk {
@@ -22,6 +24,8 @@ impl PluginCommand for JevAsk {
 
     /// Accepts a question record and shared evaluation settings.
     fn signature(&self) -> Signature {
+        // Any also admits scalar input that becomes legal inside an explicit context wrapper.
+        // A syntax-level record shape cannot validate question variants or nested criteria.
         Signature::build(self.name())
             .input_output_type(Type::Any, Type::record())
             .required(
@@ -97,7 +101,8 @@ impl PluginCommand for JevAsk {
         }]
     }
 
-    /// Validates a finite state and returns either the preview or full API envelope.
+    /// Validates question data, collects one finite state, and returns native result records.
+    /// Setup failures use `Err`; nested input errors keep their original Nu diagnostic.
     fn run(
         &self,
         plugin: &JevPlugin,
@@ -105,6 +110,8 @@ impl PluginCommand for JevAsk {
         call: &EvaluatedCall,
         input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
+        // EvaluatedCall already contains Nu Values, not unevaluated expressions or source text.
+        // Keep that structure and its spans until contract validation instead of parsing a DSL.
         let questions: Value = call.req(0).map_err(LabeledError::from)?;
         let questions = parse_questions(&questions)?;
         let metrics = call.has_flag("metrics").map_err(LabeledError::from)?;
@@ -114,11 +121,16 @@ impl PluginCommand for JevAsk {
         }
         let state = match input {
             PipelineData::Empty => {
+                // Empty means no pipeline at all; explicit Nothing is a supplied scalar and
+                // still reaches context composition before the top-level state check.
                 return Err(LabeledError::new("jev ask requires an input state")
                     .with_label("missing pipeline input", call.head));
             }
             PipelineData::Value(value, _) => value,
             PipelineData::ListStream(stream, _) => {
+                // One stream is one array state, not a batch of independent HTTP requests.
+                // This requires finite input; annotate is the bounded row-wise alternative.
+                // Retain Error items for the converter to propagate with their original spans.
                 Value::list(stream.into_iter().collect(), call.head)
             }
             PipelineData::ByteStream(_, _) => {
@@ -147,6 +159,8 @@ impl PluginCommand for JevAsk {
                 Value::record(result, call.head)
             }
         };
+        // This is a newly constructed decision envelope, not the upstream document's content.
+        // Do not inherit source/content-type pipeline metadata; generated values use call.head.
         Ok(PipelineData::value(result, None))
     }
 }

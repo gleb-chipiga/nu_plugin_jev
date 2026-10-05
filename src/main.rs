@@ -44,6 +44,8 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Initializes diagnostics before starting the async runtime and plugin.
 fn main() -> std::process::ExitCode {
+    // Keep the non-blocking writer guard through protocol serving so shutdown can flush logs.
+    // Diagnostics belong on stderr; stdout may carry the SDK's binary plugin protocol.
     let _tracing_guard = tracing::init().expect("initialize tracing");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

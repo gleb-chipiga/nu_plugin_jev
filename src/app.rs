@@ -1,4 +1,5 @@
-//! Initializes process-wide resources and serves the Nushell plugin protocol.
+//! Initializes shared resources before handing command dispatch and wire I/O to `nu-plugin`.
+//! The Nu connection transports native values with MsgPack; REST JSON is a separate boundary.
 
 use nu_plugin::{MsgPackSerializer, serve_plugin};
 use nu_protocol::LabeledError;
@@ -13,6 +14,9 @@ pub(crate) fn serve(runtime: tokio::runtime::Runtime) -> Result<(), LabeledError
     let limit = HttpAttemptLimit::from_startup()?;
     let plugin = JevPlugin::new(runtime, limit).map_err(JevError::into_labeled)?;
     ::tracing::info!("plugin started");
+    // The SDK owns transport negotiation, concurrent handlers, and stream acknowledgements.
+    // Return Values/PipelineData from commands; writing ordinary output here would corrupt
+    // the protocol when the SDK uses its stdio fallback instead of a local socket.
     serve_plugin(&plugin, MsgPackSerializer);
     Ok(())
 }

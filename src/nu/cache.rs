@@ -21,6 +21,7 @@ use crate::{
 };
 
 /// Includes the service root and a canonical complete request body, never credentials.
+/// Safe only within one invocation, where credential, proxy policy, and caller settings are fixed.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RequestKey {
     root: Arc<str>,
@@ -92,6 +93,8 @@ impl SharedResponse {
 /// Allocates distinct identities without retaining request bodies or credentials.
 pub(crate) fn next_request_id() -> String {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    // Uniqueness needs an atomic increment, not a happens-before relation between commands.
+    // The identifier groups shared outcomes; it does not encode completion order or HTTP attempts.
     format!("jev-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
 }
 

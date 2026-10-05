@@ -2,7 +2,8 @@
 
 use tokio::sync::watch;
 
-/// Cancels one invocation and every clone of its signal.
+/// Cancels one invocation and every clone of its signal through a remembered watch value.
+/// Sender ownership is also a liveness guard: dropping all senders ends asynchronous waits.
 #[derive(Clone)]
 pub(crate) struct CancelHandle(watch::Sender<bool>);
 
@@ -19,6 +20,8 @@ impl CancelHandle {
 
     /// Notifies all subscribed requests and retry waits to stop.
     pub(crate) fn cancel(&self) {
+        // A stored flag lets late subscribers observe cancellation without relying on one wakeup.
+        // send_replace is synchronous, so the SDK signal handler need not enter an async runtime.
         self.0.send_replace(true);
     }
 }

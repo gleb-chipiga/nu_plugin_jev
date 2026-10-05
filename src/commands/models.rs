@@ -18,6 +18,7 @@ use crate::{
 use super::evaluate::measurement_value;
 
 /// Fetches the current catalog without accepting pipeline state or questions.
+/// Uses `PluginCommand` to reject input without first collecting a possibly unbounded stream.
 pub(crate) struct JevModels;
 
 impl PluginCommand for JevModels {
@@ -87,6 +88,8 @@ impl PluginCommand for JevModels {
         call: &EvaluatedCall,
         input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
+        // Type::Nothing guides Nu, but direct SDK calls can still supply other pipeline kinds.
+        // Checking the enum here also distinguishes absent input from an explicit null value.
         if !matches!(input, PipelineData::Empty) {
             return Err(
                 LabeledError::new("jev models does not accept pipeline input")
@@ -109,6 +112,7 @@ impl PluginCommand for JevModels {
             signal,
         } = register_interrupt(engine, call.head)?;
         let request_id = next_request_id();
+        // Engine callbacks are complete before block_on; only this Nu handler waits for HTTP.
         let list = plugin
             .runtime
             .block_on(trace_models(
@@ -121,6 +125,8 @@ impl PluginCommand for JevModels {
             .models
             .into_iter()
             .map(|model| {
+                // release_date is service text, not necessarily a parseable Nu Date.
+                // Preserve it as a string rather than introducing a heuristic type conversion.
                 let mut record = Record::with_capacity(3);
                 record.push("name", Value::string(model.name, call.head));
                 record.push("description", Value::string(model.description, call.head));

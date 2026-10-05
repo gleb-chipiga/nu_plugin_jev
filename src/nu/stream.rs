@@ -29,6 +29,7 @@ use crate::{
 use super::cache::{CompletedCache, RequestKey, SharedResponse, next_request_id};
 
 /// Builds one outbound request from a source row on the dedicated input thread.
+/// Owns captured Nu data; Send moves the builder across threads without engine callbacks.
 pub(crate) type RowBuilder = Box<dyn Fn(&Value) -> Result<SystemOneRequest, JevError> + Send>;
 
 /// Captures all immutable evaluation settings before table input is consumed.
@@ -71,10 +72,12 @@ pub(crate) struct RowOutcome {
     /// Shared successful result or classified row failure.
     pub(crate) result: Result<Arc<SharedResponse>, Arc<JevError>>,
     /// Local row credit, not HTTP capacity; retained through reordering and output buffering.
+    /// Released when the synchronous mapper consumes this outcome, before SDK wire buffering.
     _permit: OwnedSemaphorePermit,
 }
 
-/// Receives bounded outcomes and cancels the invocation when dropped early.
+/// Bridges async outcomes to the SDK's synchronous iterator without borrowing a command call.
+/// Keeps runtime and interrupt registration alive; Drop initiates invocation-local cleanup.
 pub(crate) struct ScheduledOutput {
     receiver: mpsc::Receiver<RowOutcome>,
     cancel: CancelHandle,
@@ -87,8 +90,11 @@ pub(crate) struct ScheduledOutput {
 impl Iterator for ScheduledOutput {
     type Item = RowOutcome;
 
-    /// Waits on the plugin protocol thread, never on a Tokio runtime worker.
+    /// Waits on Nu's synchronous command/output runner, never on a Tokio worker.
     fn next(&mut self) -> Option<Self::Item> {
+        // The SDK writes a returned ListStream on its command runner, separately from its
+        // protocol reader. Blocking here leaves that reader and Tokio's HTTP tasks available.
+        // Tokio rejects blocking_recv in an async task; keep this iterator at the Nu boundary.
         self.receiver.blocking_recv()
     }
 }
@@ -96,6 +102,8 @@ impl Iterator for ScheduledOutput {
 impl Drop for ScheduledOutput {
     /// Wakes the supervisor to cancel local work without interrupting neighboring invocations.
     fn drop(&mut self) {
+        // Do not synchronously join here: stream Drop must not depend on an external input
+        // iterator returning. The supervisor observes cancellation and joins its own HTTP tasks.
         self.cancel.cancel();
         self.receiver.close();
     }
@@ -154,6 +162,7 @@ type TaskOutcome = Result<(Id, EvaluationResult), JoinError>;
 
 /// Starts a bounded row stream without reading its first input value on the caller thread.
 /// The output owns interrupt protection; a blocked external source may outlive its drop.
+/// A Send + 'static input can move to its producer after Nu's call stack has gone away.
 pub(crate) fn start(
     runtime: Arc<tokio::runtime::Runtime>,
     setup: StreamSetup,
@@ -588,6 +597,8 @@ async fn route_row(
     unordered: bool,
     fail_fast: bool,
 ) -> Routing {
+    // One supervisor owns these maps, so lookup plus registration needs no shared mutex.
+    // HTTP tasks return results only; they never mutate routing or the invocation-local LRU.
     let (request, request_key) = match row.request.take().expect("producer prepares every row") {
         Ok(request) => request,
         Err(error) => {

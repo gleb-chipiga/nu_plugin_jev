@@ -30,7 +30,8 @@ pub(crate) enum Evaluation {
     Response(MeasuredSuccess<SystemOneResponse>),
 }
 
-/// Builds one body and either previews it or sends it with caller-scoped settings.
+/// Builds one body and runs async HTTP from Nu's synchronous handler with caller-owned settings.
+/// Engine callbacks and file reads finish before entering Tokio; previews skip live key checks.
 pub(crate) fn evaluate(
     plugin: &JevPlugin,
     engine: &EngineInterface,
@@ -38,11 +39,14 @@ pub(crate) fn evaluate(
     state: &Value,
     questions: BTreeMap<String, Question>,
 ) -> Result<Evaluation, LabeledError> {
+    // EngineInterface getters synchronously wait for Nu replies. Capture them here rather
+    // than retaining engine/call references inside HTTP tasks or blocking Tokio workers.
     let sources = capture_sources(engine, call, ConfigScope::Single)?;
     let config = resolve(&sources, ConfigScope::Single)?;
     let context = call.get_flag_value("context");
     let request = build_request(state, context.as_ref(), config.model.clone(), questions)
         .map_err(StateBuildError::into_labeled)?;
+    // Preview and live execution use the same typed body; authentication is never body data.
     if call.has_flag("dry-run").map_err(LabeledError::from)? {
         return Ok(Evaluation::Preview(request));
     }
@@ -73,6 +77,7 @@ pub(crate) fn evaluate(
 }
 
 /// Wraps the exact outbound body with its compact UTF-8 JSON byte length.
+/// Projects its JSON meaning, not original Nu-only types such as Date or Filesize.
 pub(crate) fn preview_value(request: SystemOneRequest, span: Span) -> Result<Value, LabeledError> {
     let request_bytes = request_body_bytes(&request).map_err(JevError::into_labeled)?;
     let mut preview = Record::with_capacity(2);
@@ -94,7 +99,8 @@ pub(crate) fn evaluation_meta(
     Ok(Value::record(meta, span))
 }
 
-/// Converts one successful HTTP measurement to native Nu sizes and durations.
+/// Converts successful HTTP measurements to Nu integers and nanosecond Durations.
+/// Checks representation bounds instead of silently truncating counters or elapsed time.
 pub(crate) fn measurement_value(
     measurement: &HttpMeasurement,
     request_id: Option<&str>,
@@ -109,6 +115,8 @@ pub(crate) fn measurement_value(
             .map_err(|_| LabeledError::new("Jev measurement exceeds Nu duration range"))
     };
     let mut fields = Record::with_capacity(if request_id.is_some() { 7 } else { 6 });
+    // Row reuse needs an identity to avoid counting one HTTP result for every duplicate row.
+    // Single-state and model-list envelopes contain one result and omit this extra field.
     if let Some(request_id) = request_id {
         fields.push("request_id", Value::string(request_id, span));
     }

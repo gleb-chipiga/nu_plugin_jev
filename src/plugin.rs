@@ -1,4 +1,5 @@
-//! Owns the reusable runtime and policy-specific HTTP client pools.
+//! Shares runtime and HTTP resources across the SDK's concurrent synchronous command handlers.
+//! Commands hold caller settings locally, so reusing this plugin never selects a global caller.
 
 use std::sync::Arc;
 
@@ -44,8 +45,11 @@ impl Plugin for JevPlugin {
         env!("CARGO_PKG_VERSION").into()
     }
 
-    /// Registers the currently implemented commands.
+    /// Registers reusable command objects whose invocation state lives only in `run`.
+    /// The SDK adapts `SimplePluginCommand` constructors to this same command registry.
     fn commands(&self) -> Vec<Box<dyn PluginCommand<Plugin = Self>>> {
+        // The SDK may call the same Sync command object from several handler threads.
+        // These unit structs contain no current call, key, model, or output-stream state.
         vec![
             Box::new(Jev),
             Box::new(JevAsk),

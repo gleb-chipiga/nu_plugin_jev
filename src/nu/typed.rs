@@ -1,4 +1,5 @@
-//! Converts fixed TypeSafe API shapes directly to Nushell records.
+//! Projects fixed REST contracts directly into native Nu records with caller-supplied spans.
+//! Arbitrary state and descriptions alone use JSON conversion; fixed fields keep explicit types.
 
 use std::collections::BTreeMap;
 
@@ -11,7 +12,8 @@ use crate::api::types::{
 
 use super::value::{from_json, from_json_ref};
 
-/// Projects a typed outbound request while preserving arbitrary JSON state.
+/// Projects a request's JSON meaning for previews without exposing credentials or SDK metadata.
+/// All generated values use the command span rather than claiming original Nu-only types.
 pub(crate) fn request_to_nu(request: SystemOneRequest, span: Span) -> Result<Value, LabeledError> {
     let SystemOneRequest {
         state,
@@ -21,6 +23,7 @@ pub(crate) fn request_to_nu(request: SystemOneRequest, span: Span) -> Result<Val
     let mut record = Record::with_capacity(3);
     record.push("model", Value::string(model, span));
     let mut question_record = Record::with_capacity(questions.len());
+    // Questions may still be shared by the table builder; projection cannot take them from Arc.
     for (name, question) in questions.iter() {
         question_record.push(name.clone(), question_to_nu(question.clone(), span)?);
     }
@@ -29,7 +32,7 @@ pub(crate) fn request_to_nu(request: SystemOneRequest, span: Span) -> Result<Val
     Ok(Value::record(record, span))
 }
 
-/// Projects one typed question without serializing its fixed fields to JSON.
+/// Projects one typed question directly, preserving omitted fields separately from explicit null.
 pub(crate) fn question_to_nu(question: Question, span: Span) -> Result<Value, LabeledError> {
     let record = match question {
         Question::Noul {
@@ -42,6 +45,7 @@ pub(crate) fn question_to_nu(question: Question, span: Span) -> Result<Value, La
             if let Some(criteria) = criteria {
                 record.push("criteria", noul_criteria_to_nu(criteria, span)?);
             }
+            // None means no field; Some(JSON null) must produce an actual Nu Nothing field.
             if let Some(instructions) = instructions {
                 record.push("instructions", from_json(instructions, span)?);
             }
@@ -110,7 +114,8 @@ fn structured_map_to_nu(
     Ok(Value::record(record, span))
 }
 
-/// Projects all validated answer variants without a whole-map JSON copy.
+/// Borrows validated answers and builds Nu records without cloning the shared response tree.
+/// The HTTP client has already checked answer names, variants, and numeric domains.
 pub(crate) fn answers_to_nu(
     answers: &BTreeMap<String, Answer>,
     span: Span,
@@ -124,6 +129,8 @@ pub(crate) fn answers_to_nu(
 
 /// Projects one validated answer and preserves arbitrary Score legend values.
 fn answer_to_nu(answer: &Answer, span: Span) -> Result<Value, LabeledError> {
+    // Probabilities, confidence, and scores remain Nu Float even when numerically integral.
+    // Direct construction makes that contract independent of JSON number representation.
     let record = match answer {
         Answer::Noul { noul } => {
             let mut record = Record::with_capacity(2);
@@ -153,6 +160,8 @@ fn answer_to_nu(answer: &Answer, span: Span) -> Result<Value, LabeledError> {
             record.push("confidence", Value::float(*confidence, span));
             let mut levels = Record::with_capacity(legend.len());
             for (level, description) in legend {
+                // Levels are literal record keys ("0", "1", ...), not list positions.
+                // Descriptions retain their JSON structure, not an inferred Nu special type.
                 levels.push(level.clone(), from_json_ref(description, span)?);
             }
             record.push("legend", Value::record(levels, span));

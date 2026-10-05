@@ -11,6 +11,8 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
+    // Ordinary Option deserialization maps explicit null to None, which serialization would omit.
+    // Field-level default handles absence; a supplied value is preserved as Some instead.
     T::deserialize(deserializer).map(Some)
 }
 

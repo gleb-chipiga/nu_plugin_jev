@@ -1,4 +1,5 @@
 //! Builds schema-aligned questions as ordinary Nu records without network access.
+//! Constructors use the simple SDK adapter; the records remain data, not custom plugin values.
 
 use std::collections::BTreeMap;
 
@@ -25,7 +26,8 @@ fn description(value: &Value) -> Result<JsonValue, LabeledError> {
     to_json(value)
 }
 
-/// Rejects pipeline state that an offline question constructor would ignore.
+/// Rejects materialized pipeline data the constructor would otherwise silently ignore.
+/// The simple SDK adapter maps empty input to Nothing, indistinguishable from explicit null.
 fn reject_pipeline_input(input: &Value, span: Span) -> Result<(), LabeledError> {
     if input.is_nothing() {
         Ok(())
@@ -43,6 +45,8 @@ pub(crate) fn build_noul(
     yes: Option<&Value>,
     no: Option<&Value>,
 ) -> Result<Question, LabeledError> {
+    // Missing flags are None; a flag carrying Nu Nothing is Some(JSON null).
+    // Preserve that distinction so constructor output matches a hand-authored API record.
     let criteria = if yes.is_some() || no.is_some() {
         Some(NoulCriteria::Descriptions(NoulDescriptions {
             yes: yes.map(description).transpose()?,
@@ -94,6 +98,8 @@ pub(crate) fn build_choice(
     }
     let mut distinct = BTreeMap::new();
     for (name, description) in choices {
+        // Nu records can contain duplicate columns. Detect them before the map would collapse
+        // two definitions into one option and silently change the policy sent to the service.
         if distinct.insert(name.clone(), description).is_some() {
             return Err(
                 LabeledError::new(format!("duplicate Choice option {name:?}"))

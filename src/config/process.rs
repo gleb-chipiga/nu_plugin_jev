@@ -25,6 +25,8 @@ impl HttpAttemptLimit {
     /// Resolves startup environment and NUON layers on the synchronous startup thread.
     /// Only absence permits fallback; a selected invalid value fails before command servicing.
     pub(crate) fn from_startup() -> Result<Self, LabeledError> {
+        // No invocation EngineInterface exists before serve_plugin. Process environment is
+        // correct only for this immutable startup policy, not later caller-scoped settings.
         // Resolve the highest-priority value first, including its errors. Reading fallback
         // files eagerly would make an unrelated malformed file defeat a valid override.
         if let Some(value) = std::env::var_os(LIMIT_ENV) {

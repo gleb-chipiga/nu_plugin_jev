@@ -17,6 +17,7 @@ pub(crate) struct InterruptRegistration {
 }
 
 /// Registers first, then checks signal state so an interrupt cannot fall between those steps.
+/// Uses the SDK's shared signal state but creates a separate cancellation pair for this caller.
 pub(crate) fn register_interrupt(
     engine: &EngineInterface,
     span: Span,
@@ -36,15 +37,17 @@ pub(super) fn register_with(
 ) -> Result<InterruptRegistration, LabeledError> {
     let (cancel, signal) = CancelHandle::new();
     let handler = cancel.clone();
+    // The SDK runs handlers on its protocol reader thread. Only notify watch subscribers here;
+    // waiting for HTTP or joining tasks would stop the reader from processing further messages.
     let guard = register(Box::new(move |action| {
         // Reset clears Nu's shared signal state, but must never revive cancelled local work.
         if action == SignalAction::Interrupt {
             handler.cancel();
         }
     }))?;
-    // Already-set interrupts are caught here; later ones reach the registered handler.
-    // Checking first would leave an unchecked gap before registration. On check failure,
-    // guard drops and unregisters the handler without starting work.
+    // nu-plugin 0.116 updates Signals before invoking handlers. This post-registration check
+    // catches earlier interrupts; later ones reach the handler. Checking first leaves a gap.
+    // On check failure, guard drops and unregisters the handler without starting work.
     signals.check(&span).map_err(LabeledError::from)?;
     Ok(InterruptRegistration {
         guard,

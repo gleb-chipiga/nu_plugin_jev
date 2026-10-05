@@ -9,7 +9,8 @@ use crate::nu::value::to_json_at;
 
 use super::types::{Answer, NoulCriteria, Question, SystemOneResponse};
 
-/// Parses and validates a nonempty named Nu question record before dispatch.
+/// Parses named Nu question data into strict typed contracts before any state dispatch.
+/// Handles raw records as well as constructor output; syntax shapes alone cannot validate them.
 pub(crate) fn parse_questions(value: &Value) -> Result<BTreeMap<String, Question>, LabeledError> {
     let Value::Record { val: questions, .. } = value else {
         return Err(question_error("questions must be a record", value.span()));
@@ -29,6 +30,8 @@ pub(crate) fn parse_questions(value: &Value) -> Result<BTreeMap<String, Question
                     body.span(),
                 ));
             }
+            // Generic conversion checks nested Nu values and duplicate keys; Serde then checks
+            // the fixed tagged schema and unknown fields. Neither step replaces the other.
             let body = to_json_at(body, format!("$.{name}"))?;
             let question: Question = serde_json::from_value(body).map_err(|error| {
                 question_error(
@@ -43,6 +46,7 @@ pub(crate) fn parse_questions(value: &Value) -> Result<BTreeMap<String, Question
 }
 
 /// Checks the root shapes and cardinality defined by the raw API schema.
+/// Constructor shorthand limits are separate and do not restrict hand-authored API questions.
 pub(crate) fn validate_question(
     name: &str,
     question: &Question,

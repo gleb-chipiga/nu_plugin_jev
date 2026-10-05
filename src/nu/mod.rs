@@ -1,4 +1,5 @@
-//! Adapts Nushell values to the structured JSON expected by Jev.
+//! Adapts native Nu values, typed REST contracts, and a synchronous/async table bridge.
+//! Nu types and spans stay on the shell side; JSON represents arbitrary REST data only.
 
 /// Retains successful per-invocation evaluations under bounded LRU limits.
 pub(crate) mod cache;

@@ -1,4 +1,5 @@
-//! Adds typed Jev answers to record rows without materializing a whole table.
+//! Adapts Nu rows to a bounded async scheduler and maps its outcomes back to native values.
+//! The returned stream owns caller data and cancellation after the synchronous handler returns.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -34,20 +35,27 @@ pub(crate) struct JevAnnotate;
 /// Selects either a nested cell or literal top-level fields from each source row.
 #[derive(Clone)]
 enum StateSelector {
+    /// Sends the complete row, requiring every outbound field to support JSON conversion.
     Whole,
+    /// Uses Nu's typed path traversal, including nested records and list indices.
     Cell(CellPath),
+    /// Projects literal top-level names; dots in a name are not path separators.
     Fields(Vec<String>),
 }
 
-/// Controls how an invalid row or failed HTTP evaluation appears downstream.
+/// Controls how row preparation or HTTP evaluation failures appear downstream.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ErrorPolicy {
+    /// Stops local work on the first observed preparation or evaluation failure.
     Fail,
+    /// Returns a failed source value without annotation or new diagnostic fields.
     Keep,
+    /// Adds a redacted diagnostic to a record; nonrecord values become native stream errors.
     Record,
 }
 
-/// Captures parsed table options before the first input row is read.
+/// Owns parsed caller options used by the producer and the returned stream's mapper.
+/// No borrowed `EvaluatedCall` or `EngineInterface` can escape into either component.
 struct TableOptions {
     selector: StateSelector,
     context: Option<Value>,
@@ -68,6 +76,8 @@ impl PluginCommand for JevAnnotate {
 
     /// Defines selectors, stream controls, and answer destinations.
     fn signature(&self) -> Signature {
+        // Input may be one record, a materialized list, or a ListStream. The returned columns
+        // depend on caller rows, --into, and error policy; a fixed table schema would be false.
         Signature::build(self.name())
             .input_output_type(Type::Any, Type::list(Type::Any))
             .required(
@@ -187,7 +197,8 @@ impl PluginCommand for JevAnnotate {
         ]
     }
 
-    /// Validates options once, then returns a bounded lazy table stream.
+    /// Validates call-wide options before consumption and returns an owned lazy Nu stream.
+    /// Per-row errors become stream values because `run` can no longer return an error later.
     fn run(
         &self,
         plugin: &JevPlugin,
@@ -205,11 +216,15 @@ impl PluginCommand for JevAnnotate {
         } else {
             Some(require_api_key(&sources)?)
         };
+        // Normalize ownership without reading a ListStream. Rows are checked as their iterator
+        // advances, so failures can follow the selected policy without collecting the table.
         let rows = input_rows(input, call.head)?;
         let span = call.head;
         let signals = engine.signals();
         let build = request_builder(&options, config.model.clone(), questions);
         if options.dry_run {
+            // No scheduler, HTTP client selection, or key validation is needed for previews.
+            // ListStream supplies pull-driven iteration and checks Nu signals between rows.
             let iterator = preview_rows(rows, build, options.on_error, span);
             return Ok(PipelineData::list_stream(
                 ListStream::new(iterator, span, signals.clone()),
@@ -236,6 +251,8 @@ impl PluginCommand for JevAnnotate {
         };
         // Transfer interrupt protection into the returned stream: run returns before
         // its lazy HTTP work ends, so a guard kept only on this stack would expire too soon.
+        // start launches bounded read-ahead immediately; it never waits here for a first row
+        // or HTTP response, while the returned output remains a pull-driven Nu iterator.
         let output = start(
             Arc::clone(&plugin.runtime),
             setup,
@@ -245,7 +262,11 @@ impl PluginCommand for JevAnnotate {
             (cancel, signal),
         )
         .map_err(JevError::into_labeled)?;
+        // This map runs as Nu's SDK consumes output, not on a Tokio worker. It owns options
+        // and the ScheduledOutput whose Drop path handles early downstream termination.
         let iterator = output.map(move |outcome| annotate_outcome(outcome, &options, span));
+        // ListStream's signal check cannot wake a blocked next(). The retained handler also
+        // cancels the async supervisor, which closes the channel and wakes that synchronous wait.
         Ok(PipelineData::list_stream(
             ListStream::new(iterator, span, signals.clone()),
             None,
@@ -260,6 +281,8 @@ fn preview_rows(
     on_error: ErrorPolicy,
     span: Span,
 ) -> impl Iterator<Item = Value> {
+    // Keep the stop flag in the iterator: terminal row failures happen after run has returned,
+    // so they yield one Error value and then end rather than returning Err from the command.
     let mut stopped = false;
     std::iter::from_fn(move || {
         if stopped {
@@ -365,7 +388,8 @@ fn parse_fields(value: &Value) -> Result<Vec<String>, LabeledError> {
     Ok(fields)
 }
 
-/// Turns a record, list, or list stream into independently processed rows.
+/// Transfers input ownership into a Send iterator without collecting a ListStream.
+/// Flattens only the outer materialized list; row-shape checks remain with the row builder.
 fn input_rows(
     input: PipelineData,
     span: Span,
@@ -390,6 +414,8 @@ fn request_builder(
 ) -> RowBuilder {
     let selector = options.selector.clone();
     let context = options.context.clone();
+    // Reuse valid context conversion, but do not hoist its failure to a command-wide error.
+    // Row validation must precede context errors and respect keep/record, even for previews.
     let prepared_context = context.as_ref().map(to_json).transpose().ok();
     let questions = Arc::new(questions);
     let into = options.into.clone();
@@ -402,6 +428,8 @@ fn request_builder(
         let Value::Record { val, .. } = source else {
             return Err(JevError::State("jev annotate requires record rows"));
         };
+        // A collision is not repairable by keep/record: passing the row would retain an
+        // ambiguous destination. Check every reserved name before state selection or HTTP.
         if val.contains(&into)
             || val.contains("jev_meta")
             || (metrics && val.contains("jev_metrics"))
@@ -411,6 +439,8 @@ fn request_builder(
                 "Jev destination field already exists",
             ));
         }
+        // Selection controls disclosure, not the output row. Unsupported Nu-only values in
+        // unselected fields are preserved and never examined by outbound JSON conversion.
         let selected = match &selector {
             StateSelector::Whole => source.clone(),
             StateSelector::Cell(path) => source
@@ -420,6 +450,7 @@ fn request_builder(
             StateSelector::Fields(names) => {
                 let mut projected = Record::with_capacity(names.len());
                 for name in names {
+                    // Record::get treats names literally; follow_cell_path is reserved for --state.
                     let value = val.get(name).ok_or_else(|| JevError::missing_field(name))?;
                     projected.push(name.clone(), value.clone());
                 }
@@ -446,7 +477,8 @@ fn request_builder(
     })
 }
 
-/// Appends answers, provenance, and optional measurements to a successful row.
+/// Consumes an outcome on Nu's synchronous output side, preserving source fields and row span.
+/// Generated fields use the call span; returning releases the bridge's admission credit.
 fn annotate_outcome(outcome: RowOutcome, options: &TableOptions, span: Span) -> Value {
     match outcome.result {
         Ok(shared) => {
@@ -456,6 +488,8 @@ fn annotate_outcome(outcome: RowOutcome, options: &TableOptions, span: Span) -> 
             else {
                 unreachable!("source row validated before HTTP")
             };
+            // SharedCow reclaims a unique record or copies shared storage before appending.
+            // Untouched values keep their Nu types and spans; only Jev fields are newly built.
             let mut record = val.into_owned();
             let answers = match answers_to_nu(&shared.response.answers, span) {
                 Ok(value) => value,
@@ -486,7 +520,8 @@ fn annotate_outcome(outcome: RowOutcome, options: &TableOptions, span: Span) -> 
     }
 }
 
-/// Converts one classified failure to a native pipeline error value.
+/// Wraps a redacted diagnostic in Value::Error for the already-returned Nu stream.
+/// This is a shell error, unlike --on-error record's ordinary diagnostic data.
 fn error_value(error: &JevError, span: Span) -> Value {
     Value::error(ShellError::from(error.to_labeled()), span)
 }
@@ -505,6 +540,8 @@ fn add_error(row: Value, error: &JevError, span: Span) -> Value {
             span,
         );
     }
+    // A record diagnostic is data, so later Nu commands can inspect it without an exception.
+    // Preserve the source row span; diagnostic values use the command span and safe error text.
     let mut source = val.into_owned();
     let mut details = Record::with_capacity(3);
     details.push("kind", Value::string(error.kind_name(), span));

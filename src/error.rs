@@ -125,7 +125,8 @@ impl JevError {
         }
     }
 
-    /// Converts the failure to a native Nu error with a stable code.
+    /// Projects a redacted failure to Nu's serializable diagnostic with a stable category code.
+    /// Leaves source labels to boundary code, which knows the command or input value span.
     pub(crate) fn to_labeled(&self) -> LabeledError {
         let code = match self {
             Self::Validation(_) => "jev::validation",

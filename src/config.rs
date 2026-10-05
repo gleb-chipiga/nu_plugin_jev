@@ -128,7 +128,8 @@ impl ApiKey {
     }
 }
 
-/// Captures only the flag, plugin-config, and environment values applicable to a call.
+/// Owns the caller values and file contents collected for one command invocation.
+/// Engine reads are sequential, not an atomic Nu transaction; execution uses the captured values.
 #[derive(Default)]
 pub(crate) struct ConfigSources {
     /// Evaluated command flags by their long names.
@@ -156,7 +157,8 @@ struct FileSettings {
 /// Maximum accepted size of each configuration file in bytes.
 const MAX_CONFIG_BYTES: u64 = 65_536;
 
-/// Captures configuration through the public engine interface before row consumption.
+/// Collects caller settings through synchronous engine RPCs and reads selected files once.
+/// Runs on the Nu handler before row consumption; no engine callbacks enter spawned HTTP tasks.
 pub(crate) fn capture_sources(
     engine: &EngineInterface,
     call: &EvaluatedCall,
@@ -194,6 +196,8 @@ pub(crate) fn capture_sources(
         .iter()
         .filter_map(|name| call.get_flag_value(name).map(|value| (*name, value)))
         .collect();
+    // Nu evaluates closure-valued plugin config itself. Request only this plugin's config,
+    // not the entire shell config or environment, and do not invoke per-row engine callbacks.
     let plugin = engine.get_plugin_config().map_err(LabeledError::from)?;
     let env = env_names
         .iter()
@@ -210,6 +214,8 @@ pub(crate) fn capture_sources(
     let key = engine
         .get_env_var("TYPESAFE_API_KEY")
         .map_err(LabeledError::from)?;
+    // A persistent process has startup cwd/environment, not necessarily this caller's scope.
+    // Never chdir or mutate process environment to emulate a concurrent Nu invocation.
     let caller_dir = match engine.get_current_dir() {
         Ok(dir) => PathBuf::from(dir),
         #[cfg(test)]
@@ -240,6 +246,8 @@ pub(crate) fn capture_sources(
     };
     let user_path = user_root.join("nu_plugin_jev/config.nuon");
     let same_file = same_file(&local_path, &user_path);
+    // File I/O is deliberately synchronous on this handler, not on a Tokio worker.
+    // Capture contents once per invocation so file edits cannot alter later rows in its stream.
     let user = read_nuon(&user_path, same_file && explicit, false, "user")?;
     let local = if same_file {
         None

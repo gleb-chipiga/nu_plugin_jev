@@ -35,6 +35,8 @@ impl StateBuildError {
 
     /// Produces a bounded row error without copying upstream Nu error text.
     pub(crate) fn into_jev(self) -> JevError {
+        // Single-state callers can propagate a native upstream diagnostic; table error records
+        // must not persist arbitrary upstream text, which may contain private row data.
         match self {
             Self::Conversion(ValueConversionError::Invalid { kind, path, .. }) => {
                 JevError::StateConversion { kind, path }
@@ -64,6 +66,7 @@ pub(crate) fn build_request(
 }
 
 /// Builds a row request while sharing questions and a preconverted context.
+/// Each request still owns its state JSON; shared context is copied into that outbound state.
 pub(crate) fn build_shared_request(
     input: &Value,
     context: Option<&JsonValue>,
@@ -105,6 +108,8 @@ fn finalize_state(
     context: Option<JsonValue>,
     span: nu_protocol::Span,
 ) -> Result<JsonValue, StateBuildError> {
+    // Presence, not nullness, activates wrapping: --context null still creates an object.
+    // A merge could overwrite input fields; this explicit wrapper keeps both namespaces intact.
     let state = if let Some(context) = context {
         let mut wrapper = JsonMap::with_capacity(2);
         wrapper.insert("input".to_owned(), input_json);
@@ -113,6 +118,8 @@ fn finalize_state(
     } else {
         input_json
     };
+    // Check the composed REST state, not the original Nu input. A scalar is valid when nested
+    // inside the context wrapper, but cannot be sent as an unwrapped top-level state.
     validate_state(&state, span)?;
     Ok(state)
 }

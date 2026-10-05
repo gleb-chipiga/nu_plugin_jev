@@ -1,4 +1,6 @@
-//! Converts structured Nushell values to and from JSON with explicit type rules.
+//! Converts arbitrary request data between native Nu values and the REST JSON domain.
+//! Conversion is not a lossless Nu round trip: special outbound types have fixed representations.
+//! The plugin's MsgPack transport serializes the resulting Nu values, not this JSON tree.
 
 use nu_protocol::{LabeledError, Record, Span, Value};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
@@ -31,7 +33,8 @@ impl ValueConversionError {
     }
 }
 
-/// Converts one Nu value recursively, reporting the path of unsupported values.
+/// Converts one Nu value recursively without parsing strings or stringifying containers.
+/// Rejects unsupported values with their source span and propagates embedded Nu errors.
 pub(crate) fn to_json(value: &Value) -> Result<JsonValue, LabeledError> {
     to_json_checked(value).map_err(ValueConversionError::into_labeled)
 }
@@ -49,6 +52,7 @@ pub(crate) fn to_json_at(value: &Value, path: String) -> Result<JsonValue, Label
 /// Recurses with structured failures that can be safely classified by callers.
 fn to_json_at_checked(value: &Value, path: String) -> Result<JsonValue, ValueConversionError> {
     match value {
+        // JSON-looking shell strings remain literal strings; decoding them is the caller's job.
         Value::String { val, .. } => Ok(JsonValue::String(val.clone())),
         Value::Int { val, .. } => Ok(JsonValue::Number((*val).into())),
         Value::Float { val, .. } => JsonNumber::from_f64(*val)
@@ -56,6 +60,8 @@ fn to_json_at_checked(value: &Value, path: String) -> Result<JsonValue, ValueCon
             .ok_or_else(|| conversion_error(&path, "non-finite float", value.span())),
         Value::Bool { val, .. } => Ok(JsonValue::Bool(*val)),
         Value::Nothing { .. } => Ok(JsonValue::Null),
+        // JSON has no Date, Duration, or Filesize tags. Use deterministic external forms;
+        // decoding them later must not guess the original Nu type from their contents.
         Value::Date { val, .. } => Ok(JsonValue::String(val.to_rfc3339())),
         Value::Duration { val, .. } => Ok(JsonValue::String(format!("{val}ns"))),
         Value::Filesize { val, .. } => Ok(JsonValue::Number(val.get().into())),
@@ -71,6 +77,8 @@ fn to_json_at_checked(value: &Value, path: String) -> Result<JsonValue, ValueCon
                 JsonMap::with_capacity(val.len()),
                 |mut object, (key, item)| {
                     let item_path = format!("{path}.{key}");
+                    // Nu Record permits duplicate columns, unlike a JSON map. Refuse the
+                    // conversion rather than letting map insertion pick one value silently.
                     if object.contains_key(key) {
                         return Err(conversion_error(
                             &item_path,
@@ -95,7 +103,8 @@ fn to_json_at_checked(value: &Value, path: String) -> Result<JsonValue, ValueCon
     }
 }
 
-/// Converts an API JSON value to a Nu value without interpreting strings.
+/// Moves an owned JSON tree into Nu containers, assigning the supplied span recursively.
+/// Leaves strings as strings and rejects integers outside Nu's signed 64-bit domain.
 pub(crate) fn from_json(value: JsonValue, span: Span) -> Result<Value, LabeledError> {
     match value {
         JsonValue::Null => Ok(Value::nothing(span)),
@@ -117,7 +126,8 @@ pub(crate) fn from_json(value: JsonValue, span: Span) -> Result<Value, LabeledEr
     }
 }
 
-/// Converts a borrowed JSON value without cloning its intermediate containers.
+/// Copies borrowed JSON leaves directly into newly owned Nu containers with a supplied span.
+/// Avoids an intermediate JSON-tree clone when projecting shared cached answers.
 pub(crate) fn from_json_ref(value: &JsonValue, span: Span) -> Result<Value, LabeledError> {
     match value {
         JsonValue::Null => Ok(Value::nothing(span)),
@@ -144,6 +154,7 @@ fn number_to_nu(number: &JsonNumber, span: Span) -> Result<Value, LabeledError> 
     if let Some(value) = number.as_i64() {
         Ok(Value::int(value, span))
     } else if number.is_u64() {
+        // A float fallback would lose integer precision and hide an unrepresentable API value.
         Err(LabeledError::new(format!(
             "JSON integer {number} exceeds Nushell's signed 64-bit range"
         ))

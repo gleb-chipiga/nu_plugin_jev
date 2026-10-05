@@ -1,4 +1,4 @@
-//! Provides offline namespace guidance for installed Nushell users.
+//! Provides offline namespace guidance through the SDK's materialized-value adapter.
 
 use nu_plugin::{EngineInterface, EvaluatedCall, SimplePluginCommand};
 use nu_protocol::{LabeledError, Signature, Type, Value};
@@ -55,6 +55,8 @@ impl SimplePluginCommand for Jev {
         call: &EvaluatedCall,
         input: &Value,
     ) -> Result<Value, LabeledError> {
+        // The simple adapter has already collected any incoming stream. Nothing represents
+        // both absent input and explicit null; other supplied values must not be ignored.
         if !input.is_nothing() {
             return Err(LabeledError::new("jev does not accept pipeline input")
                 .with_label("invoke jev without an input state", call.head));

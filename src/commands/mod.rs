@@ -1,3 +1,6 @@
+//! Exposes SDK command adapters; argument evaluation and transport remain Nushell's job.
+//! Simple commands receive materialized values; live commands inspect `PipelineData` directly.
+
 /// Streams independent table-row evaluations and typed annotations.
 pub(crate) mod annotate;
 /// Evaluates one finite state against named questions.
