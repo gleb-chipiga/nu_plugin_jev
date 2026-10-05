@@ -167,6 +167,7 @@ impl PluginCommand for JevAsk {
 
 #[cfg(test)]
 mod tests {
+    use indoc::formatdoc;
     use nu_plugin::PluginCommand;
     use nu_plugin_test_support::PluginTest;
     use nu_protocol::{ListStream, PipelineData, ShellError, Signals, Span, Value};
@@ -333,19 +334,19 @@ mod tests {
         }, "usage": {"input_tokens": 42, "output_tokens": 6}});
         let (base_url, server) = serve(vec![answer.clone()]);
         let mut test = plugin_test()?;
-        let source = format!(
-            "$env.TYPESAFE_API_KEY = 'local-key'; $env.NU_PLUGIN_JEV_BASE_URL = '{base_url}';"
-        ) + r#"
-let questions = {
-    spam: (jev question noul "Is this unsolicited?" --yes "Unrequested bulk mail")
-    kind: (jev question choice "Message kind?" [normal promo spam])
-    urgency: (jev question score "Review urgency?" ["later" "today" "now"])
-}
-let message = "Hello"
-let sender = "Ada"
-let result = ({message: $message, sender: $sender} | jev ask $questions)
-$result
-"#;
+        let source = formatdoc! {r#"
+            $env.TYPESAFE_API_KEY = 'local-key'
+            $env.NU_PLUGIN_JEV_BASE_URL = '{base_url}'
+            let questions = {{
+                spam: (jev question noul "Is this unsolicited?" --yes "Unrequested bulk mail")
+                kind: (jev question choice "Message kind?" [normal promo spam])
+                urgency: (jev question score "Review urgency?" ["later" "today" "now"])
+            }}
+            let message = "Hello"
+            let sender = "Ada"
+            let result = ({{message: $message, sender: $sender}} | jev ask $questions)
+            $result
+        "#};
         let result = test.eval(&source)?.into_value(Span::test_data())?;
         assert_eq!(
             to_json(&result).unwrap(),
@@ -498,14 +499,15 @@ $result
         let (first_proxy, first_server) = serve(vec![answer.clone()]);
         let (second_proxy, second_server) = serve(vec![answer]);
         let mut test = plugin_test()?;
-        let source = format!(
-            "$env.TYPESAFE_API_KEY = 'local'; $env.NU_PLUGIN_JEV_BASE_URL = 'http://localhost:1'; \
-             $env.NU_PLUGIN_JEV_PROXY = '{first_proxy}'; \
-             let first = ('hello' | jev ask {{match: {{type: noul}}}}); \
-             $env.NU_PLUGIN_JEV_PROXY = '{second_proxy}'; \
-             let second = ('world' | jev ask {{match: {{type: noul}}}}); \
-             [$first $second]"
-        );
+        let source = formatdoc! {r#"
+            $env.TYPESAFE_API_KEY = 'local'
+            $env.NU_PLUGIN_JEV_BASE_URL = 'http://localhost:1'
+            $env.NU_PLUGIN_JEV_PROXY = '{first_proxy}'
+            let first = ('hello' | jev ask {{match: {{type: noul}}}})
+            $env.NU_PLUGIN_JEV_PROXY = '{second_proxy}'
+            let second = ('world' | jev ask {{match: {{type: noul}}}})
+            [$first $second]
+        "#};
         let result = test.eval(&source)?.into_value(Span::test_data())?;
         assert_eq!(to_json(&result).unwrap().as_array().unwrap().len(), 2);
         let first = first_server.join().unwrap();

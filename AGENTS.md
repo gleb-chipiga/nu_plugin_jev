@@ -4,7 +4,13 @@
 - Prefer stack types and minimize allocations (use heap only when necessary).
 - Comments and docstrings must be in English only (requirement for code).
 - Keep every Rust source line, including tests and comments, at most 100 characters long.
-  Split long string literals with `concat!` while preserving their exact contents.
+  Split long single-line string literals with `concat!`, preserving their exact contents.
+- Use `indoc!` for multiline text blocks and `formatdoc!` for interpolated blocks.
+  Prefer indented raw strings and actual line breaks for Nu scripts; wrap long
+  Nu expressions instead of joining lines with Rust continuation escapes.
+  Do not add blank lines merely to preserve insignificant opening newlines.
+  Preserve meaningful whitespace and exact protocol separators; keep explicit
+  `\r\n` and continuation escapes when needed for HTTP wire text.
 - In the tokio runtime, avoid blocking or potentially blocking calls (if needed, move to a dedicated thread or `tokio::task::spawn_blocking`).
 - Configure `tracing` with a non-blocking subscriber/writer; do not use a blocking default logger for runtime I/O paths.
 - Keep tracing initialization in a dedicated module rather than in `main.rs`.

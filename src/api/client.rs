@@ -2599,14 +2599,17 @@ mod tests {
                     let mut body = vec![0; content_length];
                     reader.read_exact(&mut body).await.unwrap();
                     let data = answer().to_string();
-                    let response = format!(
-                        concat!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
-                            "Content-Length: {}\r\nConnection: close\r\n\r\n{data}"
-                        ),
+                    // Continuations remove source newlines but preserve HTTP's explicit CRLF.
+                    let response = indoc::formatdoc! {"
+                        HTTP/1.1 200 OK\r\n\
+                        Content-Type: application/json\r\n\
+                        Content-Length: {}\r\n\
+                        Connection: close\r\n\
+                        \r\n\
+                        {data}",
                         data.len(),
                         data = data
-                    );
+                    };
                     tls.write_all(response.as_bytes()).await.unwrap();
                     (alpn, 1)
                 }

@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use indoc::indoc;
+
 /// Runs ready-made HTTP/2 fixtures for the actual plugin binary.
 #[path = "support/h2_fixture.rs"]
 mod h2_fixture;
@@ -611,29 +613,31 @@ fn annotate_composes_with_native_table_commands() {
         return;
     }
     let (base_url, server) = serve_mixed_table();
-    let source = r#"
-let q = {
-    spam: {type: noul}
-    kind: {type: choice, criteria: {normal: null, spam: null}}
-    urgency: {type: score, criteria: ['later' 'today' 'now']}
-}
+    let source = indoc! {r#"
+        let q = {
+            spam: {type: noul}
+            kind: {type: choice, criteria: {normal: null, spam: null}}
+            urgency: {type: score, criteria: ['later' 'today' 'now']}
+        }
 
-let rows = ([
-    {id: 1, message: 'urgent', sender: 'a', secret: 'local-1'}
-    {id: 2, message: 'normal', sender: 'b', secret: 'local-2'}
-    {id: 3, message: 'later', sender: 'c', secret: 'local-3'}
-]
-    | jev annotate $q --fields [message sender] --context {policy: 'rules'} --metrics --jobs 2
-    | select id message sender secret answers jev_meta jev_metrics)
-{
-    all: $rows
-    filtered: (
-        $rows | where answers.spam.noul > 0.9
-        | sort-by answers.urgency.score --reverse
-        | reject jev_meta jev_metrics
-    )
-} | to json --raw
-"#;
+        let rows = ([
+            {id: 1, message: 'urgent', sender: 'a', secret: 'local-1'}
+            {id: 2, message: 'normal', sender: 'b', secret: 'local-2'}
+            {id: 3, message: 'later', sender: 'c', secret: 'local-3'}
+        ]
+            | jev annotate $q --fields [message sender] --context {
+                policy: 'rules'
+            } --metrics --jobs 2
+            | select id message sender secret answers jev_meta jev_metrics)
+        {
+            all: $rows
+            filtered: (
+                $rows | where answers.spam.noul > 0.9
+                | sort-by answers.urgency.score --reverse
+                | reject jev_meta jev_metrics
+            )
+        } | to json --raw
+    "#};
     let output = isolated_command("nu")
         .args([
             "--no-config-file",
@@ -707,31 +711,31 @@ fn annotate_default_answers_and_explicit_legacy_path_in_real_nu() {
         return;
     }
     let (base_url, calls, server) = serve_until_stopped(false);
-    let source = r#"
-let q = {match: {type: noul}}
-let default = ([{id: 1, message: 7}] | jev annotate $q --fields [message] --metrics | first)
-let legacy = ([{id: 2, message: 7}]
-    | jev annotate $q --fields [message] --into jev --metrics | first)
-let shared = ([{id: 3, message: 7} {id: 4, message: 7}]
-    | jev annotate $q --fields [message] --metrics --jobs 1)
-let kept = ([{id: 5}] | jev annotate $q --fields [message] --on-error keep | first)
-let recorded = ([{id: 6}] | jev annotate $q --fields [message] --on-error record | first)
-let empty = ([] | jev annotate $q --fields [message] | length)
-let ordered = ([{id: 7, message: 1} {id: 8, message: 2}]
-    | jev annotate $q --fields [message] --jobs 2 | get id)
-let unordered = ([{id: 9, message: 3} {id: 10, message: 4}]
-    | jev annotate $q --fields [message] --jobs 2 --unordered | get id)
-{
-    default: $default
-    legacy: $legacy
-    shared: $shared
-    kept: $kept
-    recorded: $recorded
-    empty: $empty
-    ordered: $ordered
-    unordered: $unordered
-} | to json --raw
-"#;
+    let source = indoc! {r#"
+        let q = {match: {type: noul}}
+        let default = ([{id: 1, message: 7}] | jev annotate $q --fields [message] --metrics | first)
+        let legacy = ([{id: 2, message: 7}]
+            | jev annotate $q --fields [message] --into jev --metrics | first)
+        let shared = ([{id: 3, message: 7} {id: 4, message: 7}]
+            | jev annotate $q --fields [message] --metrics --jobs 1)
+        let kept = ([{id: 5}] | jev annotate $q --fields [message] --on-error keep | first)
+        let recorded = ([{id: 6}] | jev annotate $q --fields [message] --on-error record | first)
+        let empty = ([] | jev annotate $q --fields [message] | length)
+        let ordered = ([{id: 7, message: 1} {id: 8, message: 2}]
+            | jev annotate $q --fields [message] --jobs 2 | get id)
+        let unordered = ([{id: 9, message: 3} {id: 10, message: 4}]
+            | jev annotate $q --fields [message] --jobs 2 --unordered | get id)
+        {
+            default: $default
+            legacy: $legacy
+            shared: $shared
+            kept: $kept
+            recorded: $recorded
+            empty: $empty
+            ordered: $ordered
+            unordered: $unordered
+        } | to json --raw
+    "#};
     let output = isolated_command("nu")
         .args([
             "--no-config-file",
@@ -923,15 +927,15 @@ fn tracing_level_changes_after_plugin_restart() {
         return;
     }
     let (base_url, calls, server) = serve_until_stopped(false);
-    let source = r#"
-let q = {match: {type: noul}}
-let first = ({message: 1} | jev ask $q | get answers.match.noul)
-$env.NU_PLUGIN_JEV_LOG = "info"
-let second = ({message: 2} | jev ask $q | get answers.match.noul)
-plugin stop jev
-let third = ({message: 3} | jev ask $q | get answers.match.noul)
-[$first $second $third] | to json --raw
-"#;
+    let source = indoc! {r#"
+        let q = {match: {type: noul}}
+        let first = ({message: 1} | jev ask $q | get answers.match.noul)
+        $env.NU_PLUGIN_JEV_LOG = "info"
+        let second = ({message: 2} | jev ask $q | get answers.match.noul)
+        plugin stop jev
+        let third = ({message: 3} | jev ask $q | get answers.match.noul)
+        [$first $second $third] | to json --raw
+    "#};
     let output = isolated_command("nu")
         .args([
             "--no-config-file",
@@ -1215,14 +1219,14 @@ fn real_nu_models_reload_nuon_and_honor_explicit_config() {
         format!("{{base_url: '{url}', timeout_ms: 5000}}"),
     )
     .expect("explicit local NUON");
-    let source = r#"
-let first = (jev models --base-url '{URL}' | get models.0.name)
-{timeout_ms: 0} | save --force '{CONFIG}'
-let second_error = (try { jev models --base-url '{URL}' } catch {|err| $err.msg })
-$env.NU_PLUGIN_JEV_CONFIG = 'missing-env-selected.nuon'
-let explicit = (jev models --config '{EXPLICIT}' | get models.0.name)
-{first: $first, second_error: $second_error, explicit: $explicit} | to json --raw
-"#
+    let source = indoc! {r#"
+        let first = (jev models --base-url '{URL}' | get models.0.name)
+        {timeout_ms: 0} | save --force '{CONFIG}'
+        let second_error = (try { jev models --base-url '{URL}' } catch {|err| $err.msg })
+        $env.NU_PLUGIN_JEV_CONFIG = 'missing-env-selected.nuon'
+        let explicit = (jev models --config '{EXPLICIT}' | get models.0.name)
+        {first: $first, second_error: $second_error, explicit: $explicit} | to json --raw
+    "#}
     .replace("{URL}", &url)
     .replace("{CONFIG}", &config.to_string_lossy())
     .replace("{EXPLICIT}", &explicit.to_string_lossy());
@@ -1420,47 +1424,48 @@ fn nuon_defaults_follow_caller_directory_and_reload_between_calls() {
         "api_key = 'secret' invalid TOML",
     )
     .expect("broken legacy TOML");
-    let source = r#"
-let q = {match: (jev question noul 'Match?')};
-cd '{FIRST}';
-let a = ('hello' | jev ask $q --dry-run | get request.model);
-let pending = ([{message: 1}] | jev annotate $q --dry-run);
-{model: 'updated-model'} | save --force .nu_plugin_jev.nuon;
-let frozen = ($pending | get 0.request.model);
-let b = ('hello' | jev ask $q --dry-run | get request.model);
-cd '{SECOND}';
-let c = ('hello' | jev ask $q --dry-run | get request.model);
-{model: 'changed-user'} | save --force '{USER}/nu_plugin_jev/config.nuon';
-let changed_user = ('hello' | jev ask $q --dry-run | get request.model);
-$env.NU_PLUGIN_JEV_MODEL = 'env-model';
-let changed_env = ('hello' | jev ask $q --dry-run | get request.model);
-hide-env NU_PLUGIN_JEV_MODEL;
-$env.NU_PLUGIN_JEV_CONFIG = '{FIRST}/.nu_plugin_jev.nuon';
-let d = ('hello' | jev ask $q --dry-run | get request.model);
-let e = ('hello' | jev ask $q --config '{EXPLICIT}' --dry-run | get request.model);
-hide-env NU_PLUGIN_JEV_CONFIG;
-let parallel = (['{FIRST}' '{SECOND}'] | par-each { |dir|
-    cd $dir
-    'hello' | jev ask $q --dry-run | get request.model
-} | sort);
-cd '{SECOND}';
-$env.XDG_CONFIG_HOME = '{LEGACY_USER}';
-let ignored_legacy_files = ('hello' | jev ask $q --dry-run | get request.model);
-let legacy_error = (try {
-    'hello' | jev ask $q --config .jev.toml --dry-run
-} catch {|err| $err.msg});
-open .nu_plugin_jev.toml | save converted.nuon;
-let converted = ('hello' | jev ask $q --config converted.nuon --dry-run | get request.model);
-let retained = (open converted.nuon | {key: ($in.api_key == 'fixture-migration-key'),
-    cache: $in.cache.max_entries});
-cd '{BROKEN}';
-let offline = ((jev question noul 'Still offline?') | get type);
-let guidance = (jev | str contains 'jev ask');
-[
-    $a $frozen $b $c $changed_user $changed_env $d $e
-    $parallel $ignored_legacy_files $legacy_error $converted $retained $offline $guidance
-] | to json --raw
-"#
+    let source = indoc! {r#"
+        let q = {match: (jev question noul 'Match?')};
+        cd '{FIRST}';
+        let a = ('hello' | jev ask $q --dry-run | get request.model);
+        let pending = ([{message: 1}] | jev annotate $q --dry-run);
+        {model: 'updated-model'} | save --force .nu_plugin_jev.nuon;
+        let frozen = ($pending | get 0.request.model);
+        let b = ('hello' | jev ask $q --dry-run | get request.model);
+        cd '{SECOND}';
+        let c = ('hello' | jev ask $q --dry-run | get request.model);
+        {model: 'changed-user'} | save --force '{USER}/nu_plugin_jev/config.nuon';
+        let changed_user = ('hello' | jev ask $q --dry-run | get request.model);
+        $env.NU_PLUGIN_JEV_MODEL = 'env-model';
+        let changed_env = ('hello' | jev ask $q --dry-run | get request.model);
+        hide-env NU_PLUGIN_JEV_MODEL;
+        $env.NU_PLUGIN_JEV_CONFIG = '{FIRST}/.nu_plugin_jev.nuon';
+        let d = ('hello' | jev ask $q --dry-run | get request.model);
+        let e = ('hello' | jev ask $q --config '{EXPLICIT}' --dry-run | get request.model);
+        hide-env NU_PLUGIN_JEV_CONFIG;
+        let parallel = (['{FIRST}' '{SECOND}'] | par-each { |dir|
+            cd $dir
+            'hello' | jev ask $q --dry-run | get request.model
+        } | sort);
+        cd '{SECOND}';
+        $env.XDG_CONFIG_HOME = '{LEGACY_USER}';
+        let ignored_legacy_files = ('hello' | jev ask $q --dry-run | get request.model);
+        let legacy_error = (try {
+            'hello' | jev ask $q --config .jev.toml --dry-run
+        } catch {|err| $err.msg});
+        open .nu_plugin_jev.toml | save converted.nuon;
+        let converted = ('hello' | jev ask $q --config converted.nuon --dry-run
+            | get request.model);
+        let retained = (open converted.nuon | {key: ($in.api_key == 'fixture-migration-key'),
+            cache: $in.cache.max_entries});
+        cd '{BROKEN}';
+        let offline = ((jev question noul 'Still offline?') | get type);
+        let guidance = (jev | str contains 'jev ask');
+        [
+            $a $frozen $b $c $changed_user $changed_env $d $e
+            $parallel $ignored_legacy_files $legacy_error $converted $retained $offline $guidance
+        ] | to json --raw
+    "#}
     .replace("{FIRST}", &first.to_string_lossy())
     .replace("{SECOND}", &second.to_string_lossy())
     .replace("{BROKEN}", &broken.to_string_lossy())

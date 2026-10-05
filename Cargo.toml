@@ -48,6 +48,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 mimalloc = { version = "0.1", optional = true }
 
 [dev-dependencies]
+indoc = "2"
 nu-plugin-test-support = "=0.116"
 h2 = "0.4"
 http = "1"
