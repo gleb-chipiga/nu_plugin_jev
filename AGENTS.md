@@ -1,7 +1,8 @@
 ## General coding rules
 
 - All modules, public types, and functions must have docstrings (Rust `///`).
-- Docstring style: brief but precise; 1-3 lines describing what the module/type/function does, key guarantees, and expected side effects.
+- Docstring style: brief but precise; 1-3 lines describing what the module/type/function does,
+  key guarantees, and expected side effects.
 - Prefer stack types and minimize allocations (use heap only when necessary).
 - Comments and docstrings must be in English only (requirement for code).
 - Keep every Rust source line, including tests and comments, at most 100 characters long.
@@ -28,17 +29,27 @@
 - Format `json!` objects with multiple fields or nested structures using one field
   per line and explicit nesting indentation. Put array objects on separate lines;
   keep scalars, empty containers, and short simple values compact.
-- In the tokio runtime, avoid blocking or potentially blocking calls (if needed, move to a dedicated thread or `tokio::task::spawn_blocking`).
-- Configure `tracing` with a non-blocking subscriber/writer; do not use a blocking default logger for runtime I/O paths.
+- In the tokio runtime, avoid blocking or potentially blocking calls (if needed, move to a
+  dedicated thread or `tokio::task::spawn_blocking`).
+- Configure `tracing` with a non-blocking subscriber/writer; do not use a blocking default logger
+  for runtime I/O paths.
 - Keep tracing initialization in a dedicated module rather than in `main.rs`.
-- Create the Tokio runtime explicitly with `tokio::runtime::Builder`; do not use the `#[tokio::main]` macro.
-- Initialize tracing before entering the Tokio runtime; tracing setup must happen outside the runtime.
+- Create the Tokio runtime explicitly with `tokio::runtime::Builder`; do not use the
+  `#[tokio::main]` macro.
+- Initialize tracing before entering the Tokio runtime; tracing setup must happen outside
+  the runtime.
 - Prefer iterators and functional style over manual loops where possible.
-- Rule: minimal visibility by default — if not needed even within the crate, keep it non-`pub`; use `pub(crate)` only if needed inside the crate; use `pub` only for external API.
-- When changing Rust code or Cargo dependencies, run `cargo fmt`, `cargo clippy --all-targets --all-features`, and `cargo nextest run --all-features --all-targets --locked`; fix all findings. For documentation- or pipeline-only changes, validate the changed files without running Rust code checks.
+- Rule: minimal visibility by default — if not needed even within the crate, keep it non-`pub`;
+  use `pub(crate)` only if needed inside the crate; use `pub` only for external API.
+- When changing Rust code or Cargo dependencies, run `cargo fmt`,
+  `cargo clippy --all-targets --all-features`, and
+  `cargo nextest run --all-features --all-targets --locked`; fix all findings.
+  For documentation- or pipeline-only changes, validate the changed files without running
+  Rust code checks.
 - Prefer specific types (NewType idiom) where justified.
 - Do not use `lib.rs` (binary only).
-- `main.rs` should stay thin, build the runtime, initialize tracing via the dedicated module before runtime entry, and delegate application behavior to a single function.
+- `main.rs` should stay thin, build the runtime, initialize tracing via the dedicated module
+  before runtime entry, and delegate application behavior to a single function.
 - Use Conventional Commits for every commit message. The project convention uses a
   lower-case type and lower-case description, for example `docs: update changelog`.
 - Keep the repository-owned usage skill at `skills/jev-nushell/SKILL.md` in sync
@@ -53,6 +64,18 @@
 - Read `skills/jev-nushell/SKILL.md` when preparing Jev/Nushell usage examples
   or workflows for this repository, even if the root-level skill directory is
   not included in an agent's automatic skill discovery paths.
+
+## Markdown formatting
+
+- Wrap ordinary Markdown prose at 100 characters per source line, including OpenSpec artifacts
+  and skill instructions. Wrap at word boundaries without inserting blank lines inside a
+  paragraph; preserve list indentation and meaningful Markdown line breaks.
+- Allow longer lines for URLs, indivisible identifiers, tables, and code blocks when wrapping
+  would damage readability or change meaning. Do not enforce a blanket limit on every
+  Markdown line.
+- The line-length rule is independent of OpenSpec's 500-character requirement-description
+  limit. Wrapping a description does not split it into separate requirements or reduce
+  its total length.
 
 ## OpenSpec specifications
 
