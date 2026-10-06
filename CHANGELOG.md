@@ -4,6 +4,12 @@ Notable changes to `nu_plugin_jev` are documented here.
 
 ## [Unreleased]
 
+## [0.2.1]
+
+### Changed
+
+- Simplify README structure and shorten command, configuration, and diagnostics guidance.
+
 ## [0.2.0]
 
 ### Added
