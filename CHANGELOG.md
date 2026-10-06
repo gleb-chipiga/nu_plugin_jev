@@ -4,6 +4,8 @@ Notable changes to `nu_plugin_jev` are documented here.
 
 ## [Unreleased]
 
+## [0.2.0]
+
 ### Added
 
 - Share a startup-configured HTTP attempt budget across concurrent Nu commands
