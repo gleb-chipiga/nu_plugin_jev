@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 
+use indoc::indoc;
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{
     Example, LabeledError, ListStream, PipelineData, Record, ShellError, Signature, Span,
@@ -161,36 +162,45 @@ impl PluginCommand for JevAnnotate {
 
     /// Clarifies that each row is one state and native Nu handles filtering.
     fn extra_description(&self) -> &str {
-        concat!(
-            "Each row is an independent System One state; matching requests may share one ",
-            "evaluation. Answers go under answers by default; --into jev preserves the former ",
-            "answer path. Successful rows always add jev_meta with base_url, model, and usage; ",
-            "--metrics adds jev_metrics with one shared request_id and HTTP measurements. ",
-            "--fields selects literal top-level names, while --state follows a Nu cell path. ",
-            "Use native where and sort-by on answers. Invocation settings resolve per call from ",
-            "flags, Nu config, caller environment, local NUON (--config or ",
-            "NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.nuon), user NUON, then defaults."
-        )
+        indoc! {"
+            Each row is an independent System One state; matching requests may share one \
+            evaluation. Answers go under answers by default; --into jev preserves the former \
+            answer path. Successful rows always add jev_meta with base_url, model, and usage; \
+            --metrics adds jev_metrics with one shared request_id and HTTP measurements. \
+            --fields selects literal top-level names, while --state follows a Nu cell path. \
+            Use native where and sort-by on answers. Invocation settings resolve per call from \
+            flags, Nu config, caller environment, local NUON (--config or \
+            NU_PLUGIN_JEV_CONFIG, otherwise .nu_plugin_jev.nuon), user NUON, then defaults.\
+        "}
     }
 
     /// Shows a credential-free structured preview.
     fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                example: concat!(
-                    "[{id: 1, message: 'hello'}] | jev annotate ",
-                    "{greeting: (jev question noul 'Is this a greeting?')} ",
-                    "-f [message] --dry-run"
-                ),
+                example: indoc! {r#"
+                    (
+                        [{id: 1, message: 'hello'}]
+                        | jev annotate {
+                            greeting: (jev question noul 'Is this a greeting?')
+                        }
+                            -f [message]
+                            --dry-run
+                    )
+                "#},
                 description: "Preview the per-row outbound state without sending data",
                 result: None,
             },
             Example {
-                example: concat!(
-                    "[{id: 1, document: {text: 'hello'}}] | jev annotate ",
-                    "{greeting: {type: noul}} -s document.text ",
-                    "-c {policy: 'greetings'} --dry-run"
-                ),
+                example: indoc! {r#"
+                    (
+                        [{id: 1, document: {text: 'hello'}}]
+                        | jev annotate {greeting: {type: noul}}
+                            -s document.text
+                            -c {policy: 'greetings'}
+                            --dry-run
+                    )
+                "#},
                 description: "Preview a nested cell-path state with explicit context",
                 result: None,
             },
@@ -574,6 +584,7 @@ mod tests {
         time::Instant,
     };
 
+    use indoc::{formatdoc, indoc};
     use nu_plugin::PluginCommand;
     use nu_plugin_test_support::PluginTest;
     use nu_protocol::{Record, ShellError, Span, Value};
@@ -609,8 +620,16 @@ mod tests {
     fn mock_noul_response() -> serde_json::Value {
         json!({
             "model": "jev-fixed",
-            "answers": {"q": {"type": "noul", "noul": 0.875}},
-            "usage": {"input_tokens": 10, "output_tokens": 1}
+            "answers": {
+                "q": {
+                    "type": "noul",
+                    "noul": 0.875
+                }
+            },
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 1
+            }
         })
     }
 
@@ -638,7 +657,10 @@ mod tests {
             (
                 "spam".into(),
                 Question::Noul {
-                    instructions: Some(json!({"task": "classify", "language": "ru"})),
+                    instructions: Some(json!({
+                        "task": "classify",
+                        "language": "ru"
+                    })),
                     criteria: None,
                 },
             ),
@@ -792,10 +814,10 @@ mod tests {
             baseline_prepared_times.sort_unstable();
             prepared_times.sort_unstable();
             println!(
-                concat!(
-                    "{label}: baseline_build_ms={:.3}, optimized_build_ms={:.3}, ",
-                    "baseline_prepared_ms={:.3}, optimized_prepared_ms={:.3}"
-                ),
+                indoc! {"
+                    {label}: baseline_build_ms={:.3}, optimized_build_ms={:.3}, \
+                    baseline_prepared_ms={:.3}, optimized_prepared_ms={:.3}\
+                "},
                 baseline_build_times[2] as f64 / 1_000_000.0,
                 build_times[2] as f64 / 1_000_000.0,
                 baseline_prepared_times[2] as f64 / 1_000_000.0,
@@ -810,18 +832,27 @@ mod tests {
     fn dry_run_projects_fields_without_credentials() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
         let result = test
-            .eval(concat!(
-                "[{id: 1, message: 'hello', secret: 'local'} ",
-                "{id: 2, message: 'bye', secret: 'local'}] | jev annotate ",
-                "{q: {type: noul}} --fields [message] ",
-                "--context {policy: 'greetings'} --dry-run"
-            ))?
+            .eval(indoc! {r#"
+                (
+                    [
+                        {id: 1, message: 'hello', secret: 'local'}
+                        {id: 2, message: 'bye', secret: 'local'}
+                    ]
+                    | jev annotate {q: {type: noul}}
+                        --fields [message]
+                        --context {policy: 'greetings'}
+                        --dry-run
+                )
+            "#})?
             .into_value(Span::test_data())?;
         let wire = to_json(&result).unwrap();
         assert_eq!(wire.as_array().unwrap().len(), 2);
         assert_eq!(
             wire[0]["request"]["state"],
-            json!({"input": {"message": "hello"}, "context": {"policy": "greetings"}})
+            json!({
+                "input": {"message": "hello"},
+                "context": {"policy": "greetings"}
+            })
         );
         assert_eq!(
             wire[1]["request"]["state"]["input"],
@@ -843,38 +874,50 @@ mod tests {
         let response = mock_noul_response();
         let (base_url, server) = serve(vec![response]);
         let mut test = plugin_test()?;
-        let setup = concat!(
-            "$env.NU_PLUGIN_JEV_MODEL = 'env-model'; ",
-            "$env.NU_PLUGIN_JEV_JOBS = '0'; ",
-            "$env.config.plugins.jev = {model: 'config-model', jobs: 0};"
-        );
-        let common = format!(
-            concat!(
-                "[{{id: 1, message: 'hello'}}] | jev annotate ",
-                "{{q: {{type: noul}}}} --base-url '{base_url}'"
-            ),
+        let setup = indoc! {r#"
+            $env.NU_PLUGIN_JEV_MODEL = 'env-model'
+            $env.NU_PLUGIN_JEV_JOBS = '0'
+            $env.config.plugins.jev = {model: 'config-model', jobs: 0}
+        "#};
+        let common = formatdoc! {r#"
+            [{{id: 1, message: 'hello'}}]
+            | jev annotate {{q: {{type: noul}}}} --base-url '{base_url}'
+        "#,
             base_url = base_url
-        );
+        };
         let long = test
-            .eval(&format!(
-                concat!(
-                    "{setup} {common} --fields [message] ",
-                    "--context {{policy: 'greetings'}} --model flag-model ",
-                    "--jobs 1 --into ai --dry-run"
-                ),
+            .eval(&formatdoc! {r#"
+                {setup}
+                (
+                    {common}
+                        --fields [message]
+                        --context {{policy: 'greetings'}}
+                        --model flag-model
+                        --jobs 1
+                        --into ai
+                        --dry-run
+                )
+            "#,
                 setup = setup,
                 common = common
-            ))?
+            })?
             .into_value(Span::test_data())?;
         let short = test
-            .eval(&format!(
-                concat!(
-                    "{setup} {common} -f [message] ",
-                    "-c {{policy: 'greetings'}} -m flag-model -j 1 -i ai --dry-run"
-                ),
+            .eval(&formatdoc! {r#"
+                {setup}
+                (
+                    {common}
+                        -f [message]
+                        -c {{policy: 'greetings'}}
+                        -m flag-model
+                        -j 1
+                        -i ai
+                        --dry-run
+                )
+            "#,
                 setup = setup,
                 common = common
-            ))?
+            })?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&short).unwrap(), to_json(&long).unwrap());
         assert_eq!(
@@ -883,14 +926,21 @@ mod tests {
         );
 
         let live = test
-            .eval(&format!(
-                concat!(
-                    "{setup} $env.TYPESAFE_API_KEY = 'local'; {common} ",
-                    "-f [message] -c {{policy: 'greetings'}} -m flag-model -j 1 -i ai"
-                ),
+            .eval(&formatdoc! {r#"
+                {setup}
+                $env.TYPESAFE_API_KEY = 'local'
+                (
+                    {common}
+                        -f [message]
+                        -c {{policy: 'greetings'}}
+                        -m flag-model
+                        -j 1
+                        -i ai
+                )
+            "#,
                 setup = setup,
                 common = common
-            ))?
+            })?
             .into_value(Span::test_data())?;
         let live = to_json(&live).unwrap();
         assert_eq!(live[0]["id"], 1);
@@ -907,12 +957,25 @@ mod tests {
     #[test]
     fn short_state_option_matches_long_state_preview() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
-        let common = "[{payload: {text: 'hello'}, id: 1}] | jev annotate {q: {type: noul}}";
+        let common = indoc! {r#"
+            [{payload: {text: 'hello'}, id: 1}]
+            | jev annotate {q: {type: noul}}
+        "#};
         let long = test
-            .eval(&format!("{common} --state payload.text --dry-run"))?
+            .eval(&formatdoc! {r#"
+                (
+                    {common}
+                        --state payload.text --dry-run
+                )
+            "#})?
             .into_value(Span::test_data())?;
         let short = test
-            .eval(&format!("{common} -s payload.text --dry-run"))?
+            .eval(&formatdoc! {r#"
+                (
+                    {common}
+                        -s payload.text --dry-run
+                )
+            "#})?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&short).unwrap(), to_json(&long).unwrap());
         assert_eq!(to_json(&short).unwrap()[0]["request"]["state"], "hello");
@@ -926,15 +989,19 @@ mod tests {
         let (base_url, server) = serve(vec![response]);
         let mut test = plugin_test()?;
         let result = test
-            .eval(&format!(
-                concat!(
-                    "$env.TYPESAFE_API_KEY = 'local-key'; ",
-                    "[{{id: 7, payload: {{text: 'hello'}}, secret: 'local'}}] ",
-                    "| jev annotate {{q: {{type: noul}}}} --state payload.text ",
-                    "--into ai --metrics --base-url '{base_url}'"
-                ),
+            .eval(&formatdoc! {r#"
+                $env.TYPESAFE_API_KEY = 'local-key'
+                (
+                    [{{id: 7, payload: {{text: 'hello'}}, secret: 'local'}}]
+                    | jev annotate {{q: {{type: noul}}}}
+                        --state payload.text
+                        --into ai
+                        --metrics
+                        --base-url '{base_url}'
+                )
+            "#,
                 base_url = base_url
-            ))?
+            })?
             .into_value(Span::test_data())?;
         let wire = to_json(&result).unwrap();
         assert_eq!(wire[0]["id"], 7);
@@ -966,13 +1033,21 @@ mod tests {
         let response = mock_noul_response();
         let (base_url, server) = serve(vec![response.clone(), response]);
         let mut test = plugin_test()?;
-        let setup = format!(
-            "$env.TYPESAFE_API_KEY = 'local-key'; $env.NU_PLUGIN_JEV_BASE_URL = '{base_url}';"
-        );
-        let source =
-            "[{id: 7, message: 'hello'}] | jev annotate {q: {type: noul}} --fields [message]";
+        let setup = formatdoc! {r#"
+            $env.TYPESAFE_API_KEY = 'local-key'
+            $env.NU_PLUGIN_JEV_BASE_URL = '{base_url}'
+        "#};
+        let source = indoc! {r#"
+            [{id: 7, message: 'hello'}]
+            | jev annotate {q: {type: noul}} --fields [message]
+        "#};
         let default = test
-            .eval(&format!("{setup} {source}"))?
+            .eval(&formatdoc! {r#"
+                {setup}
+                (
+                    {source}
+                )
+            "#})?
             .into_value(Span::test_data())?;
         let default = to_json(&default).unwrap();
         assert_eq!(default[0]["answers"]["q"]["noul"], 0.875);
@@ -981,7 +1056,13 @@ mod tests {
         assert!(default[0].get("jev_metrics").is_none());
 
         let legacy = test
-            .eval(&format!("{setup} {source} --into jev --metrics"))?
+            .eval(&formatdoc! {r#"
+                {setup}
+                (
+                    {source}
+                        --into jev --metrics
+                )
+            "#})?
             .into_value(Span::test_data())?;
         let legacy = to_json(&legacy).unwrap();
         assert_eq!(legacy[0]["jev"]["q"]["noul"], 0.875);
@@ -997,10 +1078,16 @@ mod tests {
     fn rejects_conflicting_and_duplicate_selectors() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
         assert!(
-            test.eval(
-                "[] | jev annotate {q: {type: noul}} --state message --fields [message] --dry-run"
-            )
-            .is_err()
+            test.eval(indoc! {r#"
+                (
+                    []
+                    | jev annotate {q: {type: noul}}
+                        --state message
+                        --fields [message]
+                        --dry-run
+                )
+            "#})
+                .is_err()
         );
         for flags in [
             "-s message --fields [message]",
@@ -1008,42 +1095,67 @@ mod tests {
             "-s message -f [message]",
         ] {
             assert!(
-                test.eval(&format!(
-                    "[] | jev annotate {{q: {{type: noul}}}} {flags} --dry-run"
-                ))
-                .is_err()
+                test.eval(&formatdoc! {r#"
+                    []
+                    | jev annotate {{q: {{type: noul}}}} {flags} --dry-run
+                "#})
+                    .is_err()
             );
         }
         assert!(
-            test.eval("[] | jev annotate {q: {type: noul}} --fields [message message] --dry-run")
+            test.eval(indoc! {r#"
+                []
+                | jev annotate {q: {type: noul}} --fields [message message] --dry-run
+            "#})
                 .is_err()
         );
         assert!(
-            test.eval("[] | jev annotate {q: {type: noul}} --fields [] --dry-run")
+            test.eval(indoc! {r#"
+                []
+                | jev annotate {q: {type: noul}} --fields [] --dry-run
+            "#})
                 .is_err()
         );
         assert!(
-            test.eval("[] | jev annotate {q: {type: noul}} --fields [message 3] --dry-run")
+            test.eval(indoc! {r#"
+                []
+                | jev annotate {q: {type: noul}} --fields [message 3] --dry-run
+            "#})
                 .is_err()
         );
         assert!(
-            test.eval("[] | jev annotate {q: {type: noul}} --into ai --meta ai --dry-run")
+            test.eval(indoc! {r#"
+                []
+                | jev annotate {q: {type: noul}} --into ai --meta ai --dry-run
+            "#})
                 .is_err()
         );
         assert!(
-            test.eval("[] | jev annotate {q: {type: noul}} --into jev_meta --dry-run")
+            test.eval(indoc! {r#"
+                []
+                | jev annotate {q: {type: noul}} --into jev_meta --dry-run
+            "#})
                 .is_err()
         );
         assert!(
-            test.eval("[] | jev annotate {q: {type: noul}} --into jev_metrics --metrics")
+            test.eval(indoc! {r#"
+                []
+                | jev annotate {q: {type: noul}} --into jev_metrics --metrics
+            "#})
                 .is_err()
         );
         assert!(
-            test.eval("[] | jev annotate {q: {type: noul}} --metrics --dry-run")
+            test.eval(indoc! {r#"
+                []
+                | jev annotate {q: {type: noul}} --metrics --dry-run
+            "#})
                 .is_err()
         );
         assert!(
-            test.eval("[] | jev annotate {q: {type: noul}} --into jev_metrics --dry-run")
+            test.eval(indoc! {r#"
+                []
+                | jev annotate {q: {type: noul}} --into jev_metrics --dry-run
+            "#})
                 .is_ok()
         );
         Ok(())
@@ -1065,7 +1177,13 @@ mod tests {
             unordered: false,
             dry_run: false,
         };
-        let raw = crate::nu::value::from_json(json!({"q": {"type": "noul"}}), span).unwrap();
+        let raw = crate::nu::value::from_json(
+            json!({
+                "q": {"type": "noul"}
+            }),
+            span,
+        )
+        .unwrap();
         let questions = crate::api::validate::parse_questions(&raw).unwrap();
         let error = super::request_builder(&options, "jev-latest".into(), questions)(
             &Value::record(source, span),
@@ -1079,17 +1197,32 @@ mod tests {
     fn row_error_policies_keep_and_record() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
         let keep = test
-            .eval(concat!(
-                "[{id: 1}] | jev annotate {q: {type: noul}} ",
-                "--fields [message] --on-error keep --dry-run"
-            ))?
+            .eval(indoc! {r#"
+                (
+                    [{id: 1}]
+                    | jev annotate {q: {type: noul}}
+                        --fields [message]
+                        --on-error keep
+                        --dry-run
+                )
+            "#})?
             .into_value(Span::test_data())?;
-        assert_eq!(to_json(&keep).unwrap(), json!([{"id": 1}]));
+        assert_eq!(
+            to_json(&keep).unwrap(),
+            json!([
+                {"id": 1}
+            ])
+        );
         let record = test
-            .eval(concat!(
-                "[{id: 1}] | jev annotate {q: {type: noul}} ",
-                "--fields [message] --on-error record --dry-run"
-            ))?
+            .eval(indoc! {r#"
+                (
+                    [{id: 1}]
+                    | jev annotate {q: {type: noul}}
+                        --fields [message]
+                        --on-error record
+                        --dry-run
+                )
+            "#})?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&record).unwrap()[0]["jev_error"]["kind"], "state");
         assert_eq!(
@@ -1104,20 +1237,28 @@ mod tests {
     fn literal_fields_and_indexed_state_paths() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
         let literal = test
-            .eval(concat!(
-                "[{'a.b': 'value', id: 1}] | jev annotate {q: {type: noul}} ",
-                "--fields ['a.b'] --dry-run"
-            ))?
+            .eval(indoc! {r#"
+                (
+                    [{'a.b': 'value', id: 1}]
+                    | jev annotate {q: {type: noul}}
+                        --fields ['a.b']
+                        --dry-run
+                )
+            "#})?
             .into_value(Span::test_data())?;
         assert_eq!(
             to_json(&literal).unwrap()[0]["request"]["state"],
             json!({"a.b": "value"})
         );
         let indexed = test
-            .eval(concat!(
-                "[{payload: [{text: 'first'} {text: 'second'}]}] ",
-                "| jev annotate {q: {type: noul}} --state payload.1.text --dry-run"
-            ))?
+            .eval(indoc! {r#"
+                (
+                    [{payload: [{text: 'first'} {text: 'second'}]}]
+                    | jev annotate {q: {type: noul}}
+                        --state payload.1.text
+                        --dry-run
+                )
+            "#})?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&indexed).unwrap()[0]["request"]["state"], "second");
         Ok(())
@@ -1129,15 +1270,21 @@ mod tests {
         let response = mock_noul_response();
         let (base_url, server) = serve(vec![response]);
         let mut test = plugin_test()?;
-        let source = format!(
-            concat!(
-                "$env.TYPESAFE_API_KEY = 'local-key'; ",
-                "[{{id: 1, message: 'same'}} {{id: 2, message: 'same'}}] ",
-                "| jev annotate {{q: {{type: noul}}}} --fields [message] ",
-                "--metrics --base-url '{base_url}'"
-            ),
+        let source = formatdoc! {r#"
+            $env.TYPESAFE_API_KEY = 'local-key'
+            (
+                [
+                    {{id: 1, message: 'same'}}
+                    {{id: 2, message: 'same'}}
+                ]
+                | jev annotate {{q: {{type: noul}}}}
+                    --fields [message]
+                    --metrics
+                    --base-url '{base_url}'
+            )
+        "#,
             base_url = base_url
-        );
+        };
         let result = test.eval(&source)?.into_value(Span::test_data())?;
         let wire = to_json(&result).unwrap();
         assert_eq!(wire[0]["id"], 1);
@@ -1176,16 +1323,15 @@ mod tests {
         let (second_url, second_server) = serve(vec![response]);
         let mut test = plugin_test()?;
         for (key, url) in [("first-key", &first_url), ("second-key", &second_url)] {
-            let source = format!(
-                concat!(
-                    "$env.TYPESAFE_API_KEY = '{key}'; ",
-                    "$env.NU_PLUGIN_JEV_BASE_URL = '{url}'; ",
-                    "[{{message: 'same'}}] | jev annotate ",
-                    "{{q: {{type: noul}}}} --fields [message]"
-                ),
+            let source = formatdoc! {r#"
+                $env.TYPESAFE_API_KEY = '{key}'
+                $env.NU_PLUGIN_JEV_BASE_URL = '{url}'
+                [{{message: 'same'}}]
+                | jev annotate {{q: {{type: noul}}}} --fields [message]
+            "#,
                 key = key,
                 url = url
-            );
+            };
             let result = test.eval(&source)?.into_value(Span::test_data())?;
             let wire = to_json(&result).unwrap();
             assert_eq!(wire[0]["answers"]["q"]["noul"], 0.875);
@@ -1234,7 +1380,10 @@ mod tests {
                 .unwrap();
         assert_eq!(
             request.state,
-            json!({"message": "hello", "elapsed": "1500000000ns"})
+            json!({
+                "message": "hello",
+                "elapsed": "1500000000ns"
+            })
         );
         let whole = super::TableOptions {
             selector: super::StateSelector::Whole,
@@ -1254,8 +1403,13 @@ mod tests {
         source.push("ignored", Value::test_record(duplicate));
         let source = Value::test_record(source);
         let questions = crate::api::validate::parse_questions(
-            &crate::nu::value::from_json(json!({"q": {"type": "noul"}}), Span::test_data())
-                .unwrap(),
+            &crate::nu::value::from_json(
+                json!({
+                    "q": {"type": "noul"}
+                }),
+                Span::test_data(),
+            )
+            .unwrap(),
         )
         .unwrap();
         let options = super::TableOptions {
@@ -1285,20 +1439,34 @@ mod tests {
         let response = mock_noul_response();
         let (base_url, server) = serve(vec![response]);
         let mut test = plugin_test()?;
-        let common = format!(
-            concat!(
-                "[{{id: 7, message: 'hello', secret: 'local'}}] | jev annotate ",
-                "{{q: {{type: noul, instructions: {{task: 'greet'}}}}}} ",
-                "--fields [message] --context {{policy: ['first' 'second']}} ",
-                "--base-url '{base_url}'"
-            ),
+        let common = formatdoc! {r#"
+            [{{id: 7, message: 'hello', secret: 'local'}}]
+            | jev annotate {{
+                q: {{
+                    type: noul
+                    instructions: {{task: 'greet'}}
+                }}
+            }} --fields [message] --context {{
+                policy: ['first' 'second']
+            }} --base-url '{base_url}'
+        "#,
             base_url = base_url
-        );
+        };
         let preview = test
-            .eval(&format!("{common} --dry-run"))?
+            .eval(&formatdoc! {r#"
+                (
+                    {common}
+                        --dry-run
+                )
+            "#})?
             .into_value(Span::test_data())?;
         let live = test
-            .eval(&format!("$env.TYPESAFE_API_KEY = 'local-key'; {common}"))?
+            .eval(&formatdoc! {r#"
+                $env.TYPESAFE_API_KEY = 'local-key'
+                (
+                    {common}
+                )
+            "#})?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&live).unwrap()[0]["id"], 7);
         assert_eq!(
@@ -1314,16 +1482,19 @@ mod tests {
         for policy in ["keep", "record"] {
             let (base_url, server) = serve(vec![json!({"malformed": true})]);
             let mut test = plugin_test()?;
-            let source = format!(
-                concat!(
-                    "$env.TYPESAFE_API_KEY = 'local-key'; ",
-                    "[{{id: 1, message: 'hello'}}] | jev annotate ",
-                    "{{q: {{type: noul}}}} --on-error {policy} ",
-                    "--metrics --base-url '{base_url}'"
-                ),
+            let source = formatdoc! {r#"
+                $env.TYPESAFE_API_KEY = 'local-key'
+                (
+                    [{{id: 1, message: 'hello'}}]
+                    | jev annotate {{q: {{type: noul}}}}
+                        --on-error {policy}
+                        --metrics
+                        --base-url '{base_url}'
+                )
+            "#,
                 policy = policy,
                 base_url = base_url
-            );
+            };
             let result = test.eval(&source)?.into_value(Span::test_data())?;
             let wire = to_json(&result).unwrap();
             assert_eq!(wire[0]["id"], 1);
@@ -1345,14 +1516,20 @@ mod tests {
     fn accepts_single_and_empty_tables() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
         let single = test
-            .eval("{message: 'hello'} | jev annotate {q: {type: noul}} --dry-run")?
+            .eval(indoc! {r#"
+                {message: 'hello'}
+                | jev annotate {q: {type: noul}} --dry-run
+            "#})?
             .into_value(Span::test_data())?;
         assert_eq!(
             to_json(&single).unwrap()[0]["request"]["state"],
             json!({"message": "hello"})
         );
         let empty = test
-            .eval("[] | jev annotate {q: {type: noul}} --dry-run")?
+            .eval(indoc! {r#"
+                []
+                | jev annotate {q: {type: noul}} --dry-run
+            "#})?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&empty).unwrap(), json!([]));
         Ok(())
@@ -1363,10 +1540,17 @@ mod tests {
     fn dry_run_preserves_duplicate_rows_in_input_order() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
         let result = test
-            .eval(concat!(
-                "[{id: 1, message: 'same'} {id: 2, message: 'same'}] ",
-                "| jev annotate {q: {type: noul}} --fields [message] --dry-run"
-            ))?
+            .eval(indoc! {r#"
+                (
+                    [
+                        {id: 1, message: 'same'}
+                        {id: 2, message: 'same'}
+                    ]
+                    | jev annotate {q: {type: noul}}
+                        --fields [message]
+                        --dry-run
+                )
+            "#})?
             .into_value(Span::test_data())?;
         let wire = to_json(&result).unwrap();
         assert_eq!(wire.as_array().unwrap().len(), 2);
@@ -1380,44 +1564,65 @@ mod tests {
     fn selector_misses_and_collisions_do_not_issue_requests() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
         let missing = test
-            .eval(concat!(
-                "[{id: 1}] | jev annotate {q: {type: noul}} ",
-                "--state payload.text --on-error record --dry-run"
-            ))?
+            .eval(indoc! {r#"
+                (
+                    [{id: 1}]
+                    | jev annotate {q: {type: noul}}
+                        --state payload.text
+                        --on-error record
+                        --dry-run
+                )
+            "#})?
             .into_value(Span::test_data())?;
         assert_eq!(to_json(&missing).unwrap()[0]["jev_error"]["kind"], "state");
         for policy in ["keep", "record"] {
-            let collision = test.eval(&format!(
-                concat!(
-                    "[{{id: 1, message: 'hello', answers: 'existing'}}] ",
-                    "| jev annotate {{q: {{type: noul}}}} --fields [message] ",
-                    "--on-error {policy} --dry-run"
-                ),
+            let collision = test.eval(&formatdoc! {r#"
+                (
+                    [{{id: 1, message: 'hello', answers: 'existing'}}]
+                    | jev annotate {{q: {{type: noul}}}}
+                        --fields [message]
+                        --on-error {policy}
+                        --dry-run
+                )
+            "#,
                 policy = policy
-            ))?;
+            })?;
             assert!(collision.into_value(Span::test_data()).is_err());
         }
         let legacy = test
-            .eval(concat!(
-                "[{id: 1, message: 'hello', jev: 'existing'}] ",
-                "| jev annotate {q: {type: noul}} --fields [message] --dry-run"
-            ))?
+            .eval(indoc! {r#"
+                (
+                    [{id: 1, message: 'hello', jev: 'existing'}]
+                    | jev annotate {q: {type: noul}}
+                        --fields [message]
+                        --dry-run
+                )
+            "#})?
             .into_value(Span::test_data())?;
         assert_eq!(
             to_json(&legacy).unwrap()[0]["request"]["state"],
             json!({"message": "hello"})
         );
-        let meta_collision = test.eval(concat!(
-            "[{id: 1, message: 'hello', jev_meta: 'existing'}] ",
-            "| jev annotate {q: {type: noul}} --fields [message] ",
-            "--on-error keep --dry-run"
-        ))?;
+        let meta_collision = test.eval(indoc! {r#"
+            (
+                [{id: 1, message: 'hello', jev_meta: 'existing'}]
+                | jev annotate {q: {type: noul}}
+                    --fields [message]
+                    --on-error keep
+                    --dry-run
+            )
+        "#})?;
         assert!(meta_collision.into_value(Span::test_data()).is_err());
         let missing_field = test
-            .eval(concat!(
-                "[{id: 1}] | jev annotate {q: {type: noul}} ",
-                "--fields [message] --on-error record --dry-run"
-            ))?
+            .eval(indoc! {r#"
+                (
+                    [{id: 1}]
+                    | jev annotate {q: {type: noul}}
+                        --fields [message]
+                        --on-error record
+                        --dry-run
+                )
+            "#})?
             .into_value(Span::test_data())?;
         assert_eq!(
             to_json(&missing_field).unwrap()[0]["jev_error"]["kind"],
@@ -1496,8 +1701,13 @@ mod tests {
             dry_run: false,
         };
         let questions = crate::api::validate::parse_questions(
-            &crate::nu::value::from_json(json!({"q": {"type": "noul"}}), Span::test_data())
-                .unwrap(),
+            &crate::nu::value::from_json(
+                json!({
+                    "q": {"type": "noul"}
+                }),
+                Span::test_data(),
+            )
+            .unwrap(),
         )
         .unwrap();
         let builder = super::request_builder(&options, "jev-latest".into(), questions);

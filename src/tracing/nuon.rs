@@ -132,7 +132,10 @@ where
                             .get::<CapturedFields>()
                             .map(|fields| fields.0.clone())
                             .unwrap_or_default();
-                        json!({"name": span.name(), "fields": fields})
+                        json!({
+                            "name": span.name(),
+                            "fields": fields
+                        })
                     })
                     .collect()
             })

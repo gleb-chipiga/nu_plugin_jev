@@ -797,6 +797,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    use indoc::indoc;
     use nu_protocol::{Record, Value};
 
     use super::{
@@ -954,10 +955,10 @@ mod tests {
         let fixture = Fixture::new();
         let user_path = fixture.write(
             "user.nuon",
-            concat!(
-                "{api_key: 'user-secret', model: 'user-model', ",
-                "timeout_ms: 4000, cache: {max_entries: 9}}",
-            ),
+            indoc! {"
+                {api_key: 'user-secret', model: 'user-model', timeout_ms: 4000, cache: \
+                {max_entries: 9}}\
+            "},
         );
         let local_path = fixture.write(
             "local.nuon",
@@ -1297,11 +1298,10 @@ mod tests {
         let fixture = Fixture::new();
         let user_path = fixture.write(
             "models-user.nuon",
-            concat!(
-                "{api_key: 'user-key', base_url: 'https://user.example/', ",
-                "timeout_ms: 5000, model: 7, jobs: -1, ",
-                "cache: {max_entries: -1}}",
-            ),
+            indoc! {"
+                {api_key: 'user-key', base_url: 'https://user.example/', timeout_ms: 5000, \
+                model: 7, jobs: -1, cache: {max_entries: -1}}\
+            "},
         );
         let local_path = fixture.write(
             "models-local.nuon",

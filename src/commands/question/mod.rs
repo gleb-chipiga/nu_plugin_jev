@@ -142,6 +142,7 @@ pub(crate) fn build_score(
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use nu_plugin_test_support::PluginTest;
     use nu_protocol::{Record, ShellError, Span, Value};
     use serde_json::json;
@@ -186,7 +187,10 @@ mod tests {
         let question = build_choice(&instructions, &list).unwrap();
         assert_eq!(
             serde_json::to_value(question).unwrap()["criteria"],
-            json!({"normal": null, "spam": null})
+            json!({
+                "normal": null,
+                "spam": null
+            })
         );
         let duplicate =
             Value::test_list(vec![Value::test_string("spam"), Value::test_string("spam")]);
@@ -250,7 +254,10 @@ mod tests {
             .into_value(Span::test_data())?;
         assert_eq!(
             to_json(&choice).unwrap()["criteria"],
-            json!({"normal": null, "spam": null})
+            json!({
+                "normal": null,
+                "spam": null
+            })
         );
         let score = test
             .eval("jev question score 'urgency?' ['later' 'now']")?
@@ -270,7 +277,13 @@ mod tests {
             .eval("jev question noul {task: 'spam', weight: 2} --no null")?
             .into_value(Span::test_data())?;
         let noul = to_json(&noul).unwrap();
-        assert_eq!(noul["instructions"], json!({"task": "spam", "weight": 2}));
+        assert_eq!(
+            noul["instructions"],
+            json!({
+                "task": "spam",
+                "weight": 2
+            })
+        );
         assert_eq!(noul["criteria"], json!({"false": null}));
 
         let choice = test
@@ -278,7 +291,10 @@ mod tests {
             .into_value(Span::test_data())?;
         assert_eq!(
             to_json(&choice).unwrap()["criteria"],
-            json!({"normal": null, "phishing": {"risk": true}})
+            json!({
+                "normal": null,
+                "phishing": {"risk": true}
+            })
         );
 
         let score = test
@@ -286,7 +302,10 @@ mod tests {
             .into_value(Span::test_data())?;
         assert_eq!(
             to_json(&score).unwrap()["criteria"],
-            json!(["later", {"hours": 24}])
+            json!([
+                "later",
+                {"hours": 24}
+            ])
         );
         Ok(())
     }
@@ -301,9 +320,18 @@ mod tests {
             "jev question choice 'kind?' []",
             "jev question score 'urgency?' []",
             "jev question score 'urgency?' [null]",
-            "'ignored' | jev question noul 'spam?'",
-            "'ignored' | jev question choice 'kind?' [spam]",
-            "'ignored' | jev question score 'urgency?' ['low' 'high']",
+            indoc! {r#"
+                'ignored'
+                | jev question noul 'spam?'
+            "#},
+            indoc! {r#"
+                'ignored'
+                | jev question choice 'kind?' [spam]
+            "#},
+            indoc! {r#"
+                'ignored'
+                | jev question score 'urgency?' ['low' 'high']
+            "#},
         ] {
             let failed = match test.eval(source) {
                 Ok(value) => value.into_value(Span::test_data()).is_err(),

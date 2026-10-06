@@ -224,10 +224,32 @@ mod tests {
     #[test]
     fn questions_match_json_contract() {
         for fixture in [
-            json!({"type": "noul", "instructions": null, "criteria": {"true": null}}),
-            json!({"type": "noul", "criteria": null}),
-            json!({"type": "choice", "criteria": {"normal": null, "spam": {"tags": [1, true]}}}),
-            json!({"type": "score", "instructions": ["task"], "criteria": ["low", {"high": null}]}),
+            json!({
+                "type": "noul",
+                "instructions": null,
+                "criteria": {"true": null}
+            }),
+            json!({
+                "type": "noul",
+                "criteria": null
+            }),
+            json!({
+                "type": "choice",
+                "criteria": {
+                    "normal": null,
+                    "spam": {
+                        "tags": [1, true]
+                    }
+                }
+            }),
+            json!({
+                "type": "score",
+                "instructions": ["task"],
+                "criteria": [
+                    "low",
+                    {"high": null}
+                ]
+            }),
         ] {
             let question: Question = serde_json::from_value(fixture.clone()).unwrap();
             let actual = to_json(&question_to_nu(question, Span::test_data()).unwrap()).unwrap();
@@ -238,8 +260,18 @@ mod tests {
     /// Keeps previews equal to the exact typed request payload.
     #[test]
     fn request_matches_json_contract() {
-        let fixture = json!({"model": "jev-latest", "state": {"items": [1, null]},
-            "questions": {"q": {"type": "noul", "instructions": null}}});
+        let fixture = json!({
+            "model": "jev-latest",
+            "state": {
+                "items": [1, null]
+            },
+            "questions": {
+                "q": {
+                    "type": "noul",
+                    "instructions": null
+                }
+            }
+        });
         let request: SystemOneRequest = serde_json::from_value(fixture.clone()).unwrap();
         let actual = to_json(&request_to_nu(request, Span::test_data()).unwrap()).unwrap();
         assert_eq!(actual, fixture);
@@ -248,14 +280,41 @@ mod tests {
     /// Keeps all answer variants and usage equal to the validated API response.
     #[test]
     fn answers_and_usage_match_json_contract() {
-        let fixture = json!({"model": "jev-fixed", "answers": {
-            "n": {"type": "noul", "noul": 0.8},
-            "c": {"type": "choice", "choice": "spam", "confidence": 0.9,
-                "probabilities": {"spam": 0.9, "normal": 0.1}},
-            "s": {"type": "score", "score": 0.6, "confidence": 0.7,
-                "legend": {"0": {"name": "later"}, "1": ["now", null]},
-                "probabilities": {"0": 0.4, "1": 0.6}}
-        }, "usage": {"input_tokens": 12, "output_tokens": 3}});
+        let fixture = json!({
+            "model": "jev-fixed",
+            "answers": {
+                "n": {
+                    "type": "noul",
+                    "noul": 0.8
+                },
+                "c": {
+                    "type": "choice",
+                    "choice": "spam",
+                    "confidence": 0.9,
+                    "probabilities": {
+                        "spam": 0.9,
+                        "normal": 0.1
+                    }
+                },
+                "s": {
+                    "type": "score",
+                    "score": 0.6,
+                    "confidence": 0.7,
+                    "legend": {
+                        "0": {"name": "later"},
+                        "1": ["now", null]
+                    },
+                    "probabilities": {
+                        "0": 0.4,
+                        "1": 0.6
+                    }
+                }
+            },
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 3
+            }
+        });
         let response: SystemOneResponse = serde_json::from_value(fixture.clone()).unwrap();
         let answers =
             to_json(&answers_to_nu(&response.answers, Span::test_data()).unwrap()).unwrap();
@@ -267,8 +326,11 @@ mod tests {
     /// Rejects token counts that JSON can hold but Nushell cannot represent.
     #[test]
     fn usage_rejects_out_of_range_integer() {
-        let usage =
-            serde_json::from_value(json!({"input_tokens": u64::MAX, "output_tokens": 1})).unwrap();
+        let usage = serde_json::from_value(json!({
+            "input_tokens": u64::MAX,
+            "output_tokens": 1
+        }))
+        .unwrap();
         assert!(usage_to_nu(&usage, Span::test_data()).is_err());
         let nested: JsonValue = json!({"value": u64::MAX});
         assert!(super::from_json_ref(&nested, Span::test_data()).is_err());

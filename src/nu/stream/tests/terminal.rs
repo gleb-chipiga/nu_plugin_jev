@@ -50,6 +50,7 @@ struct TerminalOutput {
     retry_waits: mpsc::Receiver<(Instant, Duration)>,
     reads: Arc<AtomicUsize>,
     builds: Arc<AtomicUsize>,
+    resume_input: Option<mpsc::Sender<()>>,
     late: Option<LateInput>,
     server: Option<TestServer>,
     root: String,
@@ -58,8 +59,9 @@ struct TerminalOutput {
 impl TerminalOutput {
     /// Gates one failure while siblings reach active, retrying, and queued phases.
     fn new(unordered: bool, blocked_input: bool) -> Self {
-        // Rows 0..3 fill output. Rows 4..7 then occupy failure, retry, body, and
-        // capacity-wait phases; the two HTTP slots belong to the failure and held body.
+        // Rows 0..3 fill output. Admit the failure and retry before either held body:
+        // Tokio task scheduling does not preserve row order, so admitting all four
+        // siblings together can fill both slots before the retry ever reaches HTTP.
         let failure = ResponseGate::default();
         let body = ResponseGate::default();
         let held_failure = failure.clone();
@@ -138,6 +140,19 @@ impl TerminalOutput {
             });
             (Box::new(rows), None)
         };
+        let (resume_input, mut resumed) = mpsc::channel(1);
+        let mut rows = rows;
+        let mut sequence = 0;
+        let rows = std::iter::from_fn(move || {
+            let row = rows.next()?;
+            if sequence == JOBS || sequence == 6 {
+                // This iterator runs on the dedicated producer, never a Tokio worker.
+                // Dropping the fixture closes the channel and releases this test-only wait.
+                resumed.blocking_recv()?;
+            }
+            sequence += 1;
+            Some(row)
+        });
         let builds = Arc::new(AtomicUsize::new(0));
         let source_builds = Arc::clone(&builds);
         let runtime = runtime();
@@ -145,7 +160,7 @@ impl TerminalOutput {
         let output = start(
             Arc::clone(&runtime),
             settings,
-            rows,
+            Box::new(rows),
             Box::new(move |row| {
                 source_builds.fetch_add(1, Ordering::SeqCst);
                 build(row)
@@ -167,6 +182,7 @@ impl TerminalOutput {
             retry_waits,
             reads,
             builds,
+            resume_input: Some(resume_input),
             late,
             server: Some(server),
             root,
@@ -176,27 +192,38 @@ impl TerminalOutput {
     /// Confirms a full open output with all slots occupied before releasing the failure.
     async fn wait_saturated(&mut self) -> Instant {
         let evaluations = if self.late.is_some() { 7 } else { 2 * JOBS };
-        wait_for_admissions(&mut self.admissions, evaluations).await;
-        self.failure.wait_for_arrivals(1).await;
-        self.body.wait_for_arrivals(1).await;
-        let (due, delay) = tokio::time::timeout(WATCHDOG, self.retry_waits.recv())
-            .await
-            .expect("missing sibling retry pause")
-            .unwrap();
-        assert_eq!(delay, Duration::from_secs(2));
-        if let Some(late) = &mut self.late {
-            tokio::time::timeout(WATCHDOG, &mut late.entered)
-                .await
-                .expect("source did not enter its blocked next call")
-                .unwrap();
-        }
+        wait_for_admissions(&mut self.admissions, JOBS).await;
         tokio::time::timeout(WATCHDOG, async {
             while self.output.as_ref().unwrap().receiver.len() != JOBS {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("output did not fill before failure release");
+        .expect("fast prefix did not fill output before sibling admission");
+        assert_eq!(self.failure.arrivals(), 0);
+        self.resume_input.as_ref().unwrap().send(()).await.unwrap();
+        wait_for_admissions(&mut self.admissions, 2).await;
+        let (due, delay) = tokio::time::timeout(WATCHDOG, self.retry_waits.recv())
+            .await
+            .expect("missing sibling retry pause")
+            .unwrap();
+        assert_eq!(delay, Duration::from_secs(2));
+        assert_eq!(
+            self.body.arrivals(),
+            0,
+            "held bodies overtook the retry setup"
+        );
+        self.resume_input.take().unwrap().send(()).await.unwrap();
+        wait_for_admissions(&mut self.admissions, evaluations - 6).await;
+        self.failure.wait_for_arrivals(1).await;
+        self.body.wait_for_arrivals(1).await;
+        if let Some(late) = &mut self.late {
+            tokio::time::timeout(WATCHDOG, &mut late.entered)
+                .await
+                .expect("source did not enter its blocked next call")
+                .unwrap();
+        }
+        assert_eq!(self.output.as_ref().unwrap().receiver.len(), JOBS);
         assert_eq!(self.client.free_attempt_slots(), 0);
         assert_eq!(self.reads.load(Ordering::SeqCst), 2 * JOBS);
         assert_eq!(self.builds.load(Ordering::SeqCst), evaluations);
@@ -311,6 +338,7 @@ impl Drop for TerminalOutput {
         self.cancel.cancel();
         self.failure.release();
         self.body.release();
+        drop(self.resume_input.take());
         drop(self.late.take());
     }
 }
@@ -328,6 +356,30 @@ fn request_state(request: &CapturedRequest) -> String {
 async fn pass_retry_boundary(due: Instant) {
     tokio::time::sleep(due.saturating_duration_since(Instant::now())).await;
     tokio::task::yield_now().await;
+}
+
+/// Fixture teardown releases its source gate even before saturation setup completes.
+#[test]
+fn dropping_terminal_fixture_releases_the_staged_source() {
+    let mut fixture = TerminalOutput::new(false, true);
+    let runtime = Arc::clone(&fixture.runtime);
+    let retained = fixture.late.as_ref().unwrap().retained.clone();
+    runtime.block_on(async {
+        wait_for_admissions(&mut fixture.admissions, JOBS).await;
+        assert_eq!(fixture.failure.arrivals(), 0);
+        assert_eq!(fixture.body.arrivals(), 0);
+    });
+    // Failures before wait_saturated must release the producer's setup gate too.
+    drop(fixture);
+    runtime.block_on(async {
+        tokio::time::timeout(WATCHDOG, async {
+            while retained.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture drop retained the staged producer");
+    });
 }
 
 /// Active bodies, queued acquisition, and retry work are stopped before error delivery.

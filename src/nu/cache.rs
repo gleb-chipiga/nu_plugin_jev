@@ -196,8 +196,17 @@ mod tests {
     /// Builds a successful response with a distinguishable local identity.
     fn result() -> Arc<SharedResponse> {
         let response: SystemOneResponse = serde_json::from_value(json!({
-            "model": "jev-fixed", "answers": {"q": {"type": "noul", "noul": 0.5}},
-            "usage": {"input_tokens": 1, "output_tokens": 1}
+            "model": "jev-fixed",
+            "answers": {
+                "q": {
+                    "type": "noul",
+                    "noul": 0.5
+                }
+            },
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+            }
         }))
         .unwrap();
         let response_bytes = serde_json::to_vec(&response).unwrap().len();
@@ -230,23 +239,47 @@ mod tests {
     #[test]
     fn canonical_keys_include_complete_body_and_service_root() {
         let root = Url::parse("https://example.test/api/").unwrap();
-        let first = RequestKey::new(&root, &request(json!({"a": 1, "b": 2})));
-        let reordered = RequestKey::new(&root, &request(json!({"b": 2, "a": 1})));
+        let first = RequestKey::new(
+            &root,
+            &request(json!({
+                "a": 1,
+                "b": 2
+            })),
+        );
+        let reordered = RequestKey::new(
+            &root,
+            &request(json!({
+                "b": 2,
+                "a": 1
+            })),
+        );
         assert_eq!(first, reordered);
         assert_ne!(first, RequestKey::new(&root, &request(json!([1, 2]))));
         assert_ne!(
             first,
-            RequestKey::new(&root, &request(json!({"a": 1, "b": null})))
+            RequestKey::new(
+                &root,
+                &request(json!({
+                    "a": 1,
+                    "b": null
+                }))
+            )
         );
         assert_ne!(first, RequestKey::new(&root, &request(json!({"a": 1}))));
         assert_ne!(
             first,
             RequestKey::new(
                 &Url::parse("https://other.test/api/").unwrap(),
-                &request(json!({"a": 1, "b": 2}))
+                &request(json!({
+                    "a": 1,
+                    "b": 2
+                }))
             )
         );
-        let mut changed = request(json!({"a": 1, "b": 2}));
+        let mut changed = request(json!({
+            "a": 1,
+            "b": 2
+        }));
         changed.model = "jev-fixed".into();
         assert_ne!(first, RequestKey::new(&root, &changed));
         changed.model = "jev-latest".into();

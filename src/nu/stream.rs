@@ -771,8 +771,16 @@ mod tests {
     fn answer(input_tokens: u64) -> serde_json::Value {
         json!({
             "model": "jev-fixed",
-            "answers": {"q": {"type": "noul", "noul": 0.75}},
-            "usage": {"input_tokens": input_tokens, "output_tokens": 1}
+            "answers": {
+                "q": {
+                    "type": "noul",
+                    "noul": 0.75
+                }
+            },
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": 1
+            }
         })
     }
 

@@ -814,6 +814,7 @@ mod tests {
         time::{Duration, Instant as StdInstant, SystemTime},
     };
 
+    use indoc::formatdoc;
     use reqwest::{StatusCode, header::HeaderMap};
     use serde_json::json;
 
@@ -964,10 +965,22 @@ mod tests {
 
     /// Returns a catalog with two ordered entries and forward-compatible fields.
     pub(super) fn model_list() -> serde_json::Value {
-        json!({"models": [
-            {"name": "jev-latest", "description": "General", "release_date": "unknown", "extra": 1},
-            {"name": "jev-fixed", "description": "Pinned", "release_date": "2026-09-15"}
-        ], "extra": true})
+        json!({
+            "models": [
+                {
+                    "name": "jev-latest",
+                    "description": "General",
+                    "release_date": "unknown",
+                    "extra": 1
+                },
+                {
+                    "name": "jev-fixed",
+                    "description": "Pinned",
+                    "release_date": "2026-09-15"
+                }
+            ],
+            "extra": true
+        })
     }
 
     /// Builds one typed Noul request for transport tests.
@@ -987,8 +1000,19 @@ mod tests {
 
     /// Returns one complete valid typed answer envelope.
     pub(super) fn answer() -> serde_json::Value {
-        json!({"model": "jev-2026-09", "answers": {"spam": {"type": "noul", "noul": 0.9}},
-            "usage": {"input_tokens": 10, "output_tokens": 2}})
+        json!({
+            "model": "jev-2026-09",
+            "answers": {
+                "spam": {
+                    "type": "noul",
+                    "noul": 0.9
+                }
+            },
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2
+            }
+        })
     }
 
     /// Constructs a small response whose many questions trigger offloaded validation.
@@ -1006,7 +1030,13 @@ mod tests {
                         criteria: None,
                     },
                 );
-                (name, json!({"type": "noul", "noul": 0.5}))
+                (
+                    name,
+                    json!({
+                        "type": "noul",
+                        "noul": 0.5
+                    }),
+                )
             })
             .collect::<serde_json::Map<String, serde_json::Value>>();
         (
@@ -1014,7 +1044,10 @@ mod tests {
             json!({
                 "model": "jev-2026-09",
                 "answers": answers,
-                "usage": {"input_tokens": 10, "output_tokens": 65}
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 65
+                }
             }),
         )
     }
@@ -1184,7 +1217,13 @@ mod tests {
     #[test]
     fn counts_exact_compact_request_body_bytes() {
         let mut request = request();
-        request.state = json!({"thread": ["Привет", "quote: \"hello\"", {"nested": true}]});
+        request.state = json!({
+            "thread": [
+                "Привет",
+                "quote: \"hello\"",
+                {"nested": true}
+            ]
+        });
         Arc::make_mut(&mut request.questions).insert(
             "kind".into(),
             Question::Choice {
@@ -1212,7 +1251,13 @@ mod tests {
     fn counted_request_size_matches_submitted_body() {
         let (url, server) = serve(vec![MockResponse::json(200, answer())]);
         let mut request = request();
-        request.state = json!({"message": "Привет \"Jev\"", "nested": [1, {"ok": true}]});
+        request.state = json!({
+            "message": "Привет \"Jev\"",
+            "nested": [
+                1,
+                {"ok": true}
+            ]
+        });
         let measured = request_body_bytes(&request).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1449,7 +1494,15 @@ mod tests {
             (401, json!({"secret": "not-for-errors"})),
             (
                 200,
-                json!({"models": [{"name": "x", "description": 1, "release_date": "today"}]}),
+                json!({
+                    "models": [
+                        {
+                            "name": "x",
+                            "description": 1,
+                            "release_date": "today"
+                        }
+                    ]
+                }),
             ),
             (302, json!({})),
         ] {
@@ -2105,8 +2158,16 @@ mod tests {
         });
         assert_eq!(server.join().unwrap().len(), 1);
 
-        let missing = json!({"model": "jev-model", "answers": {"spam": {"type": "noul"}},
-            "usage": {"input_tokens": 1, "output_tokens": 1}});
+        let missing = json!({
+            "model": "jev-model",
+            "answers": {
+                "spam": {"type": "noul"}
+            },
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+            }
+        });
         let (url, server) = serve(vec![MockResponse::json(200, missing)]);
         runtime.block_on(async {
             let client = JevClient::new().unwrap();
@@ -2119,10 +2180,21 @@ mod tests {
         });
         assert_eq!(server.join().unwrap().len(), 1);
 
-        let wrong_answer = json!({"model": "jev-model", "answers": {
-            "spam": {"type": "choice", "choice": "x", "confidence": 0.8,
-                "probabilities": {"x": 0.8}}},
-            "usage": {"input_tokens": 1, "output_tokens": 1}});
+        let wrong_answer = json!({
+            "model": "jev-model",
+            "answers": {
+                "spam": {
+                    "type": "choice",
+                    "choice": "x",
+                    "confidence": 0.8,
+                    "probabilities": {"x": 0.8}
+                }
+            },
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+            }
+        });
         let (url, server) = serve(vec![MockResponse::json(200, wrong_answer)]);
         runtime.block_on(async {
             let client = JevClient::new().unwrap();
@@ -2600,13 +2672,14 @@ mod tests {
                     reader.read_exact(&mut body).await.unwrap();
                     let data = answer().to_string();
                     // Continuations remove source newlines but preserve HTTP's explicit CRLF.
-                    let response = indoc::formatdoc! {"
+                    let response = formatdoc! {"
                         HTTP/1.1 200 OK\r\n\
                         Content-Type: application/json\r\n\
                         Content-Length: {}\r\n\
                         Connection: close\r\n\
                         \r\n\
-                        {data}",
+                        {data}\
+                    ",
                         data.len(),
                         data = data
                     };

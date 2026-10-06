@@ -301,6 +301,8 @@ where
 mod tests {
     use std::process::{Command, Output};
 
+    #[cfg(feature = "nuon-tracing-format")]
+    use indoc::indoc;
     use tracing_subscriber::filter::LevelFilter;
 
     use super::{DiagnosticFormat, parse_filter, parse_format};
@@ -488,11 +490,19 @@ mod tests {
             .args([
                 "--no-config-file",
                 "--commands",
-                concat!(
-                    "use std/formats *; ",
-                    "{single: ($env.JEV_TEST_DIAGNOSTICS | lines | first | from nuon), ",
-                    "batch: ($env.JEV_TEST_DIAGNOSTICS | from ndnuon)} | to json --raw"
-                ),
+                indoc! {r#"
+                    use std/formats *
+                    {
+                        single: (
+                            $env.JEV_TEST_DIAGNOSTICS
+                            | lines
+                            | first
+                            | from nuon
+                        )
+                        batch: ($env.JEV_TEST_DIAGNOSTICS | from ndnuon)
+                    }
+                    | to json --raw
+                "#},
             ])
             .env("JEV_TEST_DIAGNOSTICS", diagnostics)
             .output()

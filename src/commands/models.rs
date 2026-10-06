@@ -1,5 +1,6 @@
 //! Lists the service's current model metadata as ordinary Nushell records.
 
+use indoc::indoc;
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{
     Example, LabeledError, PipelineData, Record, Signature, SyntaxShape, Type, Value,
@@ -61,20 +62,24 @@ impl PluginCommand for JevModels {
 
     /// Explains authentication, output, and the absence of implicit evaluation.
     fn extra_description(&self) -> &str {
-        concat!(
-            "Requires TYPESAFE_API_KEY or a private configured API key. ",
-            "Sends one authenticated GET /v1/models (plus configured retries), returning ",
-            "{models, meta: {base_url}}; --metrics adds HTTP measurements with ",
-            "request_bytes = 0. Model records preserve name, description, and ",
-            "release_date strings. Results are not cached and do not validate models used ",
-            "by jev ask or jev annotate."
-        )
+        indoc! {"
+            Requires TYPESAFE_API_KEY or a private configured API key. Sends one authenticated \
+            GET /v1/models (plus configured retries), returning {models, meta: {base_url}}; \
+            --metrics adds HTTP measurements with request_bytes = 0. Model records preserve \
+            name, description, and release_date strings. Results are not cached and do not \
+            validate models used by jev ask or jev annotate.\
+        "}
     }
 
     /// Shows native Nushell filtering of model metadata.
     fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
-            example: "jev models | get models | where name =~ '^jev' | select name release_date",
+            example: indoc! {r#"
+                jev models
+                | get models
+                | where name =~ '^jev'
+                | select name release_date
+            "#},
             description: "Inspect current Jev model names and release dates",
             result: None,
         }]
@@ -151,6 +156,7 @@ impl PluginCommand for JevModels {
 
 #[cfg(test)]
 mod tests {
+    use indoc::{formatdoc, indoc};
     use nu_plugin_test_support::PluginTest;
     use nu_protocol::{ListStream, PipelineData, ShellError, Signals, Span, Value};
     use serde_json::json;
@@ -179,21 +185,42 @@ mod tests {
     #[test]
     fn lists_typed_models_and_empty_results() -> Result<(), Box<ShellError>> {
         let (url, server) = serve(vec![
-            json!({"models": [
-                {"name": "jev-latest", "description": "General", "release_date": "unknown"},
-                {"name": "jev-fixed", "description": "Pinned", "release_date": "2026-09-15"}
-            ]}),
+            json!({
+                "models": [
+                    {
+                        "name": "jev-latest",
+                        "description": "General",
+                        "release_date": "unknown"
+                    },
+                    {
+                        "name": "jev-fixed",
+                        "description": "Pinned",
+                        "release_date": "2026-09-15"
+                    }
+                ]
+            }),
             json!({"models": []}),
         ]);
         let mut test = plugin_test()?;
-        let command = format!("$env.TYPESAFE_API_KEY = 'test-key'; jev models --base-url '{url}'");
+        let command = formatdoc! {r#"
+            $env.TYPESAFE_API_KEY = 'test-key'
+            jev models --base-url '{url}'
+        "#};
         let first = test.eval(&command)?.into_value(Span::test_data())?;
         assert_eq!(
             to_json(&first).unwrap(),
             json!({
                 "models": [
-                    {"name": "jev-latest", "description": "General", "release_date": "unknown"},
-                    {"name": "jev-fixed", "description": "Pinned", "release_date": "2026-09-15"}
+                    {
+                        "name": "jev-latest",
+                        "description": "General",
+                        "release_date": "unknown"
+                    },
+                    {
+                        "name": "jev-fixed",
+                        "description": "Pinned",
+                        "release_date": "2026-09-15"
+                    }
                 ],
                 "meta": {"base_url": format!("{url}/")}
             })
@@ -201,7 +228,10 @@ mod tests {
         let second = test.eval(&command)?.into_value(Span::test_data())?;
         assert_eq!(
             to_json(&second).unwrap(),
-            json!({"models": [], "meta": {"base_url": format!("{url}/")}})
+            json!({
+                "models": [],
+                "meta": {"base_url": format!("{url}/")}
+            })
         );
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 2);
@@ -220,9 +250,10 @@ mod tests {
         let (url, server) = serve(vec![response]);
         let mut test = plugin_test()?;
         let value = test
-            .eval(&format!(
-                "$env.TYPESAFE_API_KEY = 'local-key'; jev models --base-url '{url}' --metrics"
-            ))?
+            .eval(&formatdoc! {r#"
+                $env.TYPESAFE_API_KEY = 'local-key'
+                jev models --base-url '{url}' --metrics
+            "#})?
             .into_value(Span::test_data())?;
         let Value::Record { val, .. } = &value else {
             panic!("model listing is a record");
@@ -264,20 +295,29 @@ mod tests {
     #[test]
     fn requires_key_but_not_evaluation_settings() -> Result<(), Box<ShellError>> {
         let mut test = plugin_test()?;
-        assert!(test.eval("$env.TYPESAFE_API_KEY = ''; jev models").is_err());
-        let (url, server) = serve(vec![json!({"models": []})]);
-        let command = format!(
-            concat!(
-                "$env.TYPESAFE_API_KEY = 'test'; $env.NU_PLUGIN_JEV_MODEL = 7; ",
-                "$env.NU_PLUGIN_JEV_JOBS = 'bad'; ",
-                "$env.config.plugins.jev = {{cache: 1}}; ",
-                "jev models --base-url '{url}'"
-            ),
-            url = url
+        assert!(
+            test.eval(indoc! {r#"
+                $env.TYPESAFE_API_KEY = ''
+                jev models
+            "#})
+                .is_err()
         );
+        let (url, server) = serve(vec![json!({"models": []})]);
+        let command = formatdoc! {r#"
+            $env.TYPESAFE_API_KEY = 'test'
+            $env.NU_PLUGIN_JEV_MODEL = 7
+            $env.NU_PLUGIN_JEV_JOBS = 'bad'
+            $env.config.plugins.jev = {{cache: 1}}
+            jev models --base-url '{url}'
+        "#,
+            url = url
+        };
         assert_eq!(
             to_json(&test.eval(&command)?.into_value(Span::test_data())?).unwrap(),
-            json!({"models": [], "meta": {"base_url": format!("{url}/")}})
+            json!({
+                "models": [],
+                "meta": {"base_url": format!("{url}/")}
+            })
         );
         assert_eq!(server.join().unwrap().len(), 1);
         Ok(())
@@ -296,7 +336,13 @@ mod tests {
             test.eval_with("jev models", PipelineData::list_stream(stream, None))
                 .is_err()
         );
-        assert!(test.eval("'state' | jev models").is_err());
+        assert!(
+            test.eval(indoc! {r#"
+                'state'
+                | jev models
+            "#})
+                .is_err()
+        );
         Ok(())
     }
 }

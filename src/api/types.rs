@@ -184,11 +184,22 @@ mod tests {
     /// Accepts extra fields but requires three string fields in every entry.
     #[test]
     fn parses_model_metadata_contract() {
-        let list: ModelMetadataList = serde_json::from_value(json!({"models": [
-            {"name": "jev-latest", "description": "General", "release_date": "unknown",
-                "new_field": 1},
-            {"name": "jev-fixed", "description": "Pinned", "release_date": "2026-09-15"}
-        ], "extra": true}))
+        let list: ModelMetadataList = serde_json::from_value(json!({
+            "models": [
+                {
+                    "name": "jev-latest",
+                    "description": "General",
+                    "release_date": "unknown",
+                    "new_field": 1
+                },
+                {
+                    "name": "jev-fixed",
+                    "description": "Pinned",
+                    "release_date": "2026-09-15"
+                }
+            ],
+            "extra": true
+        }))
         .unwrap();
         assert_eq!(list.models.len(), 2);
         assert_eq!(list.models[0].release_date, "unknown");
@@ -196,8 +207,23 @@ mod tests {
         for invalid in [
             json!({}),
             json!({"models": {}}),
-            json!({"models": [{"name": "jev", "description": "General"}]}),
-            json!({"models": [{"name": "jev", "description": 1, "release_date": "today"}]}),
+            json!({
+                "models": [
+                    {
+                        "name": "jev",
+                        "description": "General"
+                    }
+                ]
+            }),
+            json!({
+                "models": [
+                    {
+                        "name": "jev",
+                        "description": 1,
+                        "release_date": "today"
+                    }
+                ]
+            }),
         ] {
             assert!(serde_json::from_value::<ModelMetadataList>(invalid).is_err());
         }
@@ -209,14 +235,41 @@ mod tests {
         let wire = json!({
             "model": "jev-latest",
             "answers": {
-                "spam": {"type": "noul", "noul": 0.982},
-                "kind": {"type": "choice", "choice": "spam", "confidence": 0.91,
-                    "probabilities": {"normal": 0.09, "spam": 0.91}},
-                "urgency": {"type": "score", "score": 2.4, "confidence": 0.81,
-                    "legend": {"0": "none", "1": "later", "2": "today", "3": "now"},
-                    "probabilities": {"0": 0.0, "1": 0.1, "2": 0.4, "3": 0.5}}
+                "spam": {
+                    "type": "noul",
+                    "noul": 0.982
+                },
+                "kind": {
+                    "type": "choice",
+                    "choice": "spam",
+                    "confidence": 0.91,
+                    "probabilities": {
+                        "normal": 0.09,
+                        "spam": 0.91
+                    }
+                },
+                "urgency": {
+                    "type": "score",
+                    "score": 2.4,
+                    "confidence": 0.81,
+                    "legend": {
+                        "0": "none",
+                        "1": "later",
+                        "2": "today",
+                        "3": "now"
+                    },
+                    "probabilities": {
+                        "0": 0.0,
+                        "1": 0.1,
+                        "2": 0.4,
+                        "3": 0.5
+                    }
+                }
             },
-            "usage": {"input_tokens": 731, "output_tokens": 18}
+            "usage": {
+                "input_tokens": 731,
+                "output_tokens": 18
+            }
         });
         let response: SystemOneResponse = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(response).unwrap(), wire);
@@ -230,13 +283,40 @@ mod tests {
             "model": "jev-latest",
             "questions": {
                 "missing": {"type": "noul"},
-                "nulls": {"type": "noul", "instructions": null, "criteria": null},
-                "one_sided": {"type": "noul", "criteria": {"true": null}},
-                "two_sided": {"type": "noul", "criteria": {
-                    "true": {"weight": 2}, "false": ["ordinary", false]}},
-                "choice": {"type": "choice", "instructions": ["sort", {"priority": 1}],
-                    "criteria": {"yes": null, "no": {"reason": false}}},
-                "score": {"type": "score", "criteria": ["low", {"weight": 2}]}
+                "nulls": {
+                    "type": "noul",
+                    "instructions": null,
+                    "criteria": null
+                },
+                "one_sided": {
+                    "type": "noul",
+                    "criteria": {"true": null}
+                },
+                "two_sided": {
+                    "type": "noul",
+                    "criteria": {
+                        "true": {"weight": 2},
+                        "false": ["ordinary", false]
+                    }
+                },
+                "choice": {
+                    "type": "choice",
+                    "instructions": [
+                        "sort",
+                        {"priority": 1}
+                    ],
+                    "criteria": {
+                        "yes": null,
+                        "no": {"reason": false}
+                    }
+                },
+                "score": {
+                    "type": "score",
+                    "criteria": [
+                        "low",
+                        {"weight": 2}
+                    ]
+                }
             }
         });
         let request: SystemOneRequest = serde_json::from_value(wire.clone()).unwrap();
@@ -249,7 +329,10 @@ mod tests {
     fn rejects_unknown_noul_criteria_fields() {
         let invalid = json!({
             "type": "noul",
-            "criteria": {"true": "spam", "other": "not in schema"}
+            "criteria": {
+                "true": "spam",
+                "other": "not in schema"
+            }
         });
         assert!(serde_json::from_value::<super::Question>(invalid).is_err());
     }

@@ -203,9 +203,13 @@ mod tests {
         record.push("size", Value::test_filesize(4096));
         assert_eq!(
             to_json(&Value::test_record(record)).unwrap(),
-            json!({"text": "{\"not\": \"parsed\"}", "items": [i64::MIN, null],
-                "date": "2026-09-15T12:30:00+02:00", "duration": "-1500000000ns",
-                "size": 4096})
+            json!({
+                "text": "{\"not\": \"parsed\"}",
+                "items": [i64::MIN, null],
+                "date": "2026-09-15T12:30:00+02:00",
+                "duration": "-1500000000ns",
+                "size": 4096
+            })
         );
     }
 

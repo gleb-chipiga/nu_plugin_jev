@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use indoc::indoc;
 use nu_protocol::LabeledError;
 use tokio::sync::Semaphore;
 
@@ -128,10 +129,10 @@ impl HttpAttemptLimit {
 
     /// Describes valid input without echoing environment contents.
     fn invalid() -> JevError {
-        JevError::Validation(concat!(
-            "NU_PLUGIN_JEV_MAX_IN_FLIGHT must be a positive base-10 integer ",
-            "within the supported HTTP attempt capacity"
-        ))
+        JevError::Validation(indoc! {"
+            NU_PLUGIN_JEV_MAX_IN_FLIGHT must be a positive base-10 integer within the \
+            supported HTTP attempt capacity\
+        "})
     }
 }
 

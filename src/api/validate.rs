@@ -243,10 +243,24 @@ mod tests {
     #[test]
     fn validates_raw_questions_without_constructor_maxima() {
         let questions = parse_questions(&nu(json!({
-            "n": {"type": "noul", "instructions": null, "criteria": {"true": {"weight": 2}}},
-            "c": {"type": "choice", "criteria": {"a": null, "b": ["text", 2]}},
-            "s": {"type": "score", "criteria":
-                (0..11).map(|n| json!({"level": n})).collect::<Vec<_>>()}
+            "n": {
+                "type": "noul",
+                "instructions": null,
+                "criteria": {
+                    "true": {"weight": 2}
+                }
+            },
+            "c": {
+                "type": "choice",
+                "criteria": {
+                    "a": null,
+                    "b": ["text", 2]
+                }
+            },
+            "s": {
+                "type": "score",
+                "criteria": (0..11).map(|n| json!({"level": n})).collect::<Vec<_>>()
+            }
         })))
         .unwrap();
         assert_eq!(questions.len(), 3);
@@ -257,13 +271,50 @@ mod tests {
     fn rejects_invalid_raw_questions() {
         for fixture in [
             json!({}),
-            json!({"q": {"type": "noul", "instructions": 2}}),
-            json!({"q": {"type": "noul", "instrucitons": "typo"}}),
-            json!({"q": {"type": "choice", "criteria": {"x": null}, "instrucitons": "typo"}}),
-            json!({"q": {"type": "score", "criteria": ["low"], "instrucitons": "typo"}}),
-            json!({"q": {"type": "choice", "criteria": {"x": true}}}),
-            json!({"q": {"type": "score", "criteria": []}}),
-            json!({"q": {"type": "score", "criteria": [null]}}),
+            json!({
+                "q": {
+                    "type": "noul",
+                    "instructions": 2
+                }
+            }),
+            json!({
+                "q": {
+                    "type": "noul",
+                    "instrucitons": "typo"
+                }
+            }),
+            json!({
+                "q": {
+                    "type": "choice",
+                    "criteria": {"x": null},
+                    "instrucitons": "typo"
+                }
+            }),
+            json!({
+                "q": {
+                    "type": "score",
+                    "criteria": ["low"],
+                    "instrucitons": "typo"
+                }
+            }),
+            json!({
+                "q": {
+                    "type": "choice",
+                    "criteria": {"x": true}
+                }
+            }),
+            json!({
+                "q": {
+                    "type": "score",
+                    "criteria": []
+                }
+            }),
+            json!({
+                "q": {
+                    "type": "score",
+                    "criteria": [null]
+                }
+            }),
         ] {
             assert!(parse_questions(&nu(fixture)).is_err());
         }
@@ -317,30 +368,96 @@ mod tests {
     fn rejects_invalid_responses() {
         let questions = parse_questions(&nu(json!({
             "n": {"type": "noul"},
-            "c": {"type": "choice", "criteria": {"a": null}},
-            "s": {"type": "score", "criteria": ["low", "high"]}
+            "c": {
+                "type": "choice",
+                "criteria": {"a": null}
+            },
+            "s": {
+                "type": "score",
+                "criteria": ["low", "high"]
+            }
         })))
         .unwrap();
-        let valid = json!({"model": "jev-latest", "usage": {"input_tokens": 1, "output_tokens": 2},
-        "answers": {
-            "n": {"type": "noul", "noul": 0.5},
-            "c": {"type": "choice", "choice": "a", "confidence": 0.8,
-                "probabilities": {"a": 0.8}},
-            "s": {"type": "score", "score": 0.5, "confidence": 0.7,
-                "legend": {"0": "low", "1": "high"},
-                "probabilities": {"0": 0.5, "1": 0.5}}
-        }});
+        let valid = json!({
+            "model": "jev-latest",
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 2
+            },
+            "answers": {
+                "n": {
+                    "type": "noul",
+                    "noul": 0.5
+                },
+                "c": {
+                    "type": "choice",
+                    "choice": "a",
+                    "confidence": 0.8,
+                    "probabilities": {"a": 0.8}
+                },
+                "s": {
+                    "type": "score",
+                    "score": 0.5,
+                    "confidence": 0.7,
+                    "legend": {
+                        "0": "low",
+                        "1": "high"
+                    },
+                    "probabilities": {
+                        "0": 0.5,
+                        "1": 0.5
+                    }
+                }
+            }
+        });
         let response: SystemOneResponse = serde_json::from_value(valid.clone()).unwrap();
         validate_response(&response, &questions).unwrap();
         for bad in [
-            json!({"answers": {"n": null}}),
-            json!({"answers": {"n": {"type": "choice", "choice": "a", "confidence": 0.8,
-                "probabilities": {"a": 0.8}}}}),
-            json!({"answers": {"n": {"type": "noul", "noul": 1.2}}}),
-            json!({"answers": {"c": {"type": "choice", "choice": "other", "confidence": 0.8,
-                "probabilities": {"other": 0.8}}}}),
-            json!({"answers": {"s": {"type": "score", "score": 2.0, "confidence": 0.7,
-                "legend": {"0": "low", "1": "high"}, "probabilities": {"0": 0.5}}}}),
+            json!({
+                "answers": {"n": null}
+            }),
+            json!({
+                "answers": {
+                    "n": {
+                        "type": "choice",
+                        "choice": "a",
+                        "confidence": 0.8,
+                        "probabilities": {"a": 0.8}
+                    }
+                }
+            }),
+            json!({
+                "answers": {
+                    "n": {
+                        "type": "noul",
+                        "noul": 1.2
+                    }
+                }
+            }),
+            json!({
+                "answers": {
+                    "c": {
+                        "type": "choice",
+                        "choice": "other",
+                        "confidence": 0.8,
+                        "probabilities": {"other": 0.8}
+                    }
+                }
+            }),
+            json!({
+                "answers": {
+                    "s": {
+                        "type": "score",
+                        "score": 2.0,
+                        "confidence": 0.7,
+                        "legend": {
+                            "0": "low",
+                            "1": "high"
+                        },
+                        "probabilities": {"0": 0.5}
+                    }
+                }
+            }),
         ] {
             let mut modified = valid.clone();
             for (key, replacement) in bad["answers"].as_object().unwrap() {

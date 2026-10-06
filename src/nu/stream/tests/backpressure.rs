@@ -42,6 +42,7 @@ struct FullOutput {
     admissions: mpsc::UnboundedReceiver<()>,
     retry_waits: mpsc::Receiver<(std::time::Instant, Duration)>,
     reads: Arc<AtomicUsize>,
+    resume_input: Option<mpsc::Sender<()>>,
     server: Option<TestServer>,
     root: String,
 }
@@ -89,9 +90,18 @@ impl FullOutput {
         settings.observer = Some(observed);
         let reads = Arc::new(AtomicUsize::new(0));
         let source_reads = Arc::clone(&reads);
-        let rows = (0..10_000).map(move |index| {
+        let (resume_input, mut resumed) = mpsc::channel(1);
+        let mut indices = 0..10_000;
+        let rows = std::iter::from_fn(move || {
+            let index = indices.next()?;
             source_reads.fetch_add(1, Ordering::SeqCst);
-            Value::test_string(format!("row-{index}"))
+            if index == JOBS || index == 2 * JOBS - 1 {
+                // Only the dedicated source thread blocks. Stage held bodies after the
+                // fast prefix, then the capacity waiter after both body slots are occupied.
+                // Task spawn order alone cannot establish either HTTP admission boundary.
+                resumed.blocking_recv()?;
+            }
+            Some(Value::test_string(format!("row-{index}")))
         });
         let runtime = runtime();
         let (cancel, signal) = CancelHandle::new();
@@ -114,6 +124,7 @@ impl FullOutput {
             admissions,
             retry_waits,
             reads,
+            resume_input: Some(resume_input),
             server: Some(server),
             root,
         }
@@ -121,9 +132,7 @@ impl FullOutput {
 
     /// Confirms output is full and every process slot belongs to a held annotation body.
     async fn wait_saturated(&mut self) {
-        wait_for_admissions(&mut self.admissions, 2 * JOBS).await;
-        self.gates[0].wait_for_arrivals(1).await;
-        self.gates[1].wait_for_arrivals(1).await;
+        wait_for_admissions(&mut self.admissions, JOBS).await;
         tokio::time::timeout(WATCHDOG, async {
             while self.output.as_ref().unwrap().receiver.len() != JOBS {
                 tokio::task::yield_now().await;
@@ -131,6 +140,13 @@ impl FullOutput {
         })
         .await
         .expect("annotation did not fill its output");
+        assert!(self.gates.iter().all(|gate| gate.arrivals() == 0));
+        self.resume_input.as_ref().unwrap().send(()).await.unwrap();
+        wait_for_admissions(&mut self.admissions, CAPACITY).await;
+        self.gates[0].wait_for_arrivals(1).await;
+        self.gates[1].wait_for_arrivals(1).await;
+        self.resume_input.take().unwrap().send(()).await.unwrap();
+        wait_for_admissions(&mut self.admissions, 1).await;
         // A spare slot would let the neighbor pass even with stalled HTTP futures.
         // Prove saturation first so its later progress requires A to release capacity.
         assert_eq!(self.client.free_attempt_slots(), 0);
@@ -214,6 +230,8 @@ impl Drop for FullOutput {
     fn drop(&mut self) {
         self.cancel.cancel();
         self.gates.iter().for_each(ResponseGate::release);
+        // Closing a partially completed setup unblocks its dedicated input thread too.
+        drop(self.resume_input.take());
     }
 }
 

@@ -1,5 +1,6 @@
 //! Provides offline namespace guidance through the SDK's materialized-value adapter.
 
+use indoc::indoc;
 use nu_plugin::{EngineInterface, EvaluatedCall, SimplePluginCommand};
 use nu_protocol::{LabeledError, Signature, Type, Value};
 
@@ -28,23 +29,21 @@ impl SimplePluginCommand for Jev {
 
     /// Explains the main command workflows in Nu help.
     fn extra_description(&self) -> &str {
-        concat!(
-            "This guidance command accepts no pipeline input. ",
-            "Build questions with `jev question`, evaluate one state with `jev ask`, ",
-            "annotate rows with `jev annotate`, or list current models with `jev models`; ",
-            "use native Nu commands for filtering and sorting. Invocation settings resolve ",
-            "per call from flags, Nu config, caller environment, local NUON, user NUON, ",
-            "then defaults. ",
-            "Use --config or NU_PLUGIN_JEV_CONFIG to select a local file. ",
-            "Concurrent calls share a startup-only HTTP attempt limit: ",
-            "NU_PLUGIN_JEV_MAX_IN_FLIGHT, local NUON max_in_flight, user NUON, then 128. ",
-            "Startup local selection uses process NU_PLUGIN_JEV_CONFIG or startup Nu PWD; ",
-            "restart to change the limit. Later caller settings cannot resize it. ",
-            "This does not change the annotation --jobs default of 16. ",
-            "Automatic proxy discovery is captured at plugin startup; restart with ",
-            "`plugin stop jev` after ordinary proxy changes. Explicit HTTP/SOCKS5h proxies ",
-            "ignore global NO_PROXY and never fall back to direct routing."
-        )
+        indoc! {"
+            This guidance command accepts no pipeline input. Build questions with `jev \
+            question`, evaluate one state with `jev ask`, annotate rows with `jev annotate`, \
+            or list current models with `jev models`; use native Nu commands for filtering and \
+            sorting. Invocation settings resolve per call from flags, Nu config, caller \
+            environment, local NUON, user NUON, then defaults. Use --config or \
+            NU_PLUGIN_JEV_CONFIG to select a local file. Concurrent calls share a startup-only \
+            HTTP attempt limit: NU_PLUGIN_JEV_MAX_IN_FLIGHT, local NUON max_in_flight, user \
+            NUON, then 128. Startup local selection uses process NU_PLUGIN_JEV_CONFIG or \
+            startup Nu PWD; restart to change the limit. Later caller settings cannot resize \
+            it. This does not change the annotation --jobs default of 16. Automatic proxy \
+            discovery is captured at plugin startup; restart with `plugin stop jev` after \
+            ordinary proxy changes. Explicit HTTP/SOCKS5h proxies ignore global NO_PROXY and \
+            never fall back to direct routing.\
+        "}
     }
 
     /// Returns usage guidance without reading credentials or sending HTTP.
@@ -62,11 +61,11 @@ impl SimplePluginCommand for Jev {
                 .with_label("invoke jev without an input state", call.head));
         }
         Ok(Value::string(
-            concat!(
-                "Use `jev ask` for one state, `jev question` to build questions, ",
-                "`jev annotate` for tables, or `jev models` to list current models. ",
-                "Filter and sort with native Nu commands. See `help jev`."
-            ),
+            indoc! {"
+                Use `jev ask` for one state, `jev question` to build questions, `jev annotate` \
+                for tables, or `jev models` to list current models. Filter and sort with \
+                native Nu commands. See `help jev`.\
+            "},
             call.head,
         ))
     }

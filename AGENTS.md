@@ -1,16 +1,33 @@
 ## General coding rules
+
 - All modules, public types, and functions must have docstrings (Rust `///`).
 - Docstring style: brief but precise; 1-3 lines describing what the module/type/function does, key guarantees, and expected side effects.
 - Prefer stack types and minimize allocations (use heap only when necessary).
 - Comments and docstrings must be in English only (requirement for code).
 - Keep every Rust source line, including tests and comments, at most 100 characters long.
-  Split long single-line string literals with `concat!`, preserving their exact contents.
-- Use `indoc!` for multiline text blocks and `formatdoc!` for interpolated blocks.
+- Keep short single-line text and expressions as ordinary string literals;
+  use `format!` for interpolation. Do not turn them into artificial text blocks.
+  Use `indoc!` for multiline text blocks, long prose, and multiline Nu examples,
+  including long source blocks whose resulting text is one line;
+  use `formatdoc!` for interpolated blocks.
+  Import only the needed `indoc` macros in the module where they are used;
+  call `indoc!` and `formatdoc!` without the `indoc::` path prefix.
+  Reserve `concat!` for compile-time composition with macros such as `env!`, not
+  for splitting a literal text into fragments to satisfy the source line limit.
   Prefer indented raw strings and actual line breaks for Nu scripts; wrap long
   Nu expressions instead of joining lines with Rust continuation escapes.
+  Put text-block content on dedicated lines. Combine the opening quote with the
+  macro's opening brace, and the closing quote with its closing brace when no
+  formatting arguments intervene. Format embedded Nu pipelines, records, and
+  closures as Nu code.
+  For text that must remain one line, use continuation escapes inside `indoc!`,
+  including after the final content line to avoid adding a trailing newline.
   Do not add blank lines merely to preserve insignificant opening newlines.
   Preserve meaningful whitespace and exact protocol separators; keep explicit
   `\r\n` and continuation escapes when needed for HTTP wire text.
+- Format `json!` objects with multiple fields or nested structures using one field
+  per line and explicit nesting indentation. Put array objects on separate lines;
+  keep scalars, empty containers, and short simple values compact.
 - In the tokio runtime, avoid blocking or potentially blocking calls (if needed, move to a dedicated thread or `tokio::task::spawn_blocking`).
 - Configure `tracing` with a non-blocking subscriber/writer; do not use a blocking default logger for runtime I/O paths.
 - Keep tracing initialization in a dedicated module rather than in `main.rs`.

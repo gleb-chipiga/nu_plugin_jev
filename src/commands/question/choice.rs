@@ -1,5 +1,6 @@
 //! Exposes the offline Choice question constructor to Nushell.
 
+use indoc::indoc;
 use nu_plugin::{EngineInterface, EvaluatedCall, SimplePluginCommand};
 use nu_protocol::{Example, LabeledError, Signature, SyntaxShape, Type, Value};
 
@@ -33,11 +34,11 @@ impl SimplePluginCommand for JevQuestionChoice {
 
     /// Explains shorthand and limits in Nu help.
     fn extra_description(&self) -> &str {
-        concat!(
-            "A list of 1 to 255 distinct strings becomes option names with null descriptions. ",
-            "A record supplies explicit descriptions. No HTTP request is made and pipeline ",
-            "input is not accepted."
-        )
+        indoc! {"
+            A list of 1 to 255 distinct strings becomes option names with null descriptions. A \
+            record supplies explicit descriptions. No HTTP request is made and pipeline input \
+            is not accepted.\
+        "}
     }
 
     /// Shows an offline list-shorthand example.

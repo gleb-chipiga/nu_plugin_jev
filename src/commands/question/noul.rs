@@ -1,5 +1,6 @@
 //! Exposes the offline Noul question constructor to Nushell.
 
+use indoc::indoc;
 use nu_plugin::{EngineInterface, EvaluatedCall, SimplePluginCommand};
 use nu_protocol::{Example, LabeledError, Signature, SyntaxShape, Type, Value};
 
@@ -48,10 +49,10 @@ impl SimplePluginCommand for JevQuestionNoul {
 
     /// Clarifies optional-field behavior in Nu help.
     fn extra_description(&self) -> &str {
-        concat!(
-            "No network request is made and pipeline input is not accepted. ",
-            "Missing --yes/--no fields are omitted; an explicitly supplied null remains null."
-        )
+        indoc! {"
+            No network request is made and pipeline input is not accepted. Missing --yes/--no \
+            fields are omitted; an explicitly supplied null remains null.\
+        "}
     }
 
     /// Shows an offline policy-building example.

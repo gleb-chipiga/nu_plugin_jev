@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use indoc::indoc;
 use serde_json::{Value, json};
 
 use super::h2_fixture::{self, CapturedRequest, Response, ResponseGate};
@@ -135,9 +136,15 @@ fn reply(request: &CapturedRequest) -> Response {
     if request.path.ends_with("/models") {
         return Response::json(
             200,
-            json!({"models": [{
-                "name": "jev-test", "description": "Fixture", "release_date": "2026-09-15",
-            }]}),
+            json!({
+                "models": [
+                    {
+                        "name": "jev-test",
+                        "description": "Fixture",
+                        "release_date": "2026-09-15",
+                    }
+                ]
+            }),
         );
     }
     let wire: Value = serde_json::from_slice(&request.body).unwrap();
@@ -145,13 +152,25 @@ fn reply(request: &CapturedRequest) -> Response {
         .as_object()
         .unwrap()
         .keys()
-        .map(|name| (name.clone(), json!({"type": "noul", "noul": 0.75})))
+        .map(|name| {
+            (
+                name.clone(),
+                json!({
+                    "type": "noul",
+                    "noul": 0.75
+                }),
+            )
+        })
         .collect::<serde_json::Map<_, _>>();
     Response::json(
         200,
         json!({
-            "model": wire["model"], "answers": answers,
-            "usage": {"input_tokens": 10, "output_tokens": 1},
+            "model": wire["model"],
+            "answers": answers,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 1
+            },
         }),
     )
 }
@@ -167,12 +186,19 @@ fn parallel_single_row_annotations_really_overlap() {
     });
     // collect inside each par-each branch drives its lazy annotation to completion.
     // Returning unconsumed streams would not prove that the commands execute concurrently.
-    let source = concat!(
-        "let q = {q: (jev question noul 'Question?')}; ",
-        "[0 1] | par-each --threads 2 { |id| ",
-        "[{id: $id}] | jev annotate $q --jobs 1 --metrics | collect ",
-        "} | flatten | sort-by id | to json --raw"
-    );
+    let source = indoc! {r#"
+        let q = {q: (jev question noul 'Question?')}
+
+        [0 1]
+        | par-each --threads 2 { |id|
+            [{id: $id}]
+            | jev annotate $q --jobs 1 --metrics
+            | collect
+        }
+        | flatten
+        | sort-by id
+        | to json --raw
+    "#};
     let rows = NuProcess::start(source, 2, &[("NU_PLUGIN_JEV_BASE_URL", &root)]).json();
     assert_eq!(rows.as_array().unwrap().len(), 2);
     for id in 0..2 {
@@ -192,11 +218,16 @@ fn parallel_ask_calls_really_overlap() {
         gate.rendezvous(2);
         reply(request)
     });
-    let source = concat!(
-        "let q = {q: (jev question noul 'Question?')}; ",
-        "[0 1] | par-each --threads 2 { |id| ",
-        "{id: $id} | jev ask $q --metrics } | to json --raw"
-    );
+    let source = indoc! {r#"
+        let q = {q: (jev question noul 'Question?')}
+
+        [0 1]
+        | par-each --threads 2 { |id|
+            {id: $id}
+            | jev ask $q --metrics
+        }
+        | to json --raw
+    "#};
     let results = NuProcess::start(source, 2, &[("NU_PLUGIN_JEV_BASE_URL", &root)]).json();
     assert_eq!(results.as_array().unwrap().len(), 2);
     assert!(
@@ -217,16 +248,30 @@ fn parallel_command_families_really_overlap() {
         gate.rendezvous(3);
         reply(request)
     });
-    let source = concat!(
-        "let q = {q: (jev question noul 'Question?')}; ",
-        "[ask annotate models] | par-each --threads 3 { |command| ",
-        "ignore; ",
-        "let result = (match $command { ",
-        "ask => ({id: 0} | jev ask $q --metrics), ",
-        "annotate => ([{id: 1}] | jev annotate $q --jobs 1 --metrics | collect), ",
-        "models => (jev models --metrics) }); {command: $command, result: $result} ",
-        "} | to json --raw"
-    );
+    let source = indoc! {r#"
+        let q = {q: (jev question noul 'Question?')}
+
+        [ask annotate models]
+        | par-each --threads 3 { |command|
+            ignore
+            let result = (
+                match $command {
+                    ask => (
+                        {id: 0}
+                        | jev ask $q --metrics
+                    )
+                    annotate => (
+                        [{id: 1}]
+                        | jev annotate $q --jobs 1 --metrics
+                        | collect
+                    )
+                    models => (jev models --metrics)
+                }
+            )
+            {command: $command, result: $result}
+        }
+        | to json --raw
+    "#};
     let results = NuProcess::start(source, 3, &[("NU_PLUGIN_JEV_BASE_URL", &root)]).json();
     assert_eq!(results.as_array().unwrap().len(), 3);
     let captured = server.join().unwrap();
@@ -263,29 +308,57 @@ fn aggregate_native_budget_and_caller_settings_are_isolated() {
     };
     let (first_root, first_server) = h2_fixture::serve_unbounded(make_handler());
     let (second_root, second_server) = h2_fixture::serve_unbounded(make_handler());
-    let source = concat!(
-        "jev | ignore; $env.NU_PLUGIN_JEV_MAX_IN_FLIGHT = '9'; ",
-        "$env.config.plugins.jev = {jobs: 1}; ",
-        "0..7 | par-each --threads 8 { |id| ",
-        "ignore; ",
-        "let root = if ($id mod 2) == 0 {$env.JEV_TEST_FIRST_ROOT} ",
-        "else {$env.JEV_TEST_SECOND_ROOT}; ",
-        "let proxy = match ($id mod 3) {0 => 'auto', 1 => 'direct', ",
-        "_ => $env.JEV_TEST_FIRST_ROOT}; ",
-        "with-env {TYPESAFE_API_KEY: $'key-($id)', ",
-        "NU_PLUGIN_JEV_BASE_URL: $root, NU_PLUGIN_JEV_PROXY: $proxy, ",
-        "NU_PLUGIN_JEV_MODEL: $'model-($id)', ",
-        "NU_PLUGIN_JEV_MAX_IN_FLIGHT: $'($id + 16)'} { ",
-        "let q = {q: {type: noul, instructions: $'question-($id)'}}; ",
-        "let command = match ($id mod 3) {0 => 'ask', 1 => 'annotate', _ => 'models'}; ",
-        "let result = (match $command { ",
-        "ask => ({id: $id} | jev ask $q --context {scope: $id} --metrics), ",
-        "annotate => ([{id: $id}] | jev annotate $q --jobs 1 ",
-        "--context {scope: $id} --metrics | collect), ",
-        "models => (jev models --metrics) }); ",
-        "{id: $id, command: $command, result: $result} } ",
-        "} | sort-by id | to json --raw"
-    );
+    let source = indoc! {r#"
+        jev | ignore
+        $env.NU_PLUGIN_JEV_MAX_IN_FLIGHT = '9'
+        $env.config.plugins.jev = {jobs: 1}
+
+        0..7
+        | par-each --threads 8 { |id|
+            ignore
+            let root = if ($id mod 2) == 0 {
+                $env.JEV_TEST_FIRST_ROOT
+            } else {
+                $env.JEV_TEST_SECOND_ROOT
+            }
+            let proxy = match ($id mod 3) {
+                0 => 'auto'
+                1 => 'direct'
+                _ => $env.JEV_TEST_FIRST_ROOT
+            }
+            with-env {
+                TYPESAFE_API_KEY: $'key-($id)'
+                NU_PLUGIN_JEV_BASE_URL: $root
+                NU_PLUGIN_JEV_PROXY: $proxy
+                NU_PLUGIN_JEV_MODEL: $'model-($id)'
+                NU_PLUGIN_JEV_MAX_IN_FLIGHT: $'($id + 16)'
+            } {
+                let q = {q: {type: noul, instructions: $'question-($id)'}}
+                let command = match ($id mod 3) {
+                    0 => 'ask'
+                    1 => 'annotate'
+                    _ => 'models'
+                }
+                let result = (
+                    match $command {
+                        ask => (
+                            {id: $id}
+                            | jev ask $q --context {scope: $id} --metrics
+                        )
+                        annotate => (
+                            [{id: $id}]
+                            | jev annotate $q --jobs 1 --context {scope: $id} --metrics
+                            | collect
+                        )
+                        models => (jev models --metrics)
+                    }
+                )
+                {id: $id, command: $command, result: $result}
+            }
+        }
+        | sort-by id
+        | to json --raw
+    "#};
     let child = NuProcess::start(
         source,
         2,
@@ -354,7 +427,10 @@ fn aggregate_native_budget_and_caller_settings_are_isolated() {
             assert_eq!(body["model"], format!("model-{id}"));
             assert_eq!(
                 body["state"],
-                json!({"input": {"id": id}, "context": {"scope": id}})
+                json!({
+                    "input": {"id": id},
+                    "context": {"scope": id}
+                })
             );
             assert_eq!(
                 body["questions"]["q"]["instructions"],
@@ -383,19 +459,31 @@ fn startup_nuon_budget_ignores_later_file_and_caller_changes() {
             response.body_gate = Some(held[index / 2].clone());
             response
         });
-        let source = concat!(
-            "jev | ignore; ",
-            "for path in [.nu_plugin_jev.nuon startup.nuon nu_plugin_jev/config.nuon] { ",
-            "{max_in_flight: 9, model: edited} | to nuon | save --raw --force $path }; ",
-            "cd calls; $env.NU_PLUGIN_JEV_MAX_IN_FLIGHT = '9'; ",
-            "$env.NU_PLUGIN_JEV_CONFIG = 'call.nuon'; ",
-            "$env.config.plugins.jev = {max_in_flight: 1}; ",
-            "let q = {q: {type: noul}}; ",
-            "0..5 | par-each --threads 6 { |id| ",
-            "if ($id mod 2) == 0 { {id: $id} | jev ask $q --config call.nuon --metrics } ",
-            "else { {id: $id} | jev ask $q --metrics } ",
-            "} | to json --raw"
-        );
+        let source = indoc! {r#"
+            jev | ignore
+            for path in [.nu_plugin_jev.nuon startup.nuon nu_plugin_jev/config.nuon] {
+                {max_in_flight: 9, model: edited}
+                | to nuon
+                | save --raw --force $path
+            }
+            cd calls
+            $env.NU_PLUGIN_JEV_MAX_IN_FLIGHT = '9'
+            $env.NU_PLUGIN_JEV_CONFIG = 'call.nuon'
+            $env.config.plugins.jev = {max_in_flight: 1}
+            let q = {q: {type: noul}}
+
+            0..5
+            | par-each --threads 6 { |id|
+                if ($id mod 2) == 0 {
+                    {id: $id}
+                    | jev ask $q --config call.nuon --metrics
+                } else {
+                    {id: $id}
+                    | jev ask $q --metrics
+                }
+            }
+            | to json --raw
+        "#};
         let mut environment = vec![("NU_PLUGIN_JEV_BASE_URL", root.as_str())];
         if let Some(selector) = selector {
             environment.push(("NU_PLUGIN_JEV_CONFIG", selector));
@@ -459,7 +547,16 @@ fn startup_nuon_selection_validates_before_commands() {
     assert!(diagnostic.contains("local NUON max_in_flight"));
     assert!(!diagnostic.contains("PRIVATE_VALUE"));
     let malformed = [(".nu_plugin_jev.nuon", "{PRIVATE_VALUE trailing")];
-    let passed = NuProcess::with_files("jev | to json --raw", Some(2), &[], &malformed).json();
+    let passed = NuProcess::with_files(
+        indoc! {r#"
+            jev
+            | to json --raw
+        "#},
+        Some(2),
+        &[],
+        &malformed,
+    )
+    .json();
     assert!(passed.as_str().unwrap().contains("jev ask"));
     let failed = NuProcess::with_files(
         "jev",
@@ -475,13 +572,18 @@ fn startup_nuon_selection_validates_before_commands() {
 /// Offline commands ignore later malformed files after successful startup validation.
 #[test]
 fn offline_commands_ignore_file_edits_after_startup() {
-    let source = concat!(
-        "jev | ignore; '{PRIVATE_VALUE trailing' ",
-        "| save --raw --force .nu_plugin_jev.nuon; ",
-        "{guidance: (jev), noul: (jev question noul 'Q'), ",
-        "choice: (jev question choice 'Q' [a b]), ",
-        "score: (jev question score 'Q' [low high])} | to json --raw"
-    );
+    let source = indoc! {r#"
+        jev | ignore
+        '{PRIVATE_VALUE trailing'
+        | save --raw --force .nu_plugin_jev.nuon
+        {
+            guidance: (jev)
+            noul: (jev question noul 'Q')
+            choice: (jev question choice 'Q' [a b])
+            score: (jev question score 'Q' [low high])
+        }
+        | to json --raw
+    "#};
     let result = NuProcess::with_files(
         source,
         None,
@@ -519,14 +621,28 @@ fn caught_native_failures_do_not_cancel_neighbors() {
         });
         // Catch the expected failure inside its branch. Catching only the outer pipeline
         // could let Nu's global interrupt hide whether plugin-local cancellation is isolated.
-        let source = concat!(
-            "let q = {q: {type: noul}}; ",
-            "[0 1] | par-each --threads 2 { |id| ",
-            "try { let result = ({id: $id} | jev ask $q --timeout 1sec); ",
-            "{id: $id, success: true, probability: $result.answers.q.noul} ",
-            "} catch { {id: $id, success: false} } ",
-            "} | sort-by id | to json --raw"
-        );
+        let source = indoc! {r#"
+            let q = {q: {type: noul}}
+
+            [0 1]
+            | par-each --threads 2 { |id|
+                try {
+                    let result = (
+                        {id: $id}
+                        | jev ask $q --timeout 1sec
+                    )
+                    {
+                        id: $id
+                        success: true
+                        probability: $result.answers.q.noul
+                    }
+                } catch {
+                    {id: $id, success: false}
+                }
+            }
+            | sort-by id
+            | to json --raw
+        "#};
         let results = NuProcess::start(source, 2, &[("NU_PLUGIN_JEV_BASE_URL", &root)]).json();
         assert_eq!(results[0]["success"], false);
         assert_eq!(results[1]["success"], true);
@@ -544,13 +660,20 @@ fn concurrent_native_annotations_do_not_share_caches() {
         gate.rendezvous(2);
         reply(captured)
     });
-    let source = concat!(
-        "let q = {q: {type: noul}}; ",
-        "[0 1] | par-each --threads 2 { ",
-        "[{message: same} {message: same}] ",
-        "| jev annotate $q --jobs 2 --metrics | collect ",
-        "} | to json --raw"
-    );
+    let source = indoc! {r#"
+        let q = {q: {type: noul}}
+
+        [0 1]
+        | par-each --threads 2 {
+            [
+                {message: same}
+                {message: same}
+            ]
+            | jev annotate $q --jobs 2 --metrics
+            | collect
+        }
+        | to json --raw
+    "#};
     let groups = NuProcess::start(source, 2, &[("NU_PLUGIN_JEV_BASE_URL", &root)]).json();
     assert_eq!(groups.as_array().unwrap().len(), 2);
     for group in groups.as_array().unwrap() {
@@ -592,18 +715,36 @@ fn native_offline_commands_bypass_a_full_budget() {
             response
         }
     });
-    let source = concat!(
-        "let q = {q: {type: noul}}; [live offline] | par-each --threads 2 { |kind| ",
-        "if $kind == live { 'held' | jev ask $q --timeout 4sec } else { ",
-        "http get $'($env.NU_PLUGIN_JEV_BASE_URL)/ready' | ignore; ",
-        "let result = {guidance: (jev), noul: (jev question noul 'Q'), ",
-        "choice: (jev question choice 'Q' [a b]), ",
-        "score: (jev question score 'Q' [low high]), ",
-        "ask: ('preview' | jev ask $q --dry-run), ",
-        "annotate: ([{id: 1}] | jev annotate $q --dry-run | collect)}; ",
-        "http get $'($env.NU_PLUGIN_JEV_BASE_URL)/release' | ignore; $result ",
-        "} } | to json --raw"
-    );
+    let source = indoc! {r#"
+        let q = {q: {type: noul}}
+
+        [live offline]
+        | par-each --threads 2 { |kind|
+            if $kind == live {
+                'held'
+                | jev ask $q --timeout 4sec
+            } else {
+                http get $'($env.NU_PLUGIN_JEV_BASE_URL)/ready'
+                | ignore
+                let result = {
+                    guidance: (jev)
+                    noul: (jev question noul 'Q')
+                    choice: (jev question choice 'Q' [a b])
+                    score: (jev question score 'Q' [low high])
+                    ask: ('preview' | jev ask $q --dry-run)
+                    annotate: (
+                        [{id: 1}]
+                        | jev annotate $q --dry-run
+                        | collect
+                    )
+                }
+                http get $'($env.NU_PLUGIN_JEV_BASE_URL)/release'
+                | ignore
+                $result
+            }
+        }
+        | to json --raw
+    "#};
     let results = NuProcess::start(source, 1, &[("NU_PLUGIN_JEV_BASE_URL", &root)]).json();
     assert_eq!(results.as_array().unwrap().len(), 2);
     let previews = results

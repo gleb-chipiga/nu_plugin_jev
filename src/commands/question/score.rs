@@ -1,5 +1,6 @@
 //! Exposes the offline Score question constructor to Nushell.
 
+use indoc::indoc;
 use nu_plugin::{EngineInterface, EvaluatedCall, SimplePluginCommand};
 use nu_protocol::{Example, LabeledError, Signature, SyntaxShape, Type, Value};
 
@@ -37,11 +38,10 @@ impl SimplePluginCommand for JevQuestionScore {
 
     /// Clarifies ordinal positions and limits in Nu help.
     fn extra_description(&self) -> &str {
-        concat!(
-            "One to ten levels are allowed; positions correspond to 0..N-1. ",
-            "At least two levels are usually useful. No HTTP request is made and ",
-            "pipeline input is not accepted."
-        )
+        indoc! {"
+            One to ten levels are allowed; positions correspond to 0..N-1. At least two levels \
+            are usually useful. No HTTP request is made and pipeline input is not accepted.\
+        "}
     }
 
     /// Shows an offline rubric example.

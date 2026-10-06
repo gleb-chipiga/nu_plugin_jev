@@ -160,7 +160,10 @@ mod tests {
         );
         assert_eq!(
             compose_state(&input, Some(&Value::test_nothing())).unwrap(),
-            json!({"input": {"input": "original"}, "context": null})
+            json!({
+                "input": {"input": "original"},
+                "context": null
+            })
         );
     }
 
@@ -216,7 +219,10 @@ mod tests {
         assert!(compose_state(&Value::test_nothing(), None).is_err());
         assert_eq!(
             compose_state(&Value::test_int(2), Some(&Value::test_nothing())).unwrap(),
-            json!({"input": 2, "context": null})
+            json!({
+                "input": 2,
+                "context": null
+            })
         );
     }
 
@@ -227,11 +233,29 @@ mod tests {
         input.push("message", Value::test_string("Hello"));
         input.push("sender", Value::test_string("Ada"));
         let questions_wire = json!({
-            "spam": {"type": "noul", "instructions": "Is this unsolicited?",
-                "criteria": {"true": "spam", "false": "expected"}},
-            "kind": {"type": "choice", "instructions": {"task": "categorize", "priority": 1},
-                "criteria": {"normal": null, "promo": "advertising"}},
-            "urgency": {"type": "score", "criteria": ["later", "today", "now"]}
+            "spam": {
+                "type": "noul",
+                "instructions": "Is this unsolicited?",
+                "criteria": {
+                    "true": "spam",
+                    "false": "expected"
+                }
+            },
+            "kind": {
+                "type": "choice",
+                "instructions": {
+                    "task": "categorize",
+                    "priority": 1
+                },
+                "criteria": {
+                    "normal": null,
+                    "promo": "advertising"
+                }
+            },
+            "urgency": {
+                "type": "score",
+                "criteria": ["later", "today", "now"]
+            }
         });
         let questions = parse_questions(
             &crate::nu::value::from_json(questions_wire.clone(), nu_protocol::Span::test_data())
@@ -247,8 +271,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             serde_json::to_value(body).unwrap(),
-            json!({"state": {"message": "Hello", "sender": "Ada"},
-                "model": "jev-latest", "questions": questions_wire})
+            json!({
+                "state": {
+                    "message": "Hello",
+                    "sender": "Ada"
+                },
+                "model": "jev-latest",
+                "questions": questions_wire
+            })
         );
     }
 }

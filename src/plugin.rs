@@ -64,6 +64,7 @@ impl Plugin for JevPlugin {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use nu_plugin::{PluginCommand, SimplePluginCommand};
     use nu_plugin_test_support::PluginTest;
     use nu_protocol::{ShellError, Span, Type};
@@ -120,7 +121,13 @@ mod tests {
         let mut test = PluginTest::new("jev", plugin.into())?;
         let result = test.eval("jev")?.into_value(Span::test_data())?;
         assert!(result.as_str()?.contains("jev ask"));
-        assert!(test.eval("'ignored' | jev").is_err());
+        assert!(
+            test.eval(indoc! {r#"
+                'ignored'
+                | jev
+            "#})
+                .is_err()
+        );
         Ok(())
     }
 }
